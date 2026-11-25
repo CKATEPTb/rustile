@@ -4,7 +4,7 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_TOKEN, HANDLE},
+    Foundation::{ERROR_BAD_IMPERSONATION_LEVEL, ERROR_NO_TOKEN, HANDLE},
     Security::*,
     System::Threading::{
         GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
@@ -26,17 +26,9 @@ fn process_token() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(token) })
 }
 
-fn thread_token() -> io::Result<Option<OwnedHandle>> {
+fn thread_token(access: TOKEN_ACCESS_MASK) -> io::Result<Option<OwnedHandle>> {
     let mut token = null_mut();
-    if unsafe {
-        OpenThreadToken(
-            GetCurrentThread(),
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
-            1,
-            &mut token,
-        )
-    } != 0
-    {
+    if unsafe { OpenThreadToken(GetCurrentThread(), access, 1, &mut token) } != 0 {
         return Ok(Some(unsafe { OwnedHandle::from_raw_handle(token) }));
     }
     let err = io::Error::last_os_error();
@@ -157,8 +149,8 @@ fn restricted_token(token: HANDLE) -> io::Result<OwnedHandle> {
     Ok(out)
 }
 
-struct Restore(Option<OwnedHandle>);
-impl Drop for Restore {
+struct Restore<'a>(Option<&'a OwnedHandle>);
+impl Drop for Restore<'_> {
     fn drop(&mut self) {
         let ok = match &self.0 {
             Some(previous) => unsafe { SetThreadToken(null(), previous.as_raw_handle()) },
@@ -170,13 +162,65 @@ impl Drop for Restore {
     }
 }
 
+fn require_io_level(token: HANDLE) -> io::Result<()> {
+    let (mut level, mut bytes) = (SecurityAnonymous, 0);
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenImpersonationLevel,
+            (&raw mut level).cast(),
+            size_of_val(&level) as u32,
+            &mut bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if level < SecurityImpersonation {
+        return Err(io::Error::from_raw_os_error(
+            ERROR_BAD_IMPERSONATION_LEVEL as i32,
+        ));
+    }
+    Ok(())
+}
+
+fn impersonate_for_io(token: HANDLE, previous: Option<&OwnedHandle>) -> io::Result<Restore<'_>> {
+    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let restore = Restore(previous);
+    // Windows can successfully install a linked identification token. The thread
+    // then cannot open files. Restore its previous identity before trying a fallback.
+    let installed = thread_token(TOKEN_QUERY)?
+        .ok_or_else(|| io::Error::from_raw_os_error(ERROR_NO_TOKEN as i32))?;
+    require_io_level(installed.as_raw_handle())?;
+    Ok(restore)
+}
+
+fn profile_context(
+    token: HANDLE,
+    linked: Option<OwnedHandle>,
+    previous: Option<&OwnedHandle>,
+) -> io::Result<Restore<'_>> {
+    if let Some(linked) = linked
+        && elevated(linked.as_raw_handle()).is_ok_and(|v| !v)
+        && let Ok(restore) = impersonate_for_io(linked.as_raw_handle(), previous)
+    {
+        return Ok(restore);
+    }
+    impersonate_for_io(restricted_token(token)?.as_raw_handle(), previous)
+}
+
 /// Run file or registry operations on a user-writable profile without giving
 /// them the additional privileges of the scheduled window manager.
 pub(crate) fn with_user<T>(op: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    let previous = thread_token()?;
+    let previous = thread_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE)?;
     let process;
     let token = match &previous {
-        Some(existing) => existing.as_raw_handle(),
+        Some(existing) => {
+            require_io_level(existing.as_raw_handle())?;
+            existing.as_raw_handle()
+        }
         None => {
             process = process_token()?;
             process.as_raw_handle()
@@ -185,17 +229,7 @@ pub(crate) fn with_user<T>(op: impl FnOnce() -> io::Result<T>) -> io::Result<T> 
     if !elevated(token)? {
         return op();
     }
-    let using_linked = linked_token(token).is_some_and(|linked| {
-        elevated(linked.as_raw_handle()).is_ok_and(|v| !v)
-            && unsafe { ImpersonateLoggedOnUser(linked.as_raw_handle()) } != 0
-    });
-    if !using_linked {
-        let limited = restricted_token(token)?;
-        if unsafe { ImpersonateLoggedOnUser(limited.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    let _restore = Restore(previous);
+    let _restore = profile_context(token, linked_token(token), previous.as_ref())?;
     op()
 }
 
@@ -205,7 +239,7 @@ mod tests {
 
     #[test]
     fn restricted_profile_token_can_save_and_preserves_impersonation() {
-        let previous = thread_token().unwrap();
+        let previous = thread_token(TOKEN_QUERY | TOKEN_IMPERSONATE).unwrap();
         let process = process_token().unwrap();
         let limited = restricted_token(process.as_raw_handle()).unwrap();
         let dir =
@@ -215,12 +249,64 @@ mod tests {
                 unsafe { ImpersonateLoggedOnUser(limited.as_raw_handle()) },
                 0
             );
-            let _restore = Restore(previous);
+            let _restore = Restore(previous.as_ref());
             std::fs::create_dir(&dir).unwrap();
             with_user(|| std::fs::write(dir.join("settings"), b"profile")).unwrap();
-            assert!(thread_token().unwrap().is_some());
+            assert!(thread_token(TOKEN_QUERY).unwrap().is_some());
             std::fs::remove_file(dir.join("settings")).unwrap();
             std::fs::remove_dir(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn identification_only_linked_token_falls_back_before_profile_io() {
+        let previous = thread_token(TOKEN_QUERY | TOKEN_IMPERSONATE).unwrap();
+        let process = process_token().unwrap();
+        let standard = restricted_token(process.as_raw_handle()).unwrap();
+        let mut identification = null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateTokenEx(
+                    standard.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    null(),
+                    SecurityIdentification,
+                    TokenImpersonation,
+                    &mut identification,
+                )
+            },
+            0
+        );
+        let identification = unsafe { OwnedHandle::from_raw_handle(identification) };
+        assert!(!elevated(identification.as_raw_handle()).unwrap());
+        assert_eq!(
+            require_io_level(identification.as_raw_handle())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(ERROR_BAD_IMPERSONATION_LEVEL as i32)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "rustile-linked-profile-{}.toml",
+            std::process::id()
+        ));
+        {
+            let _restore = profile_context(
+                process.as_raw_handle(),
+                Some(identification),
+                previous.as_ref(),
+            )
+            .unwrap();
+            let installed = thread_token(TOKEN_QUERY).unwrap().unwrap();
+            assert_ne!(unsafe { IsTokenRestricted(installed.as_raw_handle()) }, 0);
+            let mut file = std::fs::File::create_new(&path).unwrap();
+            io::Write::write_all(&mut file, b"test profile").unwrap();
+            drop(file);
+            assert_eq!(std::fs::read(&path).unwrap(), b"test profile");
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(
+            thread_token(TOKEN_QUERY).unwrap().is_some(),
+            previous.is_some()
+        );
     }
 }
