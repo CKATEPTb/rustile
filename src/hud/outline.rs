@@ -12,7 +12,7 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use windows_sys::core::w;
+use windows_sys::core::{PCWSTR, w};
 
 use crate::{
     layout::{Id, Rect},
@@ -23,12 +23,14 @@ use crate::{
 struct Palette {
     line: [u8; 4],
     rim: [u8; 4],
+    fill_alpha: u8,
 }
 
 impl Palette {
     const NORMAL: Self = Self {
         line: [171, 195, 218, 217],
         rim: [51, 72, 94, 88],
+        fill_alpha: 0,
     };
 
     fn current() -> Self {
@@ -48,6 +50,7 @@ impl Palette {
             Self {
                 line: system(COLOR_HIGHLIGHT),
                 rim: system(COLOR_HIGHLIGHTTEXT),
+                fill_alpha: 0,
             }
         }
     }
@@ -70,6 +73,19 @@ struct Shape {
 }
 
 impl Shape {
+    fn drop_preview(rect: Rect, thickness: u8, dpi: u32, mut palette: Palette) -> Self {
+        palette.fill_alpha = palette.line[3] / 6;
+        Self {
+            w: rect.w,
+            h: rect.h,
+            dpi,
+            radius_dip: 8,
+            thickness: thickness.max(1),
+            inset: true,
+            palette,
+        }
+    }
+
     fn scale(self) -> f32 {
         self.dpi as f32 / 96.0
     }
@@ -147,8 +163,9 @@ impl Shape {
         let coverage = |limit: f32| (0.5 + limit * self.scale() - distance).clamp(0.0, 1.0);
         let offset = if self.inset { 1.25 } else { 0.0 };
         let edge = coverage(0.35 - offset);
-        let ink = (edge - coverage(0.05 - f32::from(self.thickness) - offset))
-            * f32::from(self.palette.line[3]);
+        let interior = coverage(0.05 - f32::from(self.thickness) - offset);
+        let ink = (edge - interior) * f32::from(self.palette.line[3])
+            + interior * f32::from(self.palette.fill_alpha);
         let rim = (coverage(1.25 - offset) - edge) * f32::from(self.palette.rim[3]);
         let channel = |n: usize| {
             ((f32::from(self.palette.line[n]) * ink + f32::from(self.palette.rim[n]) * rim) / 255.0)
@@ -280,28 +297,9 @@ impl FocusOutline {
 
     fn create(&mut self) -> bool {
         unsafe {
-            let class = WNDCLASSW {
-                hInstance: GetModuleHandleW(null()),
-                lpszClassName: w!("Rustile.FocusOutline"),
-                lpfnWndProc: Some(outline_proc),
-                ..Default::default()
-            };
-            RegisterClassW(&class);
+            let class = overlay_class(w!("Rustile.FocusOutline"));
             for hwnd in &mut self.windows {
-                *hwnd = CreateWindowExW(
-                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                    class.lpszClassName,
-                    w!(""),
-                    WS_POPUP | WS_DISABLED,
-                    0,
-                    0,
-                    0,
-                    0,
-                    null_mut(),
-                    null_mut(),
-                    class.hInstance,
-                    null(),
-                );
+                *hwnd = overlay_window(&class);
                 if hwnd.is_null() {
                     return false;
                 }
@@ -327,6 +325,100 @@ impl FocusOutline {
 impl Drop for FocusOutline {
     fn drop(&mut self) {
         self.hide();
+    }
+}
+
+#[derive(Default)]
+pub struct DropPreview {
+    hwnd: HWND,
+    raster: Option<Shape>,
+    visible_at: Option<(Id, Rect)>,
+}
+
+impl DropPreview {
+    pub fn show(&mut self, source: Id, rect: Rect, thickness: u8) {
+        if source == 0 || rect.w <= 0 || rect.h <= 0 {
+            self.hide();
+            return;
+        }
+        // The grid lives on the primary monitor even when the dragged window
+        // straddles a differently scaled display.
+        let shape = Shape::drop_preview(rect, thickness, native::system_dpi(), Palette::current());
+        if self.raster == Some(shape) && self.visible_at == Some((source, rect)) {
+            return;
+        }
+        if self.hwnd.is_null() {
+            self.hwnd = overlay_window(&overlay_class(w!("Rustile.DropPreview")));
+            if self.hwnd.is_null() {
+                return;
+            }
+        }
+        let pos = POINT {
+            x: rect.x,
+            y: rect.y,
+        };
+        if self.raster != Some(shape) {
+            let local = Rect { x: 0, y: 0, ..rect };
+            if !upload(self.hwnd, shape, local, true, pos) {
+                self.hide();
+                return;
+            }
+            self.raster = Some(shape);
+        }
+        // Upload while hidden on the first show. Reposition an identical
+        // surface without allocating another full-tile bitmap.
+        let flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW | SWP_NOSIZE;
+        if unsafe { SetWindowPos(self.hwnd, HWND_TOPMOST, pos.x, pos.y, 0, 0, flags) } == 0 {
+            self.hide();
+            return;
+        }
+        self.visible_at = Some((source, rect));
+    }
+
+    pub fn hide(&mut self) {
+        if self.visible_at.take().is_some() {
+            unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        }
+    }
+}
+
+impl Drop for DropPreview {
+    fn drop(&mut self) {
+        if !self.hwnd.is_null() {
+            unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+}
+
+fn overlay_class(name: PCWSTR) -> WNDCLASSW {
+    unsafe {
+        let class = WNDCLASSW {
+            hInstance: GetModuleHandleW(null()),
+            lpszClassName: name,
+            lpfnWndProc: Some(outline_proc),
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+        class
+    }
+}
+
+fn overlay_window(class: &WNDCLASSW) -> HWND {
+    unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.lpszClassName,
+            w!(""),
+            WS_POPUP | WS_DISABLED,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            class.hInstance,
+            null(),
+        )
     }
 }
 
@@ -415,6 +507,49 @@ unsafe extern "system" fn outline_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_tints_the_destination_inside_a_rounded_visible_stroke() {
+        let tile = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 60,
+        };
+        let contrast = Palette {
+            line: [255, 255, 0, 255],
+            rim: [0, 0, 0, 255],
+            fill_alpha: 0,
+        };
+        for dpi in [96, 144, 192] {
+            for palette in [Palette::NORMAL, contrast] {
+                let shape = Shape::drop_preview(tile, 0, dpi, palette);
+                let mut pixels = vec![0; (tile.w * tile.h) as usize];
+                shape.paint(tile, true, &mut pixels);
+                let at = |x: i32, y: i32| pixels[(y * tile.w + x) as usize].to_le_bytes();
+                assert_eq!(at(0, 0), [0; 4]);
+                assert_eq!(at(79, 59), [0; 4]);
+                let fill = at(40, 30);
+                assert_eq!(fill[3], palette.line[3] / 6);
+                for (channel, color) in fill[..3].iter().rev().zip(palette.line) {
+                    assert_eq!(
+                        u16::from(*channel),
+                        (u16::from(color) * u16::from(fill[3]) + 127) / 255
+                    );
+                }
+                assert!(at(40, (dpi / 96) as i32)[3] > 3 * fill[3]);
+                assert!(
+                    (0..tile.w / 2)
+                        .map(|x| at(x, 0)[3])
+                        .any(|a| a > 0 && a < at(40, 0)[3])
+                );
+                assert!(pixels.iter().all(|pixel| {
+                    let [b, g, r, a] = pixel.to_le_bytes();
+                    r <= a && g <= a && b <= a
+                }));
+            }
+        }
+    }
 
     #[test]
     fn thick_flush_outlines_grow_inward_at_both_dpis() {

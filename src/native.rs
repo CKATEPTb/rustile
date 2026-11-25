@@ -115,6 +115,42 @@ pub fn foreground() -> Id {
     unsafe { GetForegroundWindow() as Id }
 }
 
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
+}
+
+// With full-window dragging disabled the HWND stays put until release. Ask
+// the app whether Windows is dragging its caption before following the cursor.
+pub fn outline_caption_drag(id: Id) -> bool {
+    let mut full = 1i32;
+    if unsafe { SystemParametersInfoW(SPI_GETDRAGFULLWINDOWS, 0, (&raw mut full).cast(), 0) } == 0
+        || full != 0
+    {
+        return false;
+    }
+    let Some((x, y)) = cursor_position() else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+        return false;
+    };
+    let location = i32::from(x as u16) | (i32::from(y) << 16);
+    let mut hit = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            id as HWND,
+            WM_NCHITTEST,
+            0,
+            location as LPARAM,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            25,
+            &mut hit,
+        ) != 0
+            && hit == HTCAPTION as usize
+    }
+}
+
 pub fn is_snapped(id: Id) -> bool {
     unsafe { IsWindowArranged(id as HWND) != 0 }
 }

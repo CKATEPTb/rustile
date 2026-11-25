@@ -256,12 +256,10 @@ impl Preferences<'_> {
     }
 }
 
-// Explorer may report visibility and desktop membership at different points in
-// a switch. Recheck once after the burst, including switches to an empty desktop.
 #[derive(Default)]
-struct DesktopSettleTimer(usize);
+struct MessageTimer(usize);
 
-impl DesktopSettleTimer {
+impl MessageTimer {
     fn schedule(&mut self, delay_ms: u32) -> bool {
         let timer = unsafe { SetTimer(null_mut(), self.0, delay_ms, None) };
         if timer != 0 {
@@ -270,12 +268,15 @@ impl DesktopSettleTimer {
         timer != 0
     }
 
+    fn matches(&self, message: &MSG) -> bool {
+        self.0 != 0
+            && message.message == WM_TIMER
+            && message.hwnd.is_null()
+            && message.wParam == self.0
+    }
+
     fn take(&mut self, message: &MSG) -> bool {
-        if self.0 == 0
-            || message.message != WM_TIMER
-            || !message.hwnd.is_null()
-            || message.wParam != self.0
-        {
+        if !self.matches(message) {
             return false;
         }
         self.cancel();
@@ -289,7 +290,7 @@ impl DesktopSettleTimer {
     }
 }
 
-impl Drop for DesktopSettleTimer {
+impl Drop for MessageTimer {
     fn drop(&mut self) {
         self.cancel();
     }
@@ -303,7 +304,8 @@ fn pump(
 ) -> Result<(), String> {
     let mut message = MSG::default();
     let mut events = Vec::new();
-    let mut desktop_timer = DesktopSettleTimer::default();
+    let mut desktop_timer = MessageTimer::default();
+    let mut drag_timer = MessageTimer::default();
     let mut retries = 0;
     if manager.take_desktop_retry() {
         retries = 2;
@@ -338,7 +340,9 @@ fn pump(
                 event,
                 EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
             ) || (event == EVENT_OBJECT_HIDE && manager.tracks_window(id));
-            if event != EVENT_SYSTEM_DESKTOPSWITCH {
+            if event == EVENT_SYSTEM_DESKTOPSWITCH {
+                manager.cancel_mouse_move();
+            } else {
                 manager.event(event, id);
             }
         }
@@ -364,6 +368,9 @@ fn pump(
         }
         if has_events || reconcile {
             refresh(manager, 0);
+        }
+        if drag_timer.matches(&message) {
+            manager.refresh_drop_preview(false);
         }
         if message.message == OUTLINE_SETTINGS_CHANGED {
             refresh(manager, 0);
@@ -398,6 +405,11 @@ fn pump(
             if command.changes_shortcuts() {
                 tray.shortcut_result(result.as_ref().err().map(String::as_str));
             }
+        }
+        if !manager.tracking_drag_cursor() {
+            drag_timer.cancel();
+        } else if drag_timer.0 == 0 {
+            drag_timer.schedule(32);
         }
     }
 }

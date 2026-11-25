@@ -582,6 +582,12 @@ impl Manager {
         }
         let state = self.observe(id);
         let eligible = state == TileState::Eligible;
+        if !eligible || event == EVENT_OBJECT_CLOAKED {
+            self.hide_drop_for(id);
+        }
+        if event == EVENT_SYSTEM_FOREGROUND && self.drag_target() != Some(id) {
+            self.cancel_mouse_move();
+        }
         if !eligible
             && self.expanded.contains(&id)
             && matches!(
@@ -734,6 +740,7 @@ impl Manager {
 
     fn place_tiles(&mut self, verify: bool) {
         let Some(area) = self.area else { return };
+        self.refresh_drop_preview(true);
         let preview = self
             .dragging
             .as_ref()

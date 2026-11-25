@@ -1,8 +1,11 @@
 mod bsp;
+mod drop_target;
 mod edge;
 mod grid;
 mod vacancy;
 
+#[cfg(test)]
+mod drop_tests;
 #[cfg(test)]
 mod focused_insert_tests;
 #[cfg(test)]
@@ -13,6 +16,7 @@ mod move_sequence_tests;
 mod work_area_tests;
 
 use bsp::{Bsp, Cut};
+pub use drop_target::DropZone;
 use grid::{Grid, Shape};
 use vacancy::Vacancy;
 

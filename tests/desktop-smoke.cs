@@ -377,21 +377,25 @@ internal static class DesktopSmoke {
         Until("Excluded dialog should close after fullscreen checks", () => Find(owner, true) == IntPtr.Zero);
         Console.WriteLine("PASS  Fullscreen and maximize/restore refill the work area after delayed app bounds or two windows stacked in its left half");
     }
+    static IntPtr ManagerWindow(Child manager, string className, bool visibleOnly) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
+            int pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid != manager.Pid || (visibleOnly && !IsWindowVisible(hwnd))) return true;
+            var cls = new StringBuilder(80);
+            GetClassName(hwnd, cls, cls.Capacity);
+            if (cls.ToString() != className) return true;
+            found = hwnd;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
     static IntPtr TrayWindow(Child manager, string className = "Rustile.Tray") {
         IntPtr tray = IntPtr.Zero;
         Until("Rustile should create " + className, () => {
             Require(!manager.Exited(0), "Rustile exited before " + className + " appeared");
-            EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
-                int pid;
-                GetWindowThreadProcessId(hwnd, out pid);
-                if (pid != manager.Pid) return true;
-                var cls = new StringBuilder(80);
-                GetClassName(hwnd, cls, cls.Capacity);
-                if (cls.ToString() != className) return true;
-                tray = hwnd;
-                return false;
-            }, IntPtr.Zero);
-            return tray != IntPtr.Zero;
+            return (tray = ManagerWindow(manager, className, false)) != IntPtr.Zero;
         });
         return tray;
     }
@@ -900,6 +904,102 @@ internal static class DesktopSmoke {
     static void EndMouseDrag(IntPtr hwnd) {
         NotifyWinEvent(0x000b /* EVENT_SYSTEM_MOVESIZEEND */, hwnd, 0, 0);
     }
+    static Point Center(Rectangle frame) {
+        return new Point(frame.Left + frame.Width / 2, frame.Top + frame.Height / 2);
+    }
+    static void MoveFrameTo(IntPtr hwnd, Rectangle source, Point center) {
+        // A private desktop cannot read the input cursor. Windows still reports
+        // the HWND translation, so its center supplies the drag point here.
+        source.Offset(center.X - Center(source).X, center.Y - Center(source).Y);
+        SetDragFrame(hwnd, source);
+    }
+    static Rectangle WaitForDropPreview(Child manager, string description, Func<Rectangle, bool> expected) {
+        var preview = Rectangle.Empty;
+        Until(description, () => {
+            var hwnd = ManagerWindow(manager, "Rustile.DropPreview", true);
+            if (hwnd == IntPtr.Zero) return false;
+            preview = Bounds(hwnd);
+            if (!expected(preview)) return false;
+            const int clickThrough = 0x00000020 /* WS_EX_TRANSPARENT */ | 0x08000000 /* WS_EX_NOACTIVATE */;
+            Require((GetWindowLongW(hwnd, -20 /* GWL_EXSTYLE */) & clickThrough) == clickThrough,
+                "The visible drop preview must pass through input and avoid activation");
+            var center = Center(preview);
+            var point = (IntPtr)((center.X & 0xffff) | ((center.Y & 0xffff) << 16));
+            UIntPtr result;
+            Require(SendMessageTimeout(hwnd, 0x84 /* WM_NCHITTEST */, IntPtr.Zero, point,
+                2 /* SMTO_ABORTIFHUNG */, 500, out result) != IntPtr.Zero
+                && unchecked((int)result.ToUInt64()) == -1 /* HTTRANSPARENT */,
+                "The visible drop preview intercepted a hit on its surface");
+            return true;
+        });
+        return preview;
+    }
+    static void MouseMove(Child manager, IntPtr[] windows, int anchor, int gap, Rectangle work) {
+        var original = windows.Select(VisibleFrame).ToArray();
+        int target = 1 - anchor;
+        var active = windows[2];
+        var source = original[2];
+        var host = original[target];
+        var center = Center(host);
+        bool stack = host.Top == original.Aggregate(Rectangle.Union).Top
+            && host.Bottom == original.Aggregate(Rectangle.Union).Bottom;
+        var edge = stack ? new Point(center.X, host.Top + 3) : new Point(host.Left + 3, center.Y);
+        var foreground = GetForegroundWindow();
+        Func<bool> hidden = () => ManagerWindow(manager, "Rustile.DropPreview", true) == IntPtr.Zero;
+        Func<bool> unchanged = () => windows.Select(VisibleFrame).SequenceEqual(original);
+        Func<Rectangle, bool> firstHalf = r => stack
+            ? r.Left == host.Left && r.Right == host.Right && r.Top == host.Top
+                && Math.Abs(2 * r.Height + gap - host.Height) <= 1
+            : r.Top == host.Top && r.Bottom == host.Bottom && r.Left == host.Left
+                && Math.Abs(2 * r.Width + gap - host.Width) <= 1;
+
+        BeginMouseDrag(active);
+        MoveFrameTo(active, source, edge);
+        WaitForDropPreview(manager, "A native caption drag to the target edge should show a half-tile preview", firstHalf);
+        MoveFrameTo(active, source, center);
+        var centerPreview = WaitForDropPreview(manager, "Retargeting the center must show the whole target tile", r => r == host);
+        Require(VisibleFrame(windows[target]) == host && VisibleFrame(windows[anchor]) == original[anchor],
+            "Showing a drop preview moved tiles before release");
+        Require(GetForegroundWindow() == foreground, "A drop preview took focus during the drag");
+        EndMouseDrag(active);
+        Until("Releasing at the center must exchange exactly the two slots from the preview", () =>
+            hidden() && VisibleFrame(active) == centerPreview && VisibleFrame(windows[target]) == source
+            && VisibleFrame(windows[anchor]) == original[anchor]);
+
+        BeginMouseDrag(active);
+        MoveFrameTo(active, centerPreview, Center(source));
+        WaitForDropPreview(manager, "The center of the original slot should accept the return", r => r == source);
+        EndMouseDrag(active);
+        Until("A second center drop should restore the original layout", () => hidden() && unchanged());
+
+        BeginMouseDrag(active);
+        MoveFrameTo(active, source, center);
+        WaitForDropPreview(manager, "The target should be visible before cancelling", r => r == host);
+        // Native Esc restores the dragged HWND to its start frame before END.
+        SetDragFrame(active, source);
+        EndMouseDrag(active);
+        Until("A cancelled caption drag must dismiss its preview and preserve all frames", () => hidden() && unchanged());
+
+        BeginMouseDrag(active);
+        MoveFrameTo(active, source, center);
+        WaitForDropPreview(manager, "A fresh drag should show the target again", r => r == host);
+        MoveFrameTo(active, source, new Point(work.Right + 16, center.Y));
+        Until("Leaving the work area should clear the drop preview before END", hidden);
+        EndMouseDrag(active);
+        Until("Dropping outside the work area should restore all original slots", () => hidden() && unchanged());
+
+        BeginMouseDrag(active);
+        MoveFrameTo(active, source, edge);
+        var split = WaitForDropPreview(manager, "Returning to the edge should show its split", firstHalf);
+        EndMouseDrag(active);
+        var remainder = stack ? Rectangle.FromLTRB(host.Left, split.Bottom + gap, host.Right, host.Bottom)
+            : Rectangle.FromLTRB(split.Right + gap, host.Top, host.Right, host.Bottom);
+        Until("The released tile should occupy its exact preview, the target should fill the rest, and its old sibling should expand", () =>
+            hidden() && VisibleFrame(active) == split && VisibleFrame(windows[target]) == remainder
+            && VisibleFrame(windows[anchor]) == Rectangle.Union(source, original[anchor]));
+        Require(GetForegroundWindow() == foreground, "Completing the drag changed the foreground window");
+        Console.WriteLine("PASS  Native caption drag previews edge and center without focus changes, commits the exact shown tile, and cancels on Escape or outside the work area");
+    }
     static void MouseResize(Child manager, IntPtr[] windows, int anchor, int gap, Rectangle work) {
         var original = windows.Select(VisibleFrame).ToArray();
         var active = windows[anchor];
@@ -1114,6 +1214,7 @@ internal static class DesktopSmoke {
             Require(windows.Select(CornerPreference).SequenceEqual(FixtureCorners), "Tiling changed an app's corner preference");
             Console.WriteLine("PASS  Outer gutter and native round, small, and square corner preferences preserved");
             MouseResize(manager, windows, anchor, outerGap, area);
+            MouseMove(manager, windows, anchor, outerGap, area);
 
             bool resized = ResizeOnHiddenDesktop(manager, windows);
             Console.WriteLine(resized ? "PASS  Shortcut dispatch, opposite arrows, Escape and Enter"

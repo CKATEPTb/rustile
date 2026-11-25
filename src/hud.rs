@@ -13,7 +13,7 @@ use crate::native;
 use crate::settings::{Settings, Shortcut};
 
 mod outline;
-pub use outline::FocusOutline;
+pub use outline::{DropPreview, FocusOutline};
 
 // A layered transparent popup passes mouse input to the actual app, even
 // across thread boundaries. It exists only while resizing a tile.
