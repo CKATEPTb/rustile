@@ -1,5 +1,6 @@
 mod bindings;
 
+use crate::profile_io;
 use bindings::Overrides;
 pub(crate) use bindings::{Chord, Shortcut};
 
@@ -189,7 +190,7 @@ impl Settings {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match fs::read_to_string(path) {
+        let text = match profile_io::with_user(|| fs::read_to_string(path)) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("Не удалось прочитать {}: {e}", path.display())),
@@ -202,7 +203,7 @@ impl Settings {
     // must leave the previous settings file intact.
     pub fn prepare(&self, path: &Path) -> Result<PendingSave, String> {
         let content = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        PendingSave::new(path, content.as_bytes())
+        profile_io::with_user(|| PendingSave::new(path, content.as_bytes()))
             .map_err(|e| format!("Не удалось записать {}: {e}", path.display()))
     }
 }
@@ -243,27 +244,26 @@ impl PendingSave {
         let wide = |s: &OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<_>>();
         let src = wide(self.tmp.as_os_str());
         let dst = wide(self.path.as_os_str());
-        if unsafe {
-            MoveFileExW(
-                src.as_ptr(),
-                dst.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(format!(
-                "Не удалось заменить {}: {}",
-                self.path.display(),
-                io::Error::last_os_error()
-            ));
-        }
-        Ok(())
+        profile_io::with_user(|| {
+            if unsafe {
+                MoveFileExW(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("Не удалось заменить {}: {e}", self.path.display()))
     }
 }
 
 impl Drop for PendingSave {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.tmp);
+        let _ = profile_io::with_user(|| fs::remove_file(&self.tmp));
     }
 }
 

@@ -10,15 +10,18 @@ embed-resource = "3"
 [target.'cfg(windows)'.dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+windows = { version = "0.62.2", default-features = false, features = ["Win32_System_TaskScheduler", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Ole"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",

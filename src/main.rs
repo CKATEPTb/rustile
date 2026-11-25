@@ -9,6 +9,8 @@ mod manager;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod profile_io;
+#[cfg(windows)]
 mod runtime;
 #[cfg(windows)]
 mod settings;
@@ -22,6 +24,19 @@ use manager::Manager;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    // Both the consent helper and the scheduled GUI use only system DLLs.
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{
+            LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+        };
+        if SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) == 0 {
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit) = startup::consent::handle_helper(&args) {
+        return exit;
+    }
     // Explorer launches Rustile without a console. A command-line launch can
     // still print help and accept Ctrl+C from the existing parent console.
     unsafe {
@@ -29,7 +44,7 @@ fn main() -> std::process::ExitCode {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
     native::init_dpi();
-    match runtime::run() {
+    match runtime::run_with_args(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("Rustile: {message}");

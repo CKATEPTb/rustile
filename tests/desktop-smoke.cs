@@ -695,6 +695,11 @@ internal static class DesktopSmoke {
                     && area.Contains(expanded), "Showing the administrator switch broke the tray anchor");
                 TrayKey(tray, startup, Keys.Down);
                 TrayFocus(tray, admin);
+                // The isolated consent provider declines the first request.
+                TrayKey(tray, admin, Keys.Enter);
+                TrayButton(tray, admin + ", Настраивается…");
+                TrayButton(tray, admin + ", Выключено");
+                TrayButton(tray, startup + ", Включено");
                 TrayKey(tray, admin, Keys.Enter);
                 TrayButton(tray, admin + ", Включено");
                 TrayFocus(tray, admin);
@@ -728,7 +733,7 @@ internal static class DesktopSmoke {
                 }
             }
         }
-        Console.WriteLine("PASS  Startup switches update isolated HKCU through keyboard and mouse, keep the flyout anchored and restore the saved mode on reopen");
+        Console.WriteLine("PASS  The administrator switch waits for approval, preserves regular startup after cancellation and restores the accepted mode on reopen (isolated registry and task)");
     }
     static void TraySettings(Child manager, string rustile, string desktop, List<Child> children,
         IntPtr[] pair, Rectangle[] originals, Rectangle area) {

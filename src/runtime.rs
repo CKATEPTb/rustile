@@ -216,7 +216,7 @@ fn dispatch(manager: &mut Manager, target: isize, command: i32) {
     }
 }
 
-fn show_error(detail: &str) {
+pub(crate) fn show_error(detail: &str) {
     let message: Vec<u16> = detail.encode_utf16().chain(Some(0)).collect();
     unsafe {
         MessageBoxW(
@@ -309,6 +309,8 @@ fn pump(
     let mut events = Vec::new();
     let mut desktop_timer = MessageTimer::default();
     let mut drag_timer = MessageTimer::default();
+    let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
+    let thread_id = unsafe { GetCurrentThreadId() };
     let mut retries = 0;
     if manager.take_desktop_retry() {
         retries = 2;
@@ -392,16 +394,36 @@ fn pump(
                 DispatchMessageW(&message);
             }
         }
+        if let Ok(result) = startup_rx.try_recv() {
+            match result {
+                Ok(actual) => tray.set_startup(Some(actual)),
+                Err(detail) => {
+                    tray.set_startup(startup::Startup::read().ok());
+                    show_error(&detail);
+                }
+            }
+        }
         while let Some(command) = tray.take_command() {
             match command {
                 Command::Exit => return Ok(()),
                 Command::SetStartup(mode) => {
-                    match mode.apply() {
-                        Ok(()) => tray.set_startup(Some(mode)),
-                        Err(detail) => {
-                            tray.set_startup(startup::Startup::read().ok());
-                            show_error(&detail);
-                        }
+                    if !tray.begin_startup_change() {
+                        continue;
+                    }
+                    // A UAC prompt can stay open indefinitely. Keep processing
+                    // WinEvents and the keyboard hook on their installing thread.
+                    let sender = startup_tx.clone();
+                    if let Err(error) =
+                        std::thread::Builder::new()
+                            .name("startup".into())
+                            .spawn(move || {
+                                if sender.send(mode.apply()).is_ok() {
+                                    unsafe { PostThreadMessageW(thread_id, WM_NULL, 0, 0) };
+                                }
+                            })
+                    {
+                        tray.set_startup(startup::Startup::read().ok());
+                        show_error(&format!("Не удалось начать настройку автозапуска: {error}"));
                     }
                     continue;
                 }
@@ -464,24 +486,17 @@ impl Drop for Instance {
 
 const USAGE: &str = "rustile [--resize-shortcut win+enter|ctrl+alt+enter]\nПо умолчанию размер изменяется через Win+Enter.";
 
-pub fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    run_with_args(&args)
-}
-
-fn run_with_args(args: &[String]) -> Result<(), String> {
+pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
     let resize_override = match args {
         [] => None,
-        [flag] if flag == startup::ELEVATED_FLAG => {
-            // Windows may restore an instance before its logon entry runs.
-            // Check before asking for consent, then let the child own the mutex.
-            drop(Instance::acquire()?);
-            match startup::launch_elevated() {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(detail) => show_error(&format!(
-                    "Rustile продолжит запуск с обычными правами.\n\n{detail}"
-                )),
+        [flag]
+            if matches!(
+                flag.as_str(),
+                startup::STARTUP_FLAG | startup::LEGACY_ELEVATED_FLAG
+            ) =>
+        {
+            if !startup::run_at_logon()? {
+                return Ok(());
             }
             None
         }

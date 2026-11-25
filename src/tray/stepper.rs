@@ -78,7 +78,7 @@ impl State {
     }
 
     pub(super) fn refresh_rows(&self, hwnd: HWND) {
-        let rows = menu::rows(self.settings.get(), self.startup.get());
+        let rows = self.menu_rows();
         for (index, row) in rows.iter().enumerate() {
             let btn = row_hwnd(hwnd, index);
             if btn.is_null() {

@@ -60,6 +60,7 @@ fn load_app_icon(width: i32, height: i32) -> HICON {
 struct State {
     settings: Cell<Settings>,
     startup: Cell<Option<Startup>>,
+    startup_pending: Cell<bool>,
     commands: RefCell<VecDeque<Command>>,
     applying: Cell<Option<Command>>,
     tray_icon: HICON,
@@ -117,6 +118,7 @@ impl Tray {
             let state = Box::new(State {
                 settings: Cell::new(settings),
                 startup: Cell::new(None),
+                startup_pending: Cell::new(false),
                 commands: RefCell::default(),
                 applying: Cell::new(None),
                 tray_icon: icon,
@@ -185,10 +187,21 @@ impl Tray {
         self.state.shortcuts.result(error);
     }
 
+    pub fn begin_startup_change(&self) -> bool {
+        if self.state.startup_pending.replace(true) {
+            return false;
+        }
+        if unsafe { IsWindowVisible(self.hwnd) } != 0 {
+            self.state.refresh_rows(self.hwnd);
+        }
+        true
+    }
+
     pub fn set_startup(&self, value: Option<Startup>) {
+        let was_pending = self.state.startup_pending.replace(false);
         self.state.applying.set(None);
         let previous = self.state.startup.replace(value);
-        if previous == value || unsafe { IsWindowVisible(self.hwnd) } == 0 {
+        if (!was_pending && previous == value) || unsafe { IsWindowVisible(self.hwnd) } == 0 {
             return;
         }
         let has_admin_row = |mode| matches!(mode, Some(Startup::Normal | Startup::Elevated));
@@ -310,6 +323,18 @@ impl Drop for State {
 }
 
 impl State {
+    fn menu_rows(&self) -> Vec<Row> {
+        let mut rows = menu::rows(self.settings.get(), self.startup.get());
+        if self.startup_pending.get() {
+            for row in &mut rows {
+                if matches!(row.action, Action::Apply(Command::SetStartup(_))) {
+                    row.detail = "Настраивается…".into();
+                }
+            }
+        }
+        rows
+    }
+
     fn icon_data(&self, hwnd: HWND) -> NOTIFYICONDATAW {
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -365,11 +390,13 @@ impl State {
     fn show(&self, hwnd: HWND, point: POINT, keyboard: bool) {
         self.anchor.set(point);
         self.keyboard.set(keyboard);
-        self.startup.set(
-            Startup::read()
-                .inspect_err(|e| eprintln!("Rustile: {e}"))
-                .ok(),
-        );
+        if !self.startup_pending.get() {
+            self.startup.set(
+                Startup::read()
+                    .inspect_err(|e| eprintln!("Rustile: {e}"))
+                    .ok(),
+            );
+        }
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
         let (mut x, mut y) = (96, 96);
         unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
@@ -488,7 +515,7 @@ impl State {
 
     fn layout(&self, hwnd: HWND) {
         self.hot.set(null_mut());
-        let rows = menu::rows(self.settings.get(), self.startup.get());
+        let rows = self.menu_rows();
         let count = rows.len();
         *self.entries.borrow_mut() = rows;
         let point = self.anchor.get();
@@ -641,6 +668,9 @@ impl State {
                 }
             }
             Some(Action::Apply(command)) => {
+                if matches!(command, Command::SetStartup(_)) && self.startup_pending.get() {
+                    return;
+                }
                 self.commands.borrow_mut().push_back(command);
                 if !matches!(command, Command::SetStartup(_)) {
                     self.hide(hwnd, true);
