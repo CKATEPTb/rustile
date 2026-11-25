@@ -1,3 +1,5 @@
+pub(crate) mod desktops;
+
 use crate::layout::{Id, Rect};
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -223,17 +225,21 @@ fn frame_bounds(hwnd: HWND, outer: Rect) -> Rect {
     measured_frame(hwnd, outer).unwrap_or(outer)
 }
 
-fn uncloaked(hwnd: HWND) -> bool {
+pub fn cloaked(id: Id) -> bool {
     let mut cloak = 0u32;
     let result = unsafe {
         DwmGetWindowAttribute(
-            hwnd,
+            id as HWND,
             DWMWA_CLOAKED as u32,
             (&mut cloak as *mut u32).cast(),
             size_of::<u32>() as u32,
         )
     };
-    result >= 0 && cloak == 0
+    result < 0 || cloak != 0
+}
+
+pub fn minimized_or_maximized(id: Id) -> bool {
+    unsafe { IsIconic(id as HWND) != 0 || IsZoomed(id as HWND) != 0 }
 }
 
 /// Visible frame and work area for an already-managed tile on the primary display.
@@ -241,10 +247,9 @@ pub fn outline_frame(id: Id) -> Option<(Rect, Rect)> {
     let hwnd = id as HWND;
     unsafe {
         if IsWindowVisible(hwnd) == 0
-            || IsIconic(hwnd) != 0
-            || IsZoomed(hwnd) != 0
+            || minimized_or_maximized(id)
             || IsWindowEnabled(hwnd) == 0
-            || !uncloaked(hwnd)
+            || cloaked(id)
         {
             return None;
         }
@@ -263,8 +268,7 @@ pub fn eligible(id: Id) -> bool {
     }
     unsafe {
         if IsWindowVisible(hwnd) == 0
-            || IsIconic(hwnd) != 0
-            || IsZoomed(hwnd) != 0
+            || minimized_or_maximized(id)
             || GetAncestor(hwnd, GA_ROOT) != hwnd
             || !GetWindow(hwnd, GW_OWNER).is_null()
             || hwnd == GetShellWindow()
@@ -277,7 +281,7 @@ pub fn eligible(id: Id) -> bool {
         if style & WS_CHILD != 0
             || style & WS_THICKFRAME == 0
             || extended & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_DLGMODALFRAME) != 0
-            || !uncloaked(hwnd)
+            || cloaked(id)
             || shell_or_dialog(hwnd)
         {
             return false;
@@ -358,6 +362,10 @@ impl FrameInsets {
 }
 
 impl Original {
+    pub fn is_at(&self, target: Rect) -> bool {
+        outer_bounds(self.id as HWND) == Some(self.insets.outer_for(target))
+    }
+
     pub fn matches(&self, id: Id) -> bool {
         id == self.id
             && pid(id) == self.owner

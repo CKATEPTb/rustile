@@ -19,6 +19,8 @@ use windows_sys::core::w;
 
 use super::{Direction, Id, Manager, Rect, native};
 
+mod virtual_desktops;
+
 // The C# harness creates the fixture windows on a private Win32 desktop.
 // Confirm both the desktop and the window membership before touching geometry.
 fn fixtures() -> [Id; 6] {
@@ -83,7 +85,7 @@ fn frame(id: Id) -> Rect {
 }
 
 fn settle(manager: &Manager, count: usize) {
-    let expected = manager.layout.placements(manager.area.unwrap());
+    let expected = manager.workspace.layout.placements(manager.area.unwrap());
     assert_eq!(expected.len(), count);
     let start = Instant::now();
     loop {
@@ -456,6 +458,8 @@ fn focused_arrivals(manager: &mut Manager, windows: [Id; 6], area: Rect) {
 
     set_visible(e, false);
     manager.event(EVENT_OBJECT_HIDE, e);
+    manager.settle_hidden();
+    manager.apply();
     settle(manager, 4);
     assert_eq!(
         [a, b, c, d].map(frame),
@@ -783,6 +787,7 @@ fn move_windows() {
     run(move_down_beside_tall_window);
     run(move_right_in_a_tall_pair);
     run(share_upper_tile_in_six_windows);
+    run(virtual_desktops::round_trip);
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));
     run(|manager, windows, _| {
@@ -793,9 +798,10 @@ fn move_windows() {
         assert!(manager.admit(id, None));
         // Give the fixture a known minimum that just fits the area. Real HWND
         // placement and persistence must both stay untouched if padding fails.
-        manager.layout = super::Layout::with_gap(native::spacing_px(settings.gap));
+        manager.workspace.layout = super::Layout::with_gap(native::spacing_px(settings.gap));
         assert!(
             manager
+                .workspace
                 .layout
                 .insert_with_minimum(id, area, (area.w, area.h))
         );
@@ -823,7 +829,7 @@ fn move_windows() {
         manager.event(EVENT_OBJECT_SHOW, windows[1]);
         assert!(!manager.begin_resize(id));
         assert!(manager.refresh_focus().is_none());
-        assert_eq!(manager.layout.placements(area), [(id, area)]);
+        assert_eq!(manager.workspace.layout.placements(area), [(id, area)]);
         assert_eq!(frame(id), area);
         manager.restore_positions();
     });

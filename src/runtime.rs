@@ -14,9 +14,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
 };
-use windows_sys::Win32::System::StationsAndDesktops::{
-    GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
-};
+use windows_sys::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -25,6 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
+use crate::native::desktops::object_name;
 use crate::settings::{Command, Modifier, Settings};
 use crate::tray::Tray;
 
@@ -39,6 +38,7 @@ const MOVE: i32 = 50;
 const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
+const DESKTOP_SETTLE_MS: u32 = 160;
 
 // GetMessage dispatches out-of-context WinEvents on the hook's installing thread.
 // Defer all application work until the callback returns, including Win32 calls
@@ -67,7 +67,9 @@ unsafe extern "system" fn on_window_event(
     _: u32,
     _: u32,
 ) {
-    if hwnd.is_null() || (event >= EVENT_OBJECT_CREATE && (object != OBJID_WINDOW || child != 0)) {
+    if (hwnd.is_null() && event != EVENT_SYSTEM_DESKTOPSWITCH)
+        || (event >= EVENT_OBJECT_CREATE && (object != OBJID_WINDOW || child != 0))
+    {
         return;
     }
     // Controls can emit LOCATIONCHANGE at scroll/animation rates. Never query
@@ -100,6 +102,7 @@ impl EventHooks {
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
             (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+            (EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
@@ -277,6 +280,45 @@ impl Preferences<'_> {
     }
 }
 
+// Explorer may report visibility and desktop membership at different points in
+// a switch. Recheck once after the burst, including switches to an empty desktop.
+#[derive(Default)]
+struct DesktopSettleTimer(usize);
+
+impl DesktopSettleTimer {
+    fn schedule(&mut self, delay_ms: u32) -> bool {
+        let timer = unsafe { SetTimer(null_mut(), self.0, delay_ms, None) };
+        if timer != 0 {
+            self.0 = timer;
+        }
+        timer != 0
+    }
+
+    fn take(&mut self, message: &MSG) -> bool {
+        if self.0 == 0
+            || message.message != WM_TIMER
+            || !message.hwnd.is_null()
+            || message.wParam != self.0
+        {
+            return false;
+        }
+        self.cancel();
+        true
+    }
+
+    fn cancel(&mut self) {
+        if self.0 != 0 {
+            unsafe { KillTimer(null_mut(), std::mem::take(&mut self.0)) };
+        }
+    }
+}
+
+impl Drop for DesktopSettleTimer {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 fn pump(
     manager: &mut Manager,
     hook: &shortcuts::Hook,
@@ -285,6 +327,14 @@ fn pump(
 ) -> Result<(), String> {
     let mut message = MSG::default();
     let mut events = Vec::new();
+    let mut desktop_timer = DesktopSettleTimer::default();
+    let mut retries = 0;
+    if manager.take_desktop_retry() {
+        retries = 2;
+        if !desktop_timer.schedule(DESKTOP_SETTLE_MS) {
+            manager.reconcile_desktop();
+        }
+    }
     loop {
         match unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } {
             -1 => {
@@ -297,10 +347,36 @@ fn pump(
             _ => {}
         }
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
-        if !events.is_empty() {
-            for (event, id) in events.drain(..) {
+        let has_events = !events.is_empty();
+        let timer_fired = desktop_timer.take(&message);
+        let mut settling = false;
+        for (event, id) in events.drain(..) {
+            settling |= matches!(
+                event,
+                EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
+            ) || (event == EVENT_OBJECT_HIDE && manager.tracks_window(id));
+            if event != EVENT_SYSTEM_DESKTOPSWITCH {
                 manager.event(event, id);
             }
+        }
+        let unresolved = manager.take_desktop_retry();
+        let reconcile = if settling || (unresolved && desktop_timer.0 == 0 && !timer_fired) {
+            retries = 2;
+            !desktop_timer.schedule(DESKTOP_SETTLE_MS)
+        } else {
+            timer_fired
+        };
+        if reconcile {
+            manager.reconcile_desktop();
+            // A new top-level HWND can briefly have no desktop GUID. Give the
+            // shell time to register it, without polling an idle desktop forever.
+            if manager.take_desktop_retry() && retries > 0 {
+                let delay = if retries == 2 { 2 } else { 4 };
+                retries -= 1;
+                desktop_timer.schedule(DESKTOP_SETTLE_MS * delay);
+            }
+        }
+        if has_events || reconcile {
             refresh(manager, 0);
         }
         if message.message == WM_HOTKEY && message.wParam == QUIT as usize {
@@ -333,32 +409,8 @@ fn pump(
         }
     }
 }
-struct Instance(HANDLE);
 
-fn object_name(handle: HANDLE) -> Result<String, String> {
-    let mut bytes = 0;
-    unsafe { GetUserObjectInformationW(handle, UOI_NAME, null_mut(), 0, &mut bytes) };
-    let mut name = vec![0u16; (bytes as usize).div_ceil(2)];
-    if bytes == 0
-        || unsafe {
-            GetUserObjectInformationW(
-                handle,
-                UOI_NAME,
-                name.as_mut_ptr().cast(),
-                bytes,
-                &mut bytes,
-            )
-        } == 0
-    {
-        return Err(format!(
-            "Имя рабочего стола: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(String::from_utf16_lossy(
-        name.strip_suffix(&[0]).unwrap_or(&name),
-    ))
-}
+struct Instance(HANDLE);
 
 impl Instance {
     fn acquire() -> Result<Self, String> {

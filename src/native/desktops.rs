@@ -1,0 +1,235 @@
+use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
+use std::io;
+use std::ptr::{NonNull, null, null_mut};
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{
+    CO_E_OBJNOTCONNECTED, CO_E_SERVER_STOPPING, HANDLE, HWND, RPC_E_CHANGED_MODE,
+    RPC_E_DISCONNECTED, RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE,
+};
+use windows_sys::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize,
+};
+use windows_sys::Win32::System::StationsAndDesktops::{
+    GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
+};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Shell::VirtualDesktopManager;
+use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+use windows_sys::core::{BOOL, GUID, HRESULT, IUnknown_Vtbl, w};
+
+use crate::layout::Id;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DesktopId(pub(crate) u128);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopMembership {
+    Current(DesktopId),
+    Other(DesktopId),
+    Unknown,
+}
+
+pub(crate) fn object_name(handle: HANDLE) -> Result<String, String> {
+    let mut bytes = 0;
+    unsafe { GetUserObjectInformationW(handle, UOI_NAME, null_mut(), 0, &mut bytes) };
+    let mut name = vec![0u16; (bytes as usize).div_ceil(2)];
+    if bytes == 0
+        || unsafe {
+            GetUserObjectInformationW(
+                handle,
+                UOI_NAME,
+                name.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        } == 0
+    {
+        return Err(format!(
+            "Имя рабочего стола: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(String::from_utf16_lossy(
+        name.strip_suffix(&[0]).unwrap_or(&name),
+    ))
+}
+
+fn shell_window() -> HWND {
+    unsafe { FindWindowW(w!("Shell_TrayWnd"), null()) }
+}
+
+// The public, stable IVirtualDesktopManager ABI in ShObjIdl_core.h. windows-sys
+// exposes its CLSID and the IUnknown header, but omits the interface methods.
+const IID_DESKTOP_MANAGER: GUID = GUID::from_u128(0xa5cd92ff_29be_454c_8d04_d82879fb3f1b);
+
+#[repr(C)]
+struct DesktopVtable {
+    base: IUnknown_Vtbl,
+    is_current: unsafe extern "system" fn(*mut c_void, HWND, *mut BOOL) -> HRESULT,
+    desktop_id: unsafe extern "system" fn(*mut c_void, HWND, *mut GUID) -> HRESULT,
+    _move_window_to_desktop: unsafe extern "system" fn(*mut c_void, HWND, *const GUID) -> HRESULT,
+}
+
+struct Service {
+    interface: NonNull<*const DesktopVtable>,
+    shell: HWND,
+}
+
+impl Service {
+    fn connect() -> Option<Self> {
+        let mut ptr = null_mut();
+        let result = unsafe {
+            CoCreateInstance(
+                &VirtualDesktopManager,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_DESKTOP_MANAGER,
+                &mut ptr,
+            )
+        };
+        if result < 0 {
+            return None;
+        }
+        Some(Self {
+            interface: NonNull::new(ptr.cast())?,
+            shell: shell_window(),
+        })
+    }
+
+    fn vtable(&self) -> &DesktopVtable {
+        // CoCreateInstance returned this exact IID and we own its reference.
+        unsafe { &**self.interface.as_ptr() }
+    }
+
+    fn query(&self, hwnd: HWND) -> Result<DesktopMembership, HRESULT> {
+        let this = self.interface.as_ptr().cast();
+        let mut guid = GUID::default();
+        let result = unsafe { (self.vtable().desktop_id)(this, hwnd, &mut guid) };
+        if result < 0 {
+            return Err(result);
+        }
+        let id = DesktopId(
+            (u128::from(guid.data1) << 96)
+                | (u128::from(guid.data2) << 80)
+                | (u128::from(guid.data3) << 64)
+                | u128::from(u64::from_be_bytes(guid.data4)),
+        );
+        // The shell also returns GUID_NULL for windows without a workspace.
+        if id.0 == 0 {
+            return Ok(DesktopMembership::Unknown);
+        }
+        let mut current = 0;
+        let result = unsafe { (self.vtable().is_current)(this, hwnd, &mut current) };
+        if result < 0 {
+            return Err(result);
+        }
+        Ok(if current != 0 {
+            DesktopMembership::Current(id)
+        } else {
+            DesktopMembership::Other(id)
+        })
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        unsafe { (self.vtable().base.Release)(self.interface.as_ptr().cast()) };
+    }
+}
+
+pub(crate) struct Desktops {
+    isolated: bool,
+    com_result: HRESULT,
+    service: RefCell<Option<Service>>,
+    retry_after: Cell<Option<Instant>>,
+    #[cfg(test)]
+    fixture: Option<std::collections::HashMap<Id, DesktopMembership>>,
+}
+
+impl Desktops {
+    pub fn new() -> Self {
+        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+        // A private Win32 desktop has no Explorer virtual desktops. A temporary
+        // shell outage on Default must never merge its saved workspaces.
+        let isolated = object_name(desktop).is_ok_and(|name| !name.eq_ignore_ascii_case("Default"))
+            && shell_window().is_null();
+        let com_result = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
+        Self {
+            isolated,
+            com_result,
+            service: RefCell::default(),
+            retry_after: Cell::default(),
+            #[cfg(test)]
+            fixture: None,
+        }
+    }
+
+    pub fn membership(&self, id: Id) -> DesktopMembership {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return fixture
+                .get(&id)
+                .copied()
+                .unwrap_or(DesktopMembership::Unknown);
+        }
+        if self.isolated {
+            return DesktopMembership::Current(DesktopId(0));
+        }
+        if (self.com_result < 0 && self.com_result != RPC_E_CHANGED_MODE)
+            || self.retry_after.get().is_some_and(|at| Instant::now() < at)
+        {
+            return DesktopMembership::Unknown;
+        }
+        let mut cached = self.service.borrow_mut();
+        for _ in 0..2 {
+            if cached.is_none() {
+                *cached = Service::connect();
+            }
+            let Some(service) = cached.as_ref() else {
+                break;
+            };
+            match service.query(id as HWND) {
+                Ok(membership) => return membership,
+                Err(code)
+                    if matches!(
+                        code,
+                        RPC_E_DISCONNECTED
+                            | RPC_E_SERVER_DIED
+                            | RPC_E_SERVER_DIED_DNE
+                            | CO_E_OBJNOTCONNECTED
+                            | CO_E_SERVER_STOPPING
+                    ) || shell_window() != service.shell =>
+                {
+                    *cached = None;
+                }
+                Err(_) => return DesktopMembership::Unknown,
+            }
+        }
+        // Retry on the next window event after this deadline; no idle timer.
+        self.retry_after
+            .set(Some(Instant::now() + Duration::from_millis(150)));
+        DesktopMembership::Unknown
+    }
+
+    #[cfg(test)]
+    pub fn set_memberships(
+        &mut self,
+        memberships: impl IntoIterator<Item = (Id, DesktopMembership)>,
+    ) {
+        self.fixture = Some(memberships.into_iter().collect());
+    }
+}
+
+impl Drop for Desktops {
+    fn drop(&mut self) {
+        self.service.get_mut().take();
+        // S_OK and S_FALSE both need balancing on this thread. An apartment
+        // already initialized in a different model remains owned by its caller.
+        if self.com_result >= 0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}

@@ -17,6 +17,7 @@ internal static class DesktopSmoke {
     const uint TrayCallback = 0x8000 + 20;
     const int TraySelect = 0x400, TrayContext = 0x7b, TrayKeyboard = 0x401;
     const int ShowFixtureDialog = 0x8001, RequestFocus = 0x8002;
+    const int ReadGeometryChanges = 0x8003, SetFixtureCloak = 0x8004;
     const int ExtendedFrameBounds = 9, WindowCornerPreference = 33;
     static readonly int[] FixtureCorners = { 2, 3, 1 }; // round, small, square
 
@@ -89,6 +90,8 @@ internal static class DesktopSmoke {
     }
 
     class Fixture : Form {
+        Rectangle lastBounds;
+        int geometryChanges;
         public Fixture(int index) {
             Text = "Rustile fixture " + index;
             var work = Screen.PrimaryScreen.WorkingArea;
@@ -103,8 +106,23 @@ internal static class DesktopSmoke {
                 MessageBox.Show(this, "Owned modal window", "Rustile fixture dialog");
             } else if (m.Msg == RequestFocus) {
                 Activate();
+            } else if (m.Msg == ReadGeometryChanges) {
+                m.Result = (IntPtr)geometryChanges;
+            } else if (m.Msg == SetFixtureCloak) {
+                int value = m.WParam == IntPtr.Zero ? 0 : 1;
+                m.Result = (IntPtr)DwmSetWindowAttribute(Handle, 13 /* DWMWA_CLOAK */, ref value, sizeof(int));
             } else {
                 base.WndProc(ref m);
+                if (m.Msg == 0x47 /* WM_WINDOWPOSCHANGED */) {
+                    Rect rect;
+                    if (GetWindowRect(m.HWnd, out rect)) {
+                        var bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+                        if (bounds != lastBounds) {
+                            lastBounds = bounds;
+                            geometryChanges++;
+                        }
+                    }
+                }
             }
         }
     }
@@ -530,6 +548,7 @@ internal static class DesktopSmoke {
             Require(GetProp(windows[0], "Rustile.Smoke.MovePassed") != IntPtr.Zero, "Manager test did not run");
             Until("Manager should restore all six fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Five real windows: three plus two slots, level DWM heights after resize and horizontal moves");
+            Console.WriteLine("PASS  Virtual desktop switch events preserve both layouts, resized splits and pending moves on the first return");
             Console.WriteLine(windows.Any(w => GetProp(w, "Rustile.Smoke.StaggeredPassed") != IntPtr.Zero)
                 ? "PASS  Staggered Down shares the lower tile with backfill, then takes it; Up shares the L before completing the return"
                 : "SKIP  Staggered preview: the remainder is below the application minimum on this display");
