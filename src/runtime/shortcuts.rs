@@ -10,7 +10,10 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use super::{CANCEL, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, SHRINK, START_RESIZE};
+use super::{
+    CANCEL, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK,
+    START_RESIZE,
+};
 use crate::manager::Mode;
 use crate::settings::{Chord, Settings, Shortcut};
 
@@ -104,6 +107,14 @@ fn command_id(action: Shortcut) -> u8 {
         ShrinkDown => SHRINK + 3,
         Confirm => CONFIRM,
         Cancel => CANCEL,
+        QuickLeft => QUICK_RESIZE,
+        QuickRight => QUICK_RESIZE + 1,
+        QuickUp => QUICK_RESIZE + 2,
+        QuickDown => QUICK_RESIZE + 3,
+        QuickReverseLeft => QUICK_REVERSE,
+        QuickReverseRight => QUICK_REVERSE + 1,
+        QuickReverseUp => QUICK_REVERSE + 2,
+        QuickReverseDown => QUICK_REVERSE + 3,
     };
     id as u8
 }
@@ -139,8 +150,9 @@ impl Press {
             return Action::Pass;
         }
         if let Some(id) = command {
-            let repeatable =
-                (EXPAND..EXPAND + 4).contains(&id) || (SHRINK..SHRINK + 4).contains(&id);
+            let repeatable = [EXPAND, SHRINK, QUICK_RESIZE, QUICK_REVERSE]
+                .into_iter()
+                .any(|first| (first..first + 4).contains(&id));
             if !consumed || (*self == Self::ResizeStep && repeatable) {
                 *self = if repeatable {
                     Self::ResizeStep
@@ -493,7 +505,51 @@ mod tests {
     }
 
     #[test]
-    fn quick_resize_cancellation_ignores_an_older_acknowledgement() {
+    fn quick_resize_repeats_and_reverses_without_entering_modal_routing() {
+        let mut k = Keyboard::new();
+        let mods = MOD_WIN | MOD_ALT;
+        for modifier in [VK_LWIN, VK_RWIN, VK_MENU] {
+            assert_eq!(k.key(modifier, true, mods), Action::Pass);
+            assert_eq!(k.key(modifier, false, 0), Action::Pass);
+        }
+        for (slot, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
+            for flags in [mods, mods, mods | MOD_SHIFT, mods] {
+                let id = if flags == mods {
+                    QUICK_RESIZE
+                } else {
+                    QUICK_REVERSE
+                };
+                assert_eq!(k.key(key, true, flags), Action::Command(id + slot as i32));
+            }
+            assert_eq!(k.key(key, true, MOD_WIN), Action::Consume);
+            assert_eq!(k.key(key, false, 0), Action::Consume);
+            assert_eq!(k.key(key, true, 0), Action::Pass);
+            assert_eq!(k.key(key, false, 0), Action::Pass);
+        }
+        assert_eq!(k.pending.ticket, 0);
+        k.state.target = 0;
+        assert_eq!(k.key(VK_LEFT, true, mods), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, false, 0), Action::Pass);
+    }
+
+    #[test]
+    fn rebinding_a_quick_resize_chord_releases_its_old_keys() {
+        let mut k = Keyboard::new();
+        k.assign(Shortcut::QuickUp, MOD_CONTROL, VK_F8);
+        assert_eq!(k.key(VK_UP, true, MOD_WIN | MOD_ALT), Action::Pass);
+        assert_eq!(k.key(VK_UP, false, 0), Action::Pass);
+        assert_eq!(
+            k.key(VK_F8, true, MOD_CONTROL),
+            Action::Command(QUICK_RESIZE + 2)
+        );
+        assert_eq!(k.key(VK_F8, false, 0), Action::Consume);
+        k.state.mode = Mode::Resize;
+        assert_eq!(k.key(VK_F8, true, MOD_CONTROL), Action::Pass);
+        assert_eq!(k.key(VK_UP, true, 0), Action::Command(EXPAND + 2));
+    }
+
+    #[test]
+    fn immediate_modal_exit_ignores_an_older_acknowledgement() {
         for mods in [0, MOD_WIN] {
             let mut keyboard = Keyboard::new();
             assert_eq!(

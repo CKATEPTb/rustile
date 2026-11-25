@@ -13,6 +13,8 @@ enum Group {
     Grow,
     Shrink,
     Finish,
+    Quick,
+    QuickReverse,
 }
 
 macro_rules! shortcuts {
@@ -22,7 +24,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 19] = [$( Self::$name, )+];
+            pub const ALL: [Self; 27] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -49,8 +51,16 @@ shortcuts! {
     ShrinkRight, "Вправо (обратно)",   Shrink, VK_RIGHT;
     ShrinkUp,    "Вверх (обратно)",    Shrink, VK_UP;
     ShrinkDown,  "Вниз (обратно)",     Shrink, VK_DOWN;
-    Confirm,     "Применить размер",   Finish, VK_RETURN;
-    Cancel,      "Отменить изменение", Finish, VK_ESCAPE;
+    Confirm,     "Выйти из режима",    Finish, VK_RETURN;
+    Cancel,      "Выйти из режима (доп.)", Finish, VK_ESCAPE;
+    QuickLeft,         "Влево",              Quick, VK_LEFT;
+    QuickRight,        "Вправо",             Quick, VK_RIGHT;
+    QuickUp,           "Вверх",              Quick, VK_UP;
+    QuickDown,         "Вниз",               Quick, VK_DOWN;
+    QuickReverseLeft,  "Влево (обратно)",    QuickReverse, VK_LEFT;
+    QuickReverseRight, "Вправо (обратно)",   QuickReverse, VK_RIGHT;
+    QuickReverseUp,    "Вверх (обратно)",    QuickReverse, VK_UP;
+    QuickReverseDown,  "Вниз (обратно)",     QuickReverse, VK_DOWN;
 }
 
 impl Shortcut {
@@ -82,6 +92,8 @@ impl Shortcut {
             Group::StartResize => settings.resize.bits(),
             Group::Grow | Group::Finish => 0,
             Group::Shrink => MOD_SHIFT,
+            Group::Quick => MOD_WIN | MOD_ALT,
+            Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
         };
         Chord { mods, key }
     }
@@ -167,8 +179,8 @@ impl Chord {
     pub fn modifier_labels(mods: u32) -> impl Iterator<Item = &'static str> {
         [
             (MOD_CONTROL, "Ctrl"),
-            (MOD_ALT, "Alt"),
             (MOD_WIN, "Win"),
+            (MOD_ALT, "Alt"),
             (MOD_SHIFT, "Shift"),
         ]
         .into_iter()
@@ -297,6 +309,21 @@ impl From<StoredOverrides> for Overrides {
         let mut overrides = Self::default();
         for (action, chord) in stored.bindings {
             overrides.0[action.index()] = Some(chord);
+        }
+        // A profile written before quick resize may already own one of its
+        // default chords. Keep that assignment and expose the new action as free.
+        for quick in Shortcut::ALL {
+            if !matches!(quick.spec().1, Group::Quick | Group::QuickReverse)
+                || overrides.0[quick.index()].is_some()
+            {
+                continue;
+            }
+            let chord = Binding::Assigned(quick.default_chord());
+            if Shortcut::ALL.into_iter().any(|other| {
+                quick.shares_context(other) && overrides.0[other.index()] == Some(chord)
+            }) {
+                overrides.0[quick.index()] = Some(Binding::Disabled);
+            }
         }
         overrides
     }

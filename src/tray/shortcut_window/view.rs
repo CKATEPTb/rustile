@@ -2,7 +2,7 @@ use super::*;
 use Shortcut::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-const GROUPS: [(&str, &[Shortcut]); 3] = [
+const GROUPS: [(&str, &[Shortcut]); 4] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
         "Навигация по окнам",
@@ -22,6 +22,19 @@ const GROUPS: [(&str, &[Shortcut]); 3] = [
             ShrinkDown,
             Confirm,
             Cancel,
+        ],
+    ),
+    (
+        "Быстрое изменение размера",
+        &[
+            QuickLeft,
+            QuickRight,
+            QuickUp,
+            QuickDown,
+            QuickReverseLeft,
+            QuickReverseRight,
+            QuickReverseUp,
+            QuickReverseDown,
         ],
     ),
 ];
@@ -231,11 +244,12 @@ impl ShortcutWindow {
     fn layout_rows(&self, view: HWND, width: i32, height: i32) {
         let p = |n| self.p(n);
         let columns = width >= p(710);
+        let column_for = |section: usize| if columns { section % 2 } else { 0 };
         let stacked = width < p(400);
         let row_h = if stacked { p(43) } else { p(29) };
         let header_h = p(29);
         let row_gap = |action| {
-            if matches!(action, GrowLeft | ShrinkLeft | Confirm) {
+            if matches!(action, GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft) {
                 p(3)
             } else {
                 0
@@ -244,7 +258,7 @@ impl ShortcutWindow {
         let mut starts = [0; GROUPS.len()];
         let mut end = [p(7); 2];
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let column = usize::from(columns && i == 2);
+            let column = column_for(i);
             starts[i] = end[column];
             end[column] +=
                 header_h + actions.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(10);
@@ -280,17 +294,13 @@ impl ShortcutWindow {
             p(24),
         );
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let x = if columns && i == 2 {
-                margin + col + gap
-            } else {
-                margin
-            };
+            let x = margin + column_for(i) as i32 * (col + gap);
             let mut y = starts[i] - self.scroll.get();
             place(
                 child(view, SECTION + i as i32),
                 x + p(2),
                 y + p(2),
-                if (columns && i == 2) || (!columns && i == 0) {
+                if i == usize::from(columns) {
                     reset_x - x - p(6)
                 } else {
                     col - p(4)

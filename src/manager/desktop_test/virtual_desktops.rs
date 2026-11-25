@@ -203,7 +203,7 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     let starting = a.map(frame);
     assert!(manager.begin_resize(a[0]));
     manager.resize(a[0], Direction::Right, false);
-    manager.finish_mode(true);
+    manager.finish_mode();
     settle(manager, a.len());
     let resized = a.map(frame);
     assert!(resized[0].w > starting[0].w);

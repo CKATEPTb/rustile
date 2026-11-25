@@ -26,7 +26,8 @@ pub enum Mode {
 
 struct ResizeSession {
     target: Id,
-    before: Layout,
+    // Quick shortcuts share divider stops while the keyboard stays in normal mode.
+    mode: Mode,
     stops: Option<ResizeStops>,
 }
 
@@ -147,7 +148,7 @@ impl Manager {
             return;
         }
         self.pending_app_cloaks.clear();
-        self.rollback_resize();
+        self.finish_mode();
         self.dragging = None;
         self.outline.hide();
         let next = self
@@ -181,7 +182,7 @@ impl Manager {
     fn detach(&mut self, id: Id, desktop: DesktopId) {
         if self.current == Some(desktop) {
             if self.workspace.layout.contains(id) {
-                self.rollback_resize();
+                self.finish_mode();
             }
             self.workspace.remove(id);
             if self.drag_target() == Some(id) {
@@ -243,7 +244,7 @@ impl Manager {
         if self.work_area == Some(work) {
             return;
         }
-        self.rollback_resize();
+        self.finish_mode();
         let dpi_changed = self
             .work_area
             .is_some_and(|previous| previous.dpi != work.dpi);
@@ -367,7 +368,7 @@ impl Manager {
             {
                 continue;
             }
-            self.rollback_resize();
+            self.finish_mode();
             let admitted = if resume {
                 self.admit_new(id)
             } else {
@@ -421,7 +422,7 @@ impl Manager {
     }
 
     fn suspend(&mut self, id: Id) {
-        self.rollback_resize();
+        self.finish_mode();
         if self.drag_target() == Some(id) {
             self.dragging = None;
         }
@@ -480,8 +481,7 @@ impl Manager {
         }
         self.settings = updated;
         if geometry || !updated.enabled {
-            // Keep the visible preview when the user pauses the current arrangement.
-            self.finish_mode(true);
+            self.finish_mode();
         }
         if !updated.enabled {
             self.dragging = None;
@@ -577,6 +577,13 @@ impl Manager {
     pub fn event(&mut self, event: u32, id: Id) {
         if !self.settings.enabled {
             return;
+        }
+        // Start and other shell surfaces can have no virtual desktop ID. A
+        // foreground change still ends resize even if the tile regains focus
+        // before this batch of events reaches refresh_focus.
+        if event == EVENT_SYSTEM_FOREGROUND && self.session.as_ref().is_some_and(|s| s.target != id)
+        {
+            self.finish_mode();
         }
         let known = self.windows.get(&id);
         if event == EVENT_OBJECT_DESTROY || known.is_some_and(|w| !w.original.matches(id)) {
@@ -679,11 +686,6 @@ impl Manager {
         if event == EVENT_SYSTEM_FOREGROUND {
             self.workspace.last_foreground = Some(id);
         }
-        if self.session.as_ref().is_some_and(|s| {
-            native::foreground() != s.target || (event == EVENT_SYSTEM_FOREGROUND && id != s.target)
-        }) {
-            self.finish_mode(false);
-        }
         if event == EVENT_SYSTEM_MOVESIZESTART {
             self.start_mouse_drag(id);
             return;
@@ -701,7 +703,7 @@ impl Manager {
             self.needs_desktop_retry = true;
         }
         if !was_tiled {
-            self.rollback_resize();
+            self.finish_mode();
             // A newly shown window can be the first visible peer after all
             // others hid to the tray. Reconcile their stale slots before retrying.
             if !self.admit_new(id) {
@@ -769,8 +771,7 @@ impl Manager {
             let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
-            // Window positioning is asynchronous. Compare the last enqueued
-            // target, so Esc also supersedes a preview still in the target's queue.
+            // Compare with the last enqueued target since placement is asynchronous.
             if drag_target == Some(id)
                 || (!verify && window.requested == Some(rect))
                 || self.desktops.membership(id) != DesktopMembership::Current(window.desktop)
@@ -806,7 +807,7 @@ impl Manager {
 
     pub fn begin_resize(&mut self, target: Id) -> bool {
         let Some(area) = self.area else { return false };
-        if self.session.is_some() || self.dragging.is_some() || !self.can_act_on(target) {
+        if self.mode() == Mode::Resize || self.dragging.is_some() || !self.can_act_on(target) {
             return false;
         }
         let tiles = self.workspace.layout.placements(area);
@@ -818,7 +819,7 @@ impl Manager {
         };
         self.session = Some(ResizeSession {
             target,
-            before: self.workspace.layout.clone(),
+            mode: Mode::Resize,
             stops: None,
         });
         self.hud.show(target, rect, None, &self.settings);
@@ -826,11 +827,7 @@ impl Manager {
     }
 
     pub fn mode(&self) -> Mode {
-        if self.session.is_some() {
-            Mode::Resize
-        } else {
-            Mode::Normal
-        }
+        self.session.as_ref().map_or(Mode::Normal, |s| s.mode)
     }
 
     // Sample foreground once so the cue and the keyboard target agree, including
@@ -840,14 +837,15 @@ impl Manager {
             return None;
         }
         let id = native::foreground();
+        let eligible = self.can_act_on(id);
         if self
             .session
             .as_ref()
-            .is_some_and(|session| session.target != id)
+            .is_some_and(|session| session.target != id || !eligible)
         {
-            self.finish_mode(false);
+            self.finish_mode();
         }
-        if self.can_act_on(id) {
+        if eligible {
             self.outline
                 .show(id, self.settings.outline, self.settings.gap == 0);
             Some(id)
@@ -858,60 +856,69 @@ impl Manager {
     }
 
     pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {
+        if self.mode() == Mode::Resize {
+            self.resize_step(active, dir, reverse);
+        }
+    }
+
+    pub fn quick_resize(&mut self, active: Id, dir: Direction, reverse: bool) {
+        if self.mode() != Mode::Normal || self.dragging.is_some() {
+            return;
+        }
+        if self.session.as_ref().is_none_or(|s| s.target != active) {
+            self.session = Some(ResizeSession {
+                target: active,
+                mode: Mode::Normal,
+                stops: None,
+            });
+        }
+        self.resize_step(active, dir, reverse);
+    }
+
+    fn resize_step(&mut self, active: Id, dir: Direction, reverse: bool) {
         let eligible = self.can_act_on(active);
         let (Some(session), Some(area)) = (&mut self.session, self.area) else {
             return;
         };
         let target = session.target;
         if active != target || !eligible {
-            self.finish_mode(false);
+            self.finish_mode();
             return;
         }
+        let show_hint = session.mode == Mode::Resize;
         if let Some(edge) =
             self.workspace
                 .layout
                 .resize(target, dir, reverse, area, &mut session.stops)
         {
             self.apply();
-            if let Some((_, rect)) = self
-                .workspace
-                .layout
-                .placements(area)
-                .into_iter()
-                .find(|(id, _)| *id == target)
+            if show_hint
+                && let Some((_, rect)) = self
+                    .workspace
+                    .layout
+                    .placements(area)
+                    .into_iter()
+                    .find(|(id, _)| *id == target)
             {
                 self.hud.show(target, rect, Some(edge), &self.settings);
             }
         }
     }
 
-    fn rollback_resize(&mut self) {
-        if let Some(session) = self.session.take() {
+    pub fn finish_mode(&mut self) {
+        if self.session.take().is_some_and(|s| s.mode == Mode::Resize) {
             self.hud.hide();
-            self.workspace.layout = session.before;
-        }
-    }
-
-    pub fn finish_mode(&mut self, commit: bool) {
-        if self.session.is_none() {
-            return;
-        }
-        if commit {
-            self.session = None;
-            self.hud.hide();
-        } else {
-            self.rollback_resize();
-            self.apply();
         }
     }
 
     pub fn move_window(&mut self, target: Id, direction: Direction) {
         if let Some(area) = self.area
-            && self.session.is_none()
+            && self.mode() == Mode::Normal
             && self.dragging.is_none()
             && self.can_act_on(target)
             && self.workspace.layout.move_window(target, direction, area)
         {
+            self.finish_mode();
             self.apply();
         }
     }

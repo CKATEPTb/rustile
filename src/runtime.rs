@@ -26,13 +26,15 @@ use crate::settings::{Command, Modifier, Settings};
 use crate::startup;
 use crate::tray::Tray;
 
-const START_RESIZE: i32 = 1;
+pub(crate) const START_RESIZE: i32 = 1;
 const FOCUS: i32 = 10;
-const EXPAND: i32 = 20;
+pub(crate) const EXPAND: i32 = 20;
 const SHRINK: i32 = 30;
-const CONFIRM: i32 = 40;
-const CANCEL: i32 = 41;
+pub(crate) const CONFIRM: i32 = 40;
+pub(crate) const CANCEL: i32 = 41;
 const MOVE: i32 = 50;
+pub(crate) const QUICK_RESIZE: i32 = 60;
+pub(crate) const QUICK_REVERSE: i32 = 70;
 const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
@@ -188,7 +190,7 @@ fn refresh(manager: &mut Manager, handled: usize) {
     shortcuts::update(target, manager.mode(), handled);
 }
 
-fn dispatch(manager: &mut Manager, target: isize, command: i32) {
+pub(crate) fn dispatch(manager: &mut Manager, target: isize, command: i32) {
     let direction = |base| ARROWS.get((command - base) as usize).copied();
     match (manager.mode(), command) {
         (Mode::Normal, START_RESIZE) => {
@@ -199,10 +201,13 @@ fn dispatch(manager: &mut Manager, target: isize, command: i32) {
                 manager.move_window(target, dir);
             } else if let Some(dir) = direction(FOCUS) {
                 manager.focus(dir);
+            } else if let Some(dir) = direction(QUICK_RESIZE) {
+                manager.quick_resize(target, dir, false);
+            } else if let Some(dir) = direction(QUICK_REVERSE) {
+                manager.quick_resize(target, dir, true);
             }
         }
-        (Mode::Resize, CANCEL) => manager.finish_mode(false),
-        (Mode::Resize, CONFIRM) => manager.finish_mode(true),
+        (Mode::Resize, CANCEL | CONFIRM) => manager.finish_mode(),
         (Mode::Resize, _) => {
             if let Some(dir) = direction(EXPAND) {
                 manager.resize(target, dir, false);
@@ -343,6 +348,7 @@ fn pump(
                 EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
             ) || (event == EVENT_OBJECT_HIDE && manager.tracks_window(id));
             if event == EVENT_SYSTEM_DESKTOPSWITCH {
+                manager.finish_mode();
                 manager.cancel_mouse_move();
             } else {
                 manager.event(event, id);

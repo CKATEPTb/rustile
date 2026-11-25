@@ -294,6 +294,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_assignments_take_priority_over_new_quick_resize_defaults() {
+        let text = "padding = 14\nshortcuts.focus_left = { mods = 9, key = 37 }";
+        let profile = toml::from_str::<Settings>(text)
+            .unwrap()
+            .validated()
+            .unwrap();
+        let quick_left = Shortcut::QuickLeft.default_chord();
+        assert_eq!(profile.padding, 14);
+        assert_eq!(profile.binding(Shortcut::FocusLeft), Some(quick_left));
+        assert_eq!(profile.binding(Shortcut::QuickLeft), None);
+        assert_eq!(
+            profile.binding(Shortcut::QuickRight),
+            Some(Shortcut::QuickRight.default_chord())
+        );
+        assert_eq!(
+            profile.conflict(Shortcut::QuickLeft, quick_left),
+            Some(Shortcut::FocusLeft)
+        );
+        let remapped = profile
+            .changed(Command::ReassignShortcut(
+                Shortcut::QuickLeft,
+                quick_left,
+                Shortcut::FocusLeft,
+            ))
+            .unwrap();
+        assert_eq!(remapped.binding(Shortcut::FocusLeft), None);
+        assert_eq!(remapped.binding(Shortcut::QuickLeft), Some(quick_left));
+        for settings in [profile, remapped] {
+            let saved = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+        }
+    }
+
+    #[test]
     fn individual_bindings_roundtrip_without_changing_legacy_profile_or_neighbors() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_LEFT, VK_RIGHT};
         let profile: Settings = toml::from_str(

@@ -12,12 +12,16 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-        GetWindowRect, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SetPropW, ShowWindowAsync,
+        FindWindowExW, GetDesktopWindow, GetWindowRect, GetWindowTextW, IsWindowVisible, SW_HIDE,
+        SW_SHOWNOACTIVATE, SetPropW, ShowWindowAsync,
     },
 };
 use windows_sys::core::w;
 
-use super::{Direction, Id, Manager, Rect, native};
+use super::{Direction, Id, Manager, Mode, Rect, native};
+use crate::runtime::{
+    CANCEL, CONFIRM, EXPAND, QUICK_RESIZE, QUICK_REVERSE, START_RESIZE, dispatch,
+};
 
 mod virtual_desktops;
 
@@ -81,6 +85,30 @@ fn frame(id: Id) -> Rect {
         y: raw.top,
         w: raw.right - raw.left,
         h: raw.bottom - raw.top,
+    }
+}
+
+fn resize_hint() -> Option<String> {
+    let mut window = std::ptr::null_mut();
+    loop {
+        window = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                window,
+                w!("Rustile.ResizeHint"),
+                std::ptr::null(),
+            )
+        };
+        if window.is_null() {
+            return None;
+        }
+        if unsafe { IsWindowVisible(window) } != 0 {
+            let mut text = [0u16; 512];
+            let len = unsafe { GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32) };
+            if len > 0 {
+                return Some(String::from_utf16_lossy(&text[..len as usize]));
+            }
+        }
     }
 }
 
@@ -228,12 +256,18 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
     let grid = rows(windows, area, &[3, 2]);
     let (active, middle, end) = (grid[0][0], grid[0][1], grid[0][2]);
     let original_height = frame(active).h;
-    assert!(manager.begin_resize(active));
-    manager.resize(active, Direction::Down, false);
-    manager.finish_mode(true);
+    dispatch(manager, active, START_RESIZE);
+    assert_eq!(manager.mode(), Mode::Resize);
+    dispatch(manager, active, EXPAND + 3); // Down
     settle(manager, 5);
+    let applied_height = frame(active).h;
+    assert!(applied_height > original_height);
+    dispatch(manager, active, CONFIRM);
+    settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
     rows(windows, area, &[3, 2]);
-    assert!(frame(active).h > original_height);
+    assert_eq!(frame(active).h, applied_height);
 
     let initial: Vec<_> = windows.iter().map(|&id| (id, frame(id))).collect();
     let (left, center, right) = (frame(active), frame(middle), frame(end));
@@ -250,28 +284,68 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
     let custom = frames();
     let offset_center = frame(middle);
     let offset_left = frame(active);
-    assert!(manager.begin_resize(middle));
-    manager.resize(middle, Direction::Left, false);
+    dispatch(manager, middle, QUICK_RESIZE);
     settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
     let grown = frame(middle);
     assert!(grown.x < offset_center.x);
     assert_eq!(grown.x + grown.w, offset_center.x + offset_center.w);
-    manager.resize(middle, Direction::Left, true);
+    dispatch(manager, middle, QUICK_REVERSE);
     settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
     assert_eq!(frames(), custom);
-    manager.finish_mode(true);
 
     assert_eq!(left.x, area.x);
-    assert!(manager.begin_resize(active));
-    manager.resize(active, Direction::Left, false);
+    dispatch(manager, active, START_RESIZE);
+    assert_eq!(manager.mode(), Mode::Resize);
+    let hint = resize_hint().expect("modal resize shows its shortcut hint");
+    assert!(
+        hint.contains("Shift") && hint.contains("Esc") && hint.contains("Enter"),
+        "{hint}"
+    );
+    assert!(!hint.contains('×'), "{hint}");
+    dispatch(manager, active, EXPAND); // Left into the work-area edge
     settle(manager, 5);
     let compressed = frame(active);
     assert_eq!(compressed.x, left.x);
     assert!(compressed.w < offset_left.w);
-    manager.resize(active, Direction::Left, true);
+    let compressed_frames = frames();
+    dispatch(manager, active, CANCEL);
     settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
+    assert_eq!(frames(), compressed_frames);
+    dispatch(manager, active, QUICK_REVERSE);
+    settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
     assert_eq!(frames(), custom);
-    manager.finish_mode(true);
+    assert!(
+        manager
+            .workspace
+            .layout
+            .resize_edge_to(middle, Direction::Left, i32::MIN, area)
+    );
+    manager.apply();
+    settle(manager, 5);
+    let min_x = frame(middle).x;
+    assert!(
+        manager
+            .workspace
+            .layout
+            .resize_edge_to(middle, Direction::Left, min_x + 7, area)
+    );
+    manager.apply();
+    settle(manager, 5);
+    let near_limit = frames();
+    dispatch(manager, middle, QUICK_RESIZE);
+    settle(manager, 5);
+    assert_eq!(frame(middle).x, min_x);
+    dispatch(manager, middle, QUICK_REVERSE);
+    settle(manager, 5);
+    assert_eq!(frames(), near_limit);
     assert!(
         manager
             .workspace
@@ -366,8 +440,7 @@ fn six_windows(manager: &mut Manager, windows: [Id; 6], area: Rect) {
     );
     assert_eq!(windows.map(frame), expected);
 
-    // Resize bursts and an immediate cancellation exercise native frame offsets
-    // across asynchronous SetWindowPos calls without waiting for a paint.
+    // Exit immediately after the final step, before Windows paints it.
     assert!(manager.begin_resize(active));
     for _ in 0..3 {
         manager.resize(active, Direction::Up, false);
@@ -375,10 +448,11 @@ fn six_windows(manager: &mut Manager, windows: [Id; 6], area: Rect) {
     settle(manager, 6);
     rows(&windows, area, &[3, 3]);
     assert!(frame(active).h > bottom.h);
-    manager.resize(active, Direction::Down, false);
-    manager.finish_mode(false);
+    let live = manager.workspace.layout.placements(area);
+    manager.finish_mode();
     settle(manager, 6);
-    assert_eq!(windows.map(frame), expected);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert!(live.iter().all(|&(id, rect)| frame(id) == rect));
 
     let current = rows(&windows, area, &[3, 3]);
     let tall_on_top = current[0].contains(&tall);
@@ -391,7 +465,7 @@ fn six_windows(manager: &mut Manager, windows: [Id; 6], area: Rect) {
     for _ in 0..24 {
         manager.resize(tall, shrink, false);
     }
-    manager.finish_mode(true);
+    manager.finish_mode();
     settle(manager, 6);
     assert_eq!(
         frame(tall).h,
@@ -486,8 +560,13 @@ fn focused_arrivals(manager: &mut Manager, windows: [Id; 6], area: Rect) {
         [b, c, d].map(frame),
         [right_tiles[0], right_tiles[1], lower_left]
     );
-    manager.finish_mode(false);
+    // Start and other shell surfaces are ineligible for tiling. Their foreground
+    // event must finish resize immediately, preserving the divider just set.
+    let (first, second) = (frame(a), frame(e));
+    manager.event(EVENT_SYSTEM_FOREGROUND, unsafe { GetDesktopWindow() } as Id);
     settle(manager, 5);
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert_eq!(resize_hint(), None);
     assert_eq!((frame(a), frame(e)), (first, second));
 
     manager.move_window(a, Direction::Right);
@@ -660,7 +739,8 @@ fn move_right_in_a_tall_pair(manager: &mut Manager, windows: [Id; 6], area: Rect
     manager.resize(chat, Direction::Up, false);
     settle(manager, tiled.len());
     assert!(frame(chat).y < bottom.y && frame(telegram).h < top.h);
-    manager.finish_mode(false);
+    manager.resize(chat, Direction::Up, true);
+    manager.finish_mode();
     settle(manager, tiled.len());
     assert_eq!((frame(telegram), frame(chat)), (top, bottom));
 
@@ -700,7 +780,7 @@ fn move_left_in_three_columns(
     ] {
         assert!(manager.begin_resize(id));
         manager.resize(id, direction, reverse);
-        manager.finish_mode(true);
+        manager.finish_mode();
         settle(manager, 3);
     }
     let [left, middle, right] = tiled.map(frame);
@@ -812,7 +892,7 @@ fn share_offset_upper_tile() {
     for _ in 0..3 {
         manager.resize(top_left, Direction::Left, false);
     }
-    manager.finish_mode(true);
+    manager.finish_mode();
     settle(&manager, 7);
 
     let [fixed_right, target, first, second, from, fixed_left, last] = windows.map(frame);

@@ -88,7 +88,7 @@ impl Manager {
         if self.drag_target() == Some(id) {
             return;
         }
-        self.finish_mode(true);
+        self.finish_mode();
         // Out-of-context START can arrive after the first native move. Read
         // the tile Rustile placed, even if the HWND has reached its new size.
         let tile = self.area.and_then(|area| {

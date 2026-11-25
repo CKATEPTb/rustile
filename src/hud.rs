@@ -21,6 +21,95 @@ pub use outline::{DropPreview, FocusOutline};
 pub struct ResizeHud {
     label: HWND,
     edge: HWND,
+    hint: Option<Hint>,
+}
+
+struct Hint {
+    settings: Settings,
+    dpi: i32,
+    work: Rect,
+    width: i32,
+    height: i32,
+}
+
+fn hint_lines(settings: &Settings) -> Vec<String> {
+    use Shortcut::*;
+    let mut lines = Vec::new();
+    for (actions, default_hint) in [
+        (
+            [GrowLeft, GrowRight, GrowUp, GrowDown],
+            "Стрелки — сдвиг границы",
+        ),
+        (
+            [ShrinkLeft, ShrinkRight, ShrinkUp, ShrinkDown],
+            "Shift+стрелки — обратно",
+        ),
+    ] {
+        if actions
+            .iter()
+            .all(|&action| settings.binding(action) == Some(action.default_chord()))
+        {
+            lines.push(default_hint.to_owned());
+        } else {
+            for action in actions {
+                if let Some(chord) = settings.binding(action) {
+                    lines.push(format!(
+                        "{} — {}",
+                        chord.label(),
+                        action.label().to_lowercase()
+                    ));
+                }
+            }
+        }
+    }
+    let exits: Vec<_> = [Confirm, Cancel]
+        .into_iter()
+        .filter_map(|action| settings.binding(action).map(|chord| chord.label()))
+        .collect();
+    if !exits.is_empty() {
+        lines.push(format!("{} — выход", exits.join(" / ")));
+    } else {
+        lines.push("Выберите другое окно для выхода".into());
+    }
+    lines
+}
+
+impl Hint {
+    fn new(hwnd: HWND, settings: Settings, dpi: i32, work: Rect) -> Self {
+        let wide: Vec<_> = hint_lines(&settings)
+            .join("\r\n")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let margin = dpi / 8;
+        let mut bounds = RECT {
+            right: (work.w - 2 * margin).max(1),
+            ..Default::default()
+        };
+        unsafe {
+            let dc = GetDC(hwnd);
+            let font = hint_font(hwnd);
+            let previous = SelectObject(dc, font);
+            DrawTextW(
+                dc,
+                wide.as_ptr(),
+                -1,
+                &mut bounds,
+                DT_CALCRECT | DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+            );
+            SelectObject(dc, previous);
+            DeleteObject(font);
+            ReleaseDC(hwnd, dc);
+            SetWindowTextW(hwnd, wide.as_ptr());
+        }
+        Self {
+            settings,
+            dpi,
+            work,
+            width: (bounds.right - bounds.left + margin * 2).min(work.w),
+            height: (bounds.bottom - bounds.top + margin).min(work.h),
+        }
+    }
 }
 
 impl ResizeHud {
@@ -34,56 +123,38 @@ impl ResizeHud {
                     ..Default::default()
                 };
                 RegisterClassW(&class);
-                self.label = popup(&class);
-                self.edge = popup(&class);
+                self.label = popup(&class, tile);
+                self.edge = popup(&class, tile);
             }
             if self.label.is_null() {
                 return;
             }
             let dpi = GetDpiForWindow(self.label).max(96) as i32;
             let scale = |n: i32| (n * dpi + 48) / 96;
-            let mut label = format!("Размер   {} × {}", tile.w, tile.h);
-            let mut width = scale(390).min(tile.w);
-            if tile.w >= scale(390) {
-                let mut full = label.clone();
-                for (action, hint) in [(Shortcut::Confirm, "готово"), (Shortcut::Cancel, "отмена")]
-                {
-                    if let Some(chord) = settings.binding(action) {
-                        full.push_str(&format!("    ·    {} — {hint}", chord.label()));
-                    }
-                }
-                let text: Vec<_> = full.encode_utf16().collect();
-                let dc = GetDC(self.label);
-                let font = hint_font(self.label);
-                let previous = SelectObject(dc, font);
-                let mut bounds = RECT::default();
-                DrawTextW(
-                    dc,
-                    text.as_ptr(),
-                    text.len() as i32,
-                    &mut bounds,
-                    DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                SelectObject(dc, previous);
-                DeleteObject(font);
-                ReleaseDC(self.label, dc);
-                let needed = bounds.right + scale(20);
-                if needed <= tile.w {
-                    label = full;
-                    width = width.max(needed);
-                }
+            if self
+                .hint
+                .as_ref()
+                .is_none_or(|hint| hint.dpi != dpi || hint.settings != *settings)
+            {
+                self.hint = Some(Hint::new(
+                    self.label,
+                    *settings,
+                    dpi,
+                    native::work_area().unwrap_or(tile),
+                ));
+                InvalidateRect(self.label, std::ptr::null(), 0);
             }
-            let wide: Vec<_> = label.encode_utf16().chain([0]).collect();
-            SetWindowTextW(self.label, wide.as_ptr());
-            let height = scale(32).min(tile.h);
+            let hint = self.hint.as_ref().unwrap();
+            // On a very narrow tile the popup can straddle a divider. Keep
+            // its shortcuts fully readable, including long custom key names.
+            let work = hint.work;
             position(
                 self.label,
-                tile.x + (tile.w - width) / 2,
-                tile.y + (tile.h - height) / 2,
-                width,
-                height,
+                (tile.x + (tile.w - hint.width) / 2).clamp(work.x, work.x + work.w - hint.width),
+                (tile.y + (tile.h - hint.height) / 2).clamp(work.y, work.y + work.h - hint.height),
+                hint.width,
+                hint.height,
             );
-            InvalidateRect(self.label, std::ptr::null(), 0);
 
             let Some(edge) = edge else {
                 if !self.edge.is_null() {
@@ -117,6 +188,7 @@ impl ResizeHud {
     }
 
     pub fn hide(&mut self) {
+        self.hint = None;
         for window in [&mut self.label, &mut self.edge] {
             if !window.is_null() {
                 unsafe { DestroyWindow(*window) };
@@ -126,15 +198,15 @@ impl ResizeHud {
     }
 }
 
-fn popup(class: &WNDCLASSW) -> HWND {
+fn popup(class: &WNDCLASSW, tile: Rect) -> HWND {
     unsafe {
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.lpszClassName,
             w!(""),
             WS_POPUP | WS_DISABLED,
-            0,
-            0,
+            tile.x,
+            tile.y,
             0,
             0,
             null_mut(),
@@ -187,8 +259,7 @@ unsafe extern "system" fn paint_hint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 let dc = BeginPaint(hwnd, &mut paint);
                 let mut bounds = RECT::default();
                 GetClientRect(hwnd, &mut bounds);
-                let mut text = [0u16; 150];
-                let len = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+                let len = GetWindowTextLengthW(hwnd);
                 let brush = if len == 0 {
                     SetDCBrushColor(dc, outline::resize_edge_color());
                     GetStockObject(DC_BRUSH)
@@ -197,16 +268,21 @@ unsafe extern "system" fn paint_hint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 };
                 FillRect(dc, &bounds, brush);
                 if len != 0 {
+                    let mut text = vec![0u16; len as usize + 1];
+                    GetWindowTextW(hwnd, text.as_mut_ptr(), len + 1);
                     let font = hint_font(hwnd);
                     let previous = SelectObject(dc, font);
                     SetTextColor(dc, GetSysColor(COLOR_MENUTEXT));
                     SetBkMode(dc, TRANSPARENT as i32);
+                    let margin = GetDpiForWindow(hwnd).max(96) as i32 / 8;
+                    let mut content = bounds;
+                    InflateRect(&mut content, -margin, -(margin / 2));
                     DrawTextW(
                         dc,
                         text.as_ptr(),
                         len,
-                        &mut bounds,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                        &mut content,
+                        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
                     );
                     SelectObject(dc, previous);
                     DeleteObject(font);
@@ -217,5 +293,39 @@ unsafe extern "system" fn paint_hint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_hint_describes_the_actual_bindings_and_both_exits() {
+        assert_eq!(
+            hint_lines(&Settings::default()),
+            [
+                "Стрелки — сдвиг границы",
+                "Shift+стрелки — обратно",
+                "Enter / Esc — выход"
+            ]
+        );
+        let settings: Settings = toml::from_str(
+            "shortcuts.grow_left = { mods = 0, key = 117 }\n\
+             shortcuts.grow_up = 'disabled'\n\
+             shortcuts.confirm = { mods = 0, key = 32 }\n\
+             shortcuts.cancel = 'disabled'",
+        )
+        .unwrap();
+        assert_eq!(
+            hint_lines(&settings),
+            [
+                "F6 — влево",
+                "→ — вправо",
+                "↓ — вниз",
+                "Shift+стрелки — обратно",
+                "Пробел — выход"
+            ]
+        );
     }
 }

@@ -464,7 +464,7 @@ internal static class DesktopSmoke {
         CaptureKey(row, modifier, false, system);
     }
     static string[] ShortcutLabels(IntPtr editor) {
-        return Enumerable.Range(1000, 19).Select(id => ControlText(EditorControl(editor, id))).ToArray();
+        return Enumerable.Range(1000, 27).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
     static void EmptyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
@@ -530,7 +530,8 @@ internal static class DesktopSmoke {
             Require(IsWindowVisible(dialog) && !IsWindowEnabled(editor), "Enter must wait for key release");
             CaptureKey(button, Keys.Enter, false);
         }
-        Until("The conflict prompt should dismiss", () => !IsWindowVisible(dialog) && IsWindowEnabled(editor));
+        Until("The conflict prompt should dismiss after " + choice,
+            () => !IsWindowVisible(dialog) && IsWindowEnabled(editor));
     }
     static bool QuitChordAvailable() {
         const int probe = 0x5120;
@@ -824,8 +825,14 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1019) == IntPtr.Zero,
-            "The page should expose 19 editable shortcuts and no quit command");
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1027) == IntPtr.Zero,
+            "The page should expose 27 editable shortcuts and no quit command");
+        var arrows = new[] { "←", "→", "↑", "↓" };
+        for (int i = 0; i < arrows.Length; ++i) {
+            Require(initial[19 + i].EndsWith("Win+Alt+" + arrows[i])
+                && initial[23 + i].EndsWith("Win+Alt+Shift+" + arrows[i]),
+                "Quick resize should display the default forward and reverse shortcuts for " + arrows[i]);
+        }
         var view = Bounds(viewHwnd);
         if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 660 * GetDpiForWindow(editor))
             Require(Enumerable.Range(1000, initial.Length).All(i => view.Contains(Bounds(EditorControl(editor, i)))),
@@ -935,7 +942,7 @@ internal static class DesktopSmoke {
         Until("Move right should save Ctrl+F9", () => File.ReadAllText(file) != oneOverride
             && ControlText(right).Contains("Ctrl+F9"));
         ClickControl(editor, 505);
-        Until("Reset all should restore the original 19 chords", () => ShortcutLabels(editor).SequenceEqual(initial));
+        Until("Reset all should restore every original chord", () => ShortcutLabels(editor).SequenceEqual(initial));
         Message(editor, WmClose);
         Until("The shortcut editor should close", () => !IsWindowVisible(editor));
         TrayOpen(tray, TraySelect, area);
@@ -1211,28 +1218,31 @@ internal static class DesktopSmoke {
         Require(moved >= 0, "Resize command did not move a divider");
         bool horizontal = moved < 22;
         Func<Rectangle, int> extent = r => horizontal ? r.Width : r.Height;
-        int expanded = extent(Bounds(active));
-        Require(expanded > extent(before[index]), "Plain arrow toward a neighbor should grow the active tile");
+        var expanded = handles.Select(Bounds).ToArray();
+        Require(extent(expanded[index]) > extent(before[index]), "Plain arrow toward a neighbor should grow the active tile");
         manager.Send(RustileShortcut, 30 + (moved - 20), active);
         Until("Shift with the same arrow should restore every native frame exactly",
             () => handles.Select(Bounds).SequenceEqual(before));
         manager.Send(RustileShortcut, moved, active);
-        Until("Repeating the plain arrow should grow the same edge again", () => extent(Bounds(active)) == expanded);
+        Until("Repeating the plain arrow should grow the same edge again", () => handles.Select(Bounds).SequenceEqual(expanded));
         manager.Send(RustileShortcut, 41, active);
-        Until("Escape should restore the initial split", () => handles.Select(Bounds).SequenceEqual(before));
+        Func<bool> noHint = () => ManagerWindow(manager, "Rustile.ResizeHint", true) == IntPtr.Zero;
+        Until("Escape should dismiss the hint and keep the displayed split",
+            () => noHint() && handles.Select(Bounds).SequenceEqual(expanded));
+        manager.Send(RustileShortcut, 70 + moved - 20, active);
+        Until("Reverse quick resize should work immediately after Escape",
+            () => noHint() && extent(Bounds(active)) < extent(expanded[index]));
+        manager.Send(RustileShortcut, 60 + moved - 20, active);
+        Until("Forward quick resize should change the same divider without a modal hint",
+            () => noHint() && handles.Select(Bounds).SequenceEqual(expanded));
         manager.Send(RustileShortcut, 1, active);
-        Thread.Sleep(60);
-        foreach (int direction in new[] { 20, 21, 22, 23 }) {
-            manager.Send(RustileShortcut, direction, active);
-            Thread.Sleep(60);
-            if (!handles.Select(Bounds).SequenceEqual(before)) break;
-        }
-        var committed = handles.Select(Bounds).ToArray();
-        Require(!before.SequenceEqual(committed), "Second resize did not run");
+        Until("The modal hint should appear again", () => !noHint());
+        manager.Send(RustileShortcut, 30 + moved - 20, active);
+        Until("The inverse modal command should update the same divider", () => extent(Bounds(active)) < extent(expanded[index]));
+        var latest = Bounds(active);
         manager.Send(RustileShortcut, 40, active);
-        manager.Send(RustileShortcut, 41, active);
-        Thread.Sleep(120);
-        Require(handles.Select(Bounds).SequenceEqual(committed), "Enter did not commit the split");
+        Until("Enter should dismiss the hint and preserve the active window's latest size",
+            () => noHint() && Bounds(active) == latest);
         return true;
     }
     static void Run(string rustile, string managerTests) {
@@ -1314,7 +1324,7 @@ internal static class DesktopSmoke {
             MouseMove(manager, windows, anchor, outerGap, area);
 
             bool resized = ResizeOnHiddenDesktop(manager, windows);
-            Console.WriteLine(resized ? "PASS  Shortcut dispatch, opposite arrows, Escape and Enter"
+            Console.WriteLine(resized ? "PASS  Modal and quick resize share a divider; Escape and Enter preserve the latest frames"
                 : "SKIP  Focus-dependent resize commands: no foreground fixture on this hidden desktop");
             if (resized) {
                 MoveOnHiddenDesktop(manager, windows);
@@ -1374,6 +1384,7 @@ internal static class DesktopSmoke {
             Require(GetProp(windows[0], "Rustile.Smoke.MovePassed") != IntPtr.Zero, "Manager test did not run");
             Until("Manager should restore all six fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Five real windows: three plus two slots, level DWM heights after resize and horizontal moves");
+            Console.WriteLine("PASS  Quick resize and its inverse preserve the off-grid divider with no modal hint; shell focus commits the current resize");
             Console.WriteLine("PASS  Virtual desktop switch events preserve both layouts, resized splits and pending moves on the first return");
             Console.WriteLine("PASS  A hidden, app-cloaked tray window releases the bottom tile and rejoins when shown");
             Console.WriteLine(windows.Any(w => GetProp(w, "Rustile.Smoke.StaggeredPassed") != IntPtr.Zero)
