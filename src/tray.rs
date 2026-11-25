@@ -63,6 +63,7 @@ struct State {
     tray_icon: HICON,
     header_icon: Cell<Option<(i32, HICON)>>,
     taskbar_created: u32,
+    work_area_changed: Cell<bool>,
     registered: Cell<bool>,
     attempts: Cell<u8>,
     shortcuts: ShortcutWindow,
@@ -118,6 +119,7 @@ impl Tray {
                 tray_icon: icon,
                 header_icon: Cell::default(),
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+                work_area_changed: Cell::new(false),
                 registered: Cell::new(false),
                 attempts: Cell::new(0),
                 shortcuts: ShortcutWindow::default(),
@@ -184,6 +186,10 @@ impl Tray {
         self.state.shortcuts.pre_translate(message)
     }
 
+    pub fn take_work_area_change(&self) -> bool {
+        self.state.work_area_changed.take()
+    }
+
     pub fn take_command(&self) -> Option<Command> {
         let command = self
             .state
@@ -206,6 +212,46 @@ impl Drop for Tray {
             DestroyWindow(self.hwnd);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn check_work_area_notifications() {
+    // Called only after the native smoke harness verifies its private desktop.
+    let tray = Tray::new(Settings::default()).unwrap();
+    let hwnd = tray.hwnd;
+    let foreground = unsafe { GetForegroundWindow() };
+    let drain_wakes = || unsafe {
+        let mut msg = MSG::default();
+        let mut wakes = 0;
+        while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+            if msg.message == WM_NULL {
+                wakes += 1;
+            } else {
+                DispatchMessageW(&msg);
+            }
+        }
+        wakes
+    };
+    drain_wakes();
+    tray.take_work_area_change();
+    let mut rect = RECT::default();
+    assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
+    for (msg, wp, lp) in [
+        (WM_SETTINGCHANGE, SPI_SETWORKAREA as usize, 0),
+        (WM_SETTINGCHANGE, 0, 0),
+        (WM_DISPLAYCHANGE, 32, (1080 << 16) | 1920),
+        (WM_DPICHANGED, (96 << 16) | 96, (&raw const rect) as isize),
+        (tray.state.taskbar_created, 0, 0),
+    ] {
+        for _ in 0..3 {
+            unsafe { SendMessageW(hwnd, msg, wp, lp) };
+        }
+        assert!(tray.take_work_area_change(), "missed notification {msg:#x}");
+        assert!(!tray.take_work_area_change());
+        assert_eq!(drain_wakes(), 1, "one wake-up per notification burst");
+    }
+    assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground);
 }
 
 impl Drop for State {
@@ -715,6 +761,14 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         let Some(state) = ptr.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
+        // This top-level window receives broadcasts even when its flyout is
+        // closed. A sent message alone does not return control to GetMessage.
+        if (matches!(msg, WM_SETTINGCHANGE | WM_DISPLAYCHANGE | WM_DPICHANGED)
+            || (msg != 0 && msg == state.taskbar_created))
+            && !state.work_area_changed.replace(true)
+        {
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+        }
         match msg {
             CALLBACK if (lp as u32 >> 16) == ICON_ID => {
                 let event = (lp as u32) & 0xffff;

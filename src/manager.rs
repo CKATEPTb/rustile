@@ -31,6 +31,8 @@ struct TrackedWindow {
     original: Original,
     requested: Option<Rect>,
     repairs: u8,
+    // A former tile can remain floating until the monitor has room again.
+    overflow: bool,
 }
 
 impl TrackedWindow {
@@ -69,6 +71,26 @@ impl Workspace {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WorkArea {
+    bounds: Rect,
+    dpi: u32,
+}
+
+impl WorkArea {
+    fn read() -> Option<Self> {
+        Some(Self {
+            bounds: native::work_area()?,
+            dpi: native::system_dpi(),
+        })
+    }
+
+    fn tiles(self, settings: Settings) -> Rect {
+        self.bounds
+            .inset_for_tiles(native::scaled_spacing(settings.padding, self.dpi))
+    }
+}
+
 pub struct Manager {
     settings: Settings,
     desktops: Desktops,
@@ -78,6 +100,7 @@ pub struct Manager {
     windows: HashMap<Id, TrackedWindow>,
     expanded: HashSet<Id>,
     needs_desktop_retry: bool,
+    work_area: Option<WorkArea>,
     area: Option<Rect>,
     dragging: Option<Id>,
     session: Option<ResizeSession>,
@@ -92,6 +115,7 @@ impl Manager {
     }
 
     pub fn with_settings(settings: Settings) -> Self {
+        let work_area = WorkArea::read();
         Self {
             settings,
             desktops: Desktops::new(),
@@ -101,7 +125,8 @@ impl Manager {
             windows: HashMap::new(),
             expanded: HashSet::new(),
             needs_desktop_retry: false,
-            area: tiling_area(settings),
+            work_area,
+            area: work_area.map(|work| work.tiles(settings)),
             dragging: None,
             session: None,
             hud: ResizeHud::default(),
@@ -195,6 +220,45 @@ impl Manager {
         self.reconcile_desktop();
     }
 
+    pub fn work_area_changed(&self) -> bool {
+        self.settings.enabled && WorkArea::read().is_some_and(|work| self.work_area != Some(work))
+    }
+
+    fn update_work_area(&mut self, work: WorkArea) {
+        if self.work_area == Some(work) {
+            return;
+        }
+        self.rollback_resize();
+        let dpi_changed = self
+            .work_area
+            .is_some_and(|previous| previous.dpi != work.dpi);
+        let area = work.tiles(self.settings);
+        let gap = native::scaled_spacing(self.settings.gap, work.dpi);
+        let windows = &mut self.windows;
+        for workspace in std::iter::once(&mut self.workspace).chain(self.parked.values_mut()) {
+            let released = workspace.layout.refit_work_area(area, gap, |id| {
+                if !dpi_changed {
+                    return None;
+                }
+                let original = &mut windows.get_mut(&id)?.original;
+                if !original.matches(id) {
+                    return None;
+                }
+                original.refresh_frame();
+                Some(original.minimum_frame_size())
+            });
+            for id in released {
+                workspace.remove(id);
+                if let Some(window) = windows.get_mut(&id) {
+                    window.requested = None;
+                    window.overflow = true;
+                }
+            }
+        }
+        self.work_area = Some(work);
+        self.area = Some(area);
+    }
+
     fn observe(&mut self, id: Id) -> TileState {
         let state = native::tile_state(id);
         match state {
@@ -210,9 +274,15 @@ impl Manager {
     }
 
     pub fn reconcile_desktop(&mut self) {
+        self.reconcile_in(WorkArea::read());
+    }
+
+    fn reconcile_in(&mut self, work: Option<WorkArea>) {
         if !self.settings.enabled {
             return;
         }
+        let Some(work) = work else { return };
+        self.update_work_area(work);
         let foreground = native::foreground();
         // A paused or inactive workspace can miss DESTROY, or an HWND can be
         // reused. Identity markers survive cloaking and distinguish the cases.
@@ -279,10 +349,16 @@ impl Manager {
                 continue;
             }
             self.rollback_resize();
-            if resume {
-                self.admit_new(id);
+            let admitted = if resume {
+                self.admit_new(id)
             } else {
-                self.admit(id, None);
+                self.admit(id, None)
+            };
+            if !admitted
+                && let Some(window) = self.windows.get(&id)
+                && window.overflow
+            {
+                window.original.fit_floating(work.bounds);
             }
         }
         if self.workspace.layout.contains(foreground) {
@@ -338,10 +414,11 @@ impl Manager {
         let resuming = updated.enabled && !previous.enabled;
         let geometry = updated.gap != previous.gap || updated.padding != previous.padding;
         let proposed = if geometry {
-            let area = tiling_area(updated)
+            let work = WorkArea::read()
                 .ok_or_else(|| "Windows не сообщила размер рабочей области.".to_owned())?;
+            let area = work.tiles(updated);
             // Validate the whole layout before changing the live model or any HWND.
-            let gap = native::spacing_px(updated.gap);
+            let gap = native::scaled_spacing(updated.gap, work.dpi);
             let refit = |layout: &Layout| {
                 layout.clone().with_spacing(area, gap).ok_or_else(|| {
                     "С такими отступами окна не помещаются. Уменьшите отступ.".to_owned()
@@ -355,12 +432,15 @@ impl Manager {
                     refit(&workspace.layout).map(|layout| (desktop, layout))
                 })
                 .collect();
-            Some((area, active, others?))
+            Some((work, area, active, others?))
         } else {
             None
         };
         persist()?;
-        if let Some((area, active, others)) = proposed {
+        let system_changed = proposed
+            .as_ref()
+            .is_some_and(|(work, ..)| Some(*work) != self.work_area);
+        if let Some((_, area, active, others)) = proposed {
             self.area = Some(area);
             self.workspace.layout = active;
             for (desktop, layout) in others {
@@ -375,7 +455,7 @@ impl Manager {
         if !updated.enabled {
             self.dragging = None;
             self.outline.hide();
-        } else if resuming {
+        } else if resuming || system_changed {
             self.sync();
         } else if geometry {
             self.apply();
@@ -437,9 +517,13 @@ impl Manager {
         };
         let entry = match self.windows.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let original = &mut entry.get_mut().original;
-                original.refresh_frame();
-                return insert(original.minimum_frame_size());
+                let tracked = entry.get_mut();
+                tracked.original.refresh_frame();
+                let admitted = insert(tracked.original.minimum_frame_size());
+                if admitted {
+                    tracked.overflow = false;
+                }
+                return admitted;
             }
             std::collections::hash_map::Entry::Vacant(entry) => entry,
         };
@@ -454,6 +538,7 @@ impl Manager {
             original,
             requested: None,
             repairs: 0,
+            overflow: false,
         });
         true
     }
@@ -797,10 +882,6 @@ impl Manager {
         self.needs_desktop_retry = false;
         self.dragging = None;
     }
-}
-
-fn tiling_area(settings: Settings) -> Option<Rect> {
-    native::work_area().map(|area| area.inset_for_tiles(native::spacing_px(settings.padding)))
 }
 
 impl Drop for Manager {

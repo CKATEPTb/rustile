@@ -51,13 +51,24 @@ fn rect(bounds: RECT) -> Rect {
 
 pub fn work_area() -> Option<Rect> {
     let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
-    monitor_info(monitor).map(|info| rect(info.rcWork))
+    monitor_info(monitor).and_then(|info| usable_work_area(info.rcWork))
 }
 
-// The prototype tiles the primary monitor, whose DPI is the system DPI.
+fn usable_work_area(bounds: RECT) -> Option<Rect> {
+    (bounds.left < bounds.right && bounds.top < bounds.bottom).then(|| rect(bounds))
+}
+
+pub fn system_dpi() -> u32 {
+    unsafe { GetDpiForSystem() }.max(96)
+}
+
+pub fn scaled_spacing(dip: u8, dpi: u32) -> i32 {
+    let pixels = (u64::from(dip) * u64::from(dpi) + 48) / 96;
+    pixels.min(i32::MAX as u64) as i32
+}
+
 pub fn spacing_px(dip: u8) -> i32 {
-    let dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
-    (i32::from(dip) * dpi + 48) / 96
+    scaled_spacing(dip, system_dpi())
 }
 
 /// Windows does not expose a composited corner radius. Follow the application's
@@ -261,7 +272,10 @@ pub fn outline_frame(id: Id) -> Option<(Rect, Rect)> {
         if info.dwFlags & MONITORINFOF_PRIMARY == 0 {
             return None;
         }
-        Some((frame_bounds(hwnd, outer_bounds(hwnd)?), rect(info.rcWork)))
+        Some((
+            frame_bounds(hwnd, outer_bounds(hwnd)?),
+            usable_work_area(info.rcWork)?,
+        ))
     }
 }
 
@@ -270,6 +284,22 @@ pub(crate) enum TileState {
     Eligible,
     Expanded,
     Excluded,
+}
+
+fn untracked_in_reserved_strip(frame: Rect, screen: Rect, work: Rect, tracked: bool) -> bool {
+    let right = |r: Rect| r.x.saturating_add(r.w);
+    let bottom = |r: Rect| r.y.saturating_add(r.h);
+    !tracked
+        && frame.w > 0
+        && frame.h > 0
+        && frame.x >= screen.x
+        && right(frame) <= right(screen)
+        && frame.y >= screen.y
+        && bottom(frame) <= bottom(screen)
+        && (right(frame) <= work.x
+            || frame.x >= right(work)
+            || bottom(frame) <= work.y
+            || frame.y >= bottom(work))
 }
 
 pub(crate) fn tile_state(id: Id) -> TileState {
@@ -310,6 +340,11 @@ pub(crate) fn tile_state(id: Id) -> TileState {
         };
         let frame = frame_bounds(hwnd, outer);
         let screen = rect(info.rcMonitor);
+        let tracked = !GetPropW(hwnd, marker_name()).is_null();
+        let work = rect(info.rcWork);
+        if work.w > 0 && work.h > 0 && untracked_in_reserved_strip(frame, screen, work, tracked) {
+            return TileState::Excluded;
+        }
         let covers_monitor = frame.x <= screen.x
             && frame.y <= screen.y
             && frame.x + frame.w >= screen.x + screen.w
@@ -317,11 +352,10 @@ pub(crate) fn tile_state(id: Id) -> TileState {
         let compact = frame.w <= screen.w / 2 && frame.h <= screen.h / 2;
         // Browsers can drop WS_THICKFRAME on F11. DWM may still report the
         // old resize border briefly after the outer window reaches the screen.
-        let fullscreen = (covers_monitor && (borderless || rect(info.rcWork) != screen))
-            || (borderless && outer == screen);
+        let fullscreen =
+            (covers_monitor && (borderless || work != screen)) || (borderless && outer == screen);
         // Our own tile may have made an ordinary topmost window compact.
-        let floating_panel = extended & WS_EX_TOPMOST != 0
-            && (borderless || (compact && GetPropW(hwnd, marker_name()).is_null()));
+        let floating_panel = extended & WS_EX_TOPMOST != 0 && (borderless || (compact && !tracked));
         let state = if fullscreen || (resizable && IsZoomed(hwnd) != 0 && !floating_panel) {
             TileState::Expanded
         } else if resizable && !floating_panel {
@@ -386,6 +420,27 @@ impl FrameInsets {
             h: frame.h + self.top + self.bottom,
         }
     }
+
+    fn frame_for(&self, outer: Rect) -> Rect {
+        Rect {
+            x: outer.x + self.left,
+            y: outer.y + self.top,
+            w: outer.w - self.left - self.right,
+            h: outer.h - self.top - self.bottom,
+        }
+    }
+}
+
+fn floating_frame(frame: Rect, work: Rect, minimum: (i32, i32)) -> Rect {
+    let fit = |start: i32, length: i32, origin: i32, available: i32, min: i32| {
+        let length = length.min(available.max(min));
+        // If even the minimum overflows, keep the leading edge and title bar reachable.
+        let last = origin.saturating_add((available - length).max(0));
+        (start.clamp(origin, last), length)
+    };
+    let (x, w) = fit(frame.x, frame.w, work.x, work.w, minimum.0);
+    let (y, h) = fit(frame.y, frame.h, work.y, work.h, minimum.1);
+    Rect { x, y, w, h }
 }
 
 impl Original {
@@ -417,11 +472,15 @@ impl Original {
         }
     }
 
-    // Called only when an HWND enters the grid, never from the keyboard hook.
+    // Queried on admission or when a changed work area requires a refit.
     pub fn minimum_frame_size(&self) -> (i32, i32) {
+        self.minimum_for(&self.insets)
+    }
+
+    fn minimum_for(&self, insets: &FrameInsets) -> (i32, i32) {
         let hwnd = self.id as HWND;
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-        let primary_dpi = unsafe { GetDpiForSystem() }.max(96);
+        let primary_dpi = system_dpi();
         let metrics = |x, y| POINT {
             x: unsafe { GetSystemMetricsForDpi(x, dpi) },
             y: unsafe { GetSystemMetricsForDpi(y, dpi) },
@@ -456,17 +515,48 @@ impl Original {
             ((scaled + i64::from(dpi) - 1) / i64::from(dpi)).min(i64::from(i32::MAX)) as i32
         };
         (
-            (physical(track.x) - self.insets.left - self.insets.right).max(0),
-            (physical(track.y) - self.insets.top - self.insets.bottom).max(0),
+            (physical(track.x) - insets.left - insets.right).max(0),
+            (physical(track.y) - insets.top - insets.bottom).max(0),
         )
     }
 
+    pub fn fit_floating(&self, work: Rect) {
+        if work.w <= 0 || work.h <= 0 || !self.matches(self.id) || !eligible(self.id) {
+            return;
+        }
+        let hwnd = self.id as HWND;
+        let Some(outer) = outer_bounds(hwnd) else {
+            return;
+        };
+        let measured = FrameInsets::measure(hwnd, outer);
+        let insets = measured.as_ref().unwrap_or(&self.insets);
+        let frame = insets.frame_for(outer);
+        if frame.w <= 0 || frame.h <= 0 {
+            return;
+        }
+        let minimum = if frame.w > work.w || frame.h > work.h {
+            self.minimum_for(insets)
+        } else {
+            (0, 0)
+        };
+        let target = floating_frame(frame, work, minimum);
+        if frame != target {
+            self.place_frame(insets.outer_for(target));
+        }
+    }
+
     pub fn place(&self, target: Rect) -> bool {
-        if target.w <= 0 || target.h <= 0 || !self.matches(self.id) || !eligible(self.id) {
+        if target.w <= 0 || target.h <= 0 {
+            return false;
+        }
+        self.place_frame(self.insets.outer_for(target))
+    }
+
+    fn place_frame(&self, bounds: Rect) -> bool {
+        if !self.matches(self.id) || !eligible(self.id) {
             return false;
         }
         let hwnd = self.id as HWND;
-        let bounds = self.insets.outer_for(target);
         if is_snapped(self.id) {
             return place_unsnapped(hwnd, bounds);
         }
@@ -568,4 +658,82 @@ pub fn focus(id: Id) -> bool {
     eligible(id)
         && unsafe { IsWindowEnabled(id as HWND) } != 0
         && (foreground() == id || unsafe { SetForegroundWindow(id as HWND) } != 0)
+}
+
+#[cfg(test)]
+mod work_area_tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn only_untracked_frames_wholly_inside_reserved_strips_are_excluded() {
+        let screen = r(-1800, -240, 1600, 1000);
+        let work = r(-1760, -210, 1540, 940);
+        for bar in [
+            r(-1800, -240, 1600, 30), // top
+            r(-1800, 730, 1600, 30),  // bottom
+            r(-1800, -240, 40, 1000), // left
+            r(-220, -240, 20, 1000),  // right
+        ] {
+            assert!(untracked_in_reserved_strip(bar, screen, work, false));
+            assert!(!untracked_in_reserved_strip(bar, screen, work, true));
+        }
+        for window in [
+            work,
+            r(-1740, -235, 400, 26), // overlaps the work area by one pixel
+            r(-1880, -240, 80, 30),  // lies on the neighboring monitor
+            r(-1810, -240, 40, 25),  // straddles the monitor edge
+        ] {
+            assert!(!untracked_in_reserved_strip(window, screen, work, false));
+        }
+    }
+
+    #[test]
+    fn floating_frame_moves_only_as_far_as_needed_and_respects_minimums() {
+        let work = r(-960, -200, 800, 600);
+        let inside = r(-810, -100, 320, 220);
+        assert_eq!(floating_frame(inside, work, (250, 150)), inside);
+        assert_eq!(
+            floating_frame(r(-980, -230, 320, 220), work, (250, 150)),
+            r(-960, -200, 320, 220)
+        );
+        assert_eq!(
+            floating_frame(r(-420, 240, 320, 220), work, (250, 150)),
+            r(-480, 180, 320, 220)
+        );
+        assert_eq!(
+            floating_frame(r(-990, -30, 960, 280), work, (480, 180)),
+            r(-960, -30, 800, 280)
+        );
+        assert_eq!(
+            floating_frame(r(-990, -350, 1100, 900), work, (880, 730)),
+            r(-960, -200, 880, 730)
+        );
+    }
+
+    #[test]
+    fn work_area_requires_positive_extents_and_spacing_uses_the_supplied_dpi() {
+        let raw = RECT {
+            left: -200,
+            top: -300,
+            right: 0,
+            bottom: 0,
+        };
+        assert_eq!(usable_work_area(raw), Some(r(-200, -300, 200, 300)));
+        assert!(usable_work_area(RECT::default()).is_none());
+        assert!(usable_work_area(RECT { right: -200, ..raw }).is_none());
+        assert!(
+            usable_work_area(RECT {
+                bottom: -301,
+                ..raw
+            })
+            .is_none()
+        );
+        assert_eq!(scaled_spacing(0, 144), 0);
+        assert_eq!(scaled_spacing(8, 120), 10);
+        assert_eq!(scaled_spacing(3, 144), 5);
+    }
 }

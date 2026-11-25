@@ -864,6 +864,7 @@ fn move_windows() {
     }));
     let originals = windows.map(frame);
     check_normal_placement(windows[0]);
+    crate::tray::check_work_area_notifications();
     let foreground = native::foreground();
     let work = native::work_area().unwrap();
     let width = work.w.min(1160);
@@ -892,11 +893,12 @@ fn move_windows() {
     run(move_right_in_a_tall_pair);
     run(share_upper_tile_in_six_windows);
     run(virtual_desktops::round_trip);
+    run(panel_reservations);
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));
     run(|manager, windows, _| {
         let settings = manager.settings;
-        let area = super::tiling_area(settings).unwrap();
+        let area = super::WorkArea::read().unwrap().tiles(settings);
         manager.area = Some(area);
         let id = windows[0];
         assert!(manager.admit(id, None));
@@ -944,4 +946,112 @@ fn move_windows() {
             0
         )
     };
+}
+
+// Inject only the monitor reading. Use the ordinary inventory, reconciliation
+// and placement paths, and measure the resulting HWNDs on the private desktop.
+fn panel_reservations(manager: &mut Manager, windows: [Id; 6], area: Rect) {
+    use super::{DesktopId, DesktopMembership, WorkArea};
+
+    let [first, second, parked, ..] = windows;
+    let homes = [
+        (first, DesktopId(1)),
+        (second, DesktopId(1)),
+        (parked, DesktopId(2)),
+    ];
+    let select = |manager: &mut Manager, active: DesktopId| {
+        manager.desktops.set_memberships(homes.map(|(id, home)| {
+            (
+                id,
+                if active == home {
+                    DesktopMembership::Current(home)
+                } else {
+                    DesktopMembership::Other(home)
+                },
+            )
+        }));
+    };
+    let base = WorkArea {
+        bounds: Rect {
+            x: area.x + 10,
+            w: area.w - 10,
+            ..area
+        },
+        dpi: native::system_dpi(),
+    };
+    select(manager, DesktopId(2));
+    manager.reconcile_in(Some(base));
+    settle(manager, 1);
+    let parked_before = frame(parked);
+    select(manager, DesktopId(1));
+    manager.reconcile_in(Some(base));
+    settle(manager, 2);
+    let initial = [frame(first), frame(second)];
+    assert!(manager.begin_resize(first));
+
+    for (left, top, right, bottom) in [(0, 32, 0, 0), (63, 32, 0, 0), (0, 0, 75, 24), (0, 0, 0, 0)]
+    {
+        let work = WorkArea {
+            bounds: Rect {
+                x: base.bounds.x + left,
+                y: base.bounds.y + top,
+                w: base.bounds.w - left - right,
+                h: base.bounds.h - top - bottom,
+            },
+            ..base
+        };
+        manager.reconcile_in(Some(work));
+        settle(manager, 2);
+        let (a, b) = (frame(first), frame(second));
+        let expected = work.tiles(manager.settings);
+        assert_eq!((a.x.min(b.x), a.y.min(b.y)), (expected.x, expected.y));
+        assert_eq!(
+            ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h)),
+            (expected.x + expected.w, expected.y + expected.h)
+        );
+        assert_eq!(manager.mode(), super::Mode::Normal);
+        assert_eq!(frame(parked), parked_before);
+    }
+    assert_eq!([frame(first), frame(second)], initial);
+    // A space too small for a pair still accommodates either fixture alone.
+    // The released window must move out from under the panel and rejoin on growth.
+    let small = WorkArea {
+        bounds: Rect {
+            x: base.bounds.x + 110,
+            y: base.bounds.y + 50,
+            w: 240,
+            h: 185,
+        },
+        ..base
+    };
+    manager.reconcile_in(Some(small));
+    settle(manager, 1);
+    until("former tile inside the available work area", || {
+        [first, second].map(frame).iter().all(|r| {
+            r.x >= small.bounds.x
+                && r.y >= small.bounds.y
+                && r.x + r.w <= small.bounds.x + small.bounds.w
+                && r.y + r.h <= small.bounds.y + small.bounds.h
+        })
+    });
+    assert_eq!(frame(parked), parked_before);
+    manager.reconcile_in(Some(base));
+    settle(manager, 2);
+    let work = WorkArea {
+        bounds: Rect {
+            y: base.bounds.y + 32,
+            h: base.bounds.h - 32,
+            ..base.bounds
+        },
+        ..base
+    };
+    manager.reconcile_in(Some(work));
+    select(manager, DesktopId(2));
+    manager.reconcile_in(Some(work));
+    settle(manager, 1);
+    assert_eq!(frame(parked), work.tiles(manager.settings));
+    // Let the harness restore all three fixtures on shutdown.
+    manager
+        .desktops
+        .set_memberships(homes.map(|(id, _)| (id, DesktopMembership::Current(DesktopId(2)))));
 }

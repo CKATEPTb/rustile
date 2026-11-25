@@ -7,6 +7,8 @@ mod vacancy;
 mod focused_insert_tests;
 #[cfg(test)]
 mod move_sequence_tests;
+#[cfg(test)]
+mod work_area_tests;
 
 use bsp::{Bsp, Cut};
 use grid::{Grid, Shape};
@@ -534,16 +536,97 @@ impl Layout {
     /// Keep the existing tracks, BSP cuts and pending moves whenever their
     /// occupants fit the new spacing. Nothing is applied on failure.
     pub fn with_spacing(mut self, area: Rect, gap: i32) -> Option<Self> {
+        self.fit_spacing(area, gap).then_some(self)
+    }
+
+    fn fit_spacing(&mut self, area: Rect, gap: i32) -> bool {
         self.grid.gap = gap;
         let minima = self.occupants.iter().map(|window| window.min).collect();
         let (roots, children) = self.bsp.minimums(minima, gap);
-        if !self.grid.fit(area, &roots) {
-            return None;
+        if !self.grid.fit_spacing(area, &roots) {
+            return false;
         }
         self.bsp.fit(self.grid.rects(area), &children, gap);
         self.last_area = Some(area);
         self.settle_invalid_pairs(area);
-        Some(self)
+        true
+    }
+
+    /// An external work-area change cannot be rejected like a preference.
+    /// Return the windows that must float so their native minima are respected.
+    pub fn refit_work_area(
+        &mut self,
+        area: Rect,
+        gap: i32,
+        mut minimum: impl FnMut(Id) -> Option<(i32, i32)>,
+    ) -> Vec<Id> {
+        let mut updated = self.clone();
+        for window in &mut updated.occupants {
+            if let Some((w, h)) = minimum(window.id) {
+                window.min = (w.max(MIN_WIDTH), h.max(MIN_HEIGHT));
+            }
+        }
+        if updated.fit_spacing(area, gap) {
+            *self = updated;
+            return Vec::new();
+        }
+
+        // A different topology is necessary. Use the old visible reading
+        // order, including any pending move, rather than BSP storage order.
+        let old = self.last_area.expect("nonempty layouts have a work area");
+        let mut ordered: Vec<_> = self
+            .visible_rects(old)
+            .into_iter()
+            .zip(updated.occupants)
+            .collect();
+        ordered.sort_by_key(|(rect, _)| (rect.y, rect.x));
+        let windows: Vec<_> = ordered.into_iter().map(|(_, window)| window).collect();
+        let mut replacement = Self::with_gap(gap);
+        if let Some(grid) = replacement.grid_for(&windows, area) {
+            replacement.occupants = windows;
+            replacement.grid = grid;
+            replacement.last_area = Some(area);
+            *self = replacement;
+            return Vec::new();
+        }
+
+        // Including each tile's right/bottom gutter gives disjoint
+        // footprints, also for BSP layouts with staggered rows.
+        let footprint =
+            |w: i32, h: i32| (i64::from(w) + i64::from(gap)) * (i64::from(h) + i64::from(gap));
+        let mut free = footprint(area.w, area.h);
+        let mut released = Vec::new();
+        let mut failed_minima: Vec<(i32, i32)> = Vec::new();
+        for window in windows {
+            let (w, h) = window.min;
+            let required = footprint(w, h);
+            // While the accepted group is unchanged, a larger window cannot
+            // fit a split that already failed for a smaller one.
+            if !window.fits(area)
+                || required > free
+                || failed_minima.iter().any(|&(x, y)| x <= w && y <= h)
+            {
+                released.push(window.id);
+                continue;
+            }
+            // Large and small windows sometimes fit in an asymmetric BSP
+            // even though no balanced grid fits them together.
+            if replacement.insert_with_minimum(window.id, area, window.min)
+                || replacement
+                    .placements(area)
+                    .into_iter()
+                    .any(|(anchor, _)| replacement.insert_near(window.id, anchor, area, window.min))
+            {
+                free -= required;
+                failed_minima.clear();
+            } else {
+                failed_minima.retain(|&(x, y)| x < w || y < h);
+                failed_minima.push(window.min);
+                released.push(window.id);
+            }
+        }
+        *self = replacement;
+        released
     }
 
     pub fn cell_rects(&self, area: Rect) -> Vec<Rect> {

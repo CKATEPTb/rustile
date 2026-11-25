@@ -325,6 +325,13 @@ fn pump(
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
         let has_events = !events.is_empty();
         let timer_fired = desktop_timer.take(&message);
+        let work_area_changed = tray.take_work_area_change();
+        // Some appbars reserve their edge without a settings broadcast. Read
+        // rcWork once per event batch, before placing any newly shown HWNDs.
+        let refitted = has_events && manager.work_area_changed();
+        if refitted {
+            manager.reconcile_desktop();
+        }
         let mut settling = false;
         for (event, id) in events.drain(..) {
             settling |= matches!(
@@ -336,11 +343,14 @@ fn pump(
             }
         }
         let unresolved = manager.take_desktop_retry();
-        let reconcile = if settling || (unresolved && desktop_timer.0 == 0 && !timer_fired) {
+        let timer_due = timer_fired && !refitted;
+        let reconcile = if settling
+            || ((unresolved || work_area_changed) && desktop_timer.0 == 0 && !timer_due)
+        {
             retries = 2;
             !desktop_timer.schedule(DESKTOP_SETTLE_MS)
         } else {
-            timer_fired
+            timer_due
         };
         if reconcile {
             manager.reconcile_desktop();

@@ -117,29 +117,46 @@ impl Grid {
     }
 
     pub fn fit(&mut self, area: Rect, minima: &[(i32, i32)]) -> bool {
-        self.fit_with(area, minima, lengths)
+        let gap = self.gap;
+        self.fit_with(minima, |weights, axis, mins| {
+            lengths(weights, axis.length(area), mins, gap)
+        })
     }
 
     pub fn refit(&mut self, area: Rect, minima: &[(i32, i32)]) -> bool {
-        self.fit_with(area, minima, keep_dividers)
+        let gap = self.gap;
+        self.fit_with(minima, |weights, axis, mins| {
+            keep_dividers(weights, axis.length(area), mins, gap)
+        })
+    }
+
+    // During a display or panel change, rounding a projected size to pixels
+    // must not turn it into a new ratio. Keep each band's and row's weights
+    // unless a native minimum actually requires displacing a divider.
+    pub fn fit_spacing(&mut self, area: Rect, minima: &[(i32, i32)]) -> bool {
+        let gap = self.gap;
+        self.fit_with(minima, |weights, axis, mins| {
+            let length = axis.length(area);
+            let floors = vec![axis.minimum(); weights.len()];
+            let projected = lengths(weights, length, &floors, gap)?;
+            if projected.iter().zip(mins).all(|(size, min)| size >= min) {
+                Some(weights.to_vec())
+            } else {
+                lengths(weights, length, mins, gap)
+            }
+        })
     }
 
     fn fit_with(
         &mut self,
-        area: Rect,
         minima: &[(i32, i32)],
-        distribute: impl Fn(&[i32], i32, &[i32], i32) -> Option<Vec<i32>>,
+        distribute: impl Fn(&[i32], Axis, &[i32]) -> Option<Vec<i32>>,
     ) -> bool {
         if self.bands.is_empty() {
             return true;
         }
         let across = self.flow.perpendicular();
-        let Some(bands) = distribute(
-            &self.bands,
-            across.length(area),
-            &self.band_minima(minima),
-            self.gap,
-        ) else {
+        let Some(bands) = distribute(&self.bands, across, &self.band_minima(minima)) else {
             return false;
         };
         let mut offset = 0;
@@ -149,7 +166,7 @@ impl Grid {
                 .iter()
                 .map(|&m| self.flow.min_dimension(m))
                 .collect();
-            let Some(sizes) = distribute(weights, self.flow.length(area), &min, self.gap) else {
+            let Some(sizes) = distribute(weights, self.flow, &min) else {
                 return false;
             };
             *weights = sizes;
