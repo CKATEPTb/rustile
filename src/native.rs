@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT,
-    DWMWCP_DONOTROUND, DWMWCP_ROUNDSMALL, DwmGetWindowAttribute,
+    DWM_CLOAKED_APP, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUNDSMALL, DwmGetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, GetWindowRgnBox, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
@@ -260,7 +260,14 @@ fn frame_bounds(hwnd: HWND, outer: Rect) -> Rect {
     measured_frame(hwnd, outer).unwrap_or(outer)
 }
 
-pub fn cloaked(id: Id) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cloak {
+    None,
+    Application,
+    Other,
+}
+
+pub(crate) fn cloak_state(id: Id) -> Cloak {
     let mut cloak = 0u32;
     let result = unsafe {
         DwmGetWindowAttribute(
@@ -270,7 +277,17 @@ pub fn cloaked(id: Id) -> bool {
             size_of::<u32>() as u32,
         )
     };
-    result < 0 || cloak != 0
+    match (result >= 0, cloak) {
+        (true, 0) => Cloak::None,
+        (true, DWM_CLOAKED_APP) => Cloak::Application,
+        // Shell, inherited or mixed flags can belong to a desktop switch.
+        // A failed DWM query also gives no evidence of an application hide.
+        _ => Cloak::Other,
+    }
+}
+
+pub fn cloaked(id: Id) -> bool {
+    cloak_state(id) != Cloak::None
 }
 
 pub fn minimized_or_maximized(id: Id) -> bool {

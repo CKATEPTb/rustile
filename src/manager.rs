@@ -9,7 +9,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::hud::{FocusOutline, ResizeHud};
 use crate::layout::{Direction, Id, Layout, Rect};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
-use crate::native::{self, Original, TileState};
+use crate::native::{self, Cloak, Original, TileState};
 use crate::settings::Settings;
 
 mod mouse;
@@ -102,6 +102,7 @@ pub struct Manager {
     parked: HashMap<DesktopId, Workspace>,
     windows: HashMap<Id, TrackedWindow>,
     expanded: HashSet<Id>,
+    pending_app_cloaks: HashSet<Id>,
     needs_desktop_retry: bool,
     work_area: Option<WorkArea>,
     area: Option<Rect>,
@@ -127,6 +128,7 @@ impl Manager {
             parked: HashMap::new(),
             windows: HashMap::new(),
             expanded: HashSet::new(),
+            pending_app_cloaks: HashSet::new(),
             needs_desktop_retry: false,
             work_area,
             area: work_area.map(|work| work.tiles(settings)),
@@ -143,6 +145,7 @@ impl Manager {
         if self.current == Some(desktop) {
             return;
         }
+        self.pending_app_cloaks.clear();
         self.rollback_resize();
         self.dragging = None;
         self.outline.hide();
@@ -199,6 +202,7 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        self.pending_app_cloaks.remove(&id);
         if self.drag_target() == Some(id) {
             self.dragging = None;
         }
@@ -277,6 +281,7 @@ impl Manager {
             }
             TileState::Eligible => {
                 self.expanded.remove(&id);
+                self.pending_app_cloaks.remove(&id);
             }
             TileState::Excluded => {}
         }
@@ -383,20 +388,32 @@ impl Manager {
 
     fn settle_hidden(&mut self, desktop_confirmed: bool) {
         let Some(area) = self.area else { return };
+        let previous_cloaks = std::mem::take(&mut self.pending_app_cloaks);
         for (id, _) in self.workspace.layout.placements(area) {
-            let release = match self.desktops.membership(id) {
-                DesktopMembership::Current(key) if self.current == Some(key) => {
-                    !native::eligible(id)
+            let on_current = match self.desktops.membership(id) {
+                DesktopMembership::Current(key) if self.current == Some(key) => true,
+                // Tray windows can lose their desktop GUID. A visible peer in
+                // this workspace still identifies the active layout.
+                DesktopMembership::Unknown if desktop_confirmed => false,
+                _ => continue,
+            };
+            let release = match native::cloak_state(id) {
+                Cloak::None if on_current => !native::eligible(id),
+                Cloak::None => native::hidden_or_minimized(id),
+                Cloak::Application if desktop_confirmed => {
+                    if native::hidden_or_minimized(id) || previous_cloaks.contains(&id) {
+                        true
+                    } else {
+                        // WS_VISIBLE can survive an app cloak. Give a returning
+                        // desktop one settle interval to reveal the window.
+                        self.pending_app_cloaks.insert(id);
+                        self.needs_desktop_retry = true;
+                        false
+                    }
                 }
-                // Hiding to the tray may unregister the HWND from the Shell.
-                // A visible peer identifies this workspace even after the hidden
-                // window's own GetWindowDesktopId starts returning no result.
-                DesktopMembership::Unknown => desktop_confirmed && native::hidden_or_minimized(id),
                 _ => false,
             };
-            // A desktop switch can hide windows while their GUIDs are in flux.
-            // Keep their layout until Windows finishes the cloak transition.
-            if release && !native::cloaked(id) {
+            if release {
                 self.suspend(id);
             }
         }
@@ -918,6 +935,7 @@ impl Manager {
         self.workspace = Workspace::new(native::spacing_px(self.settings.gap));
         self.parked.clear();
         self.expanded.clear();
+        self.pending_app_cloaks.clear();
         self.current = None;
         self.needs_desktop_retry = false;
         self.dragging = None;

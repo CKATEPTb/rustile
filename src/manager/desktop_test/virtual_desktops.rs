@@ -340,6 +340,71 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     assert_eq!(super::join_frames(frame(a[0]), frame(a[1])), manager.area);
     assert_eq!(b.map(geometry_changes), b_changes);
 
+    // A tray app can both cloak and hide its HWND, then lose its Shell GUID.
+    // Reproduce a full-width bottom tile disappearing while A stays active.
+    if frame(a[0]).y == frame(a[1]).y {
+        let left = *a.iter().min_by_key(|&&id| frame(id).x).unwrap();
+        manager.move_window(left, Direction::Right);
+        settle(manager, 2);
+    }
+    let mut stacked = a;
+    stacked.sort_by_key(|&id| frame(id).y);
+    let [top, bottom] = stacked;
+    assert_eq!(frame(bottom).w, manager.area.unwrap().w);
+    assert!(frame(top).y < frame(bottom).y);
+    manager.take_desktop_retry();
+    cloak(bottom, true);
+    set_visible(bottom, false);
+    assert!(
+        crate::native::cloaked(bottom),
+        "the hidden HWND must still be cloaked"
+    );
+    select_desktop(manager, &homes, A, Some(bottom));
+    manager.event(EVENT_OBJECT_CLOAKED, bottom);
+    manager.event(EVENT_OBJECT_HIDE, bottom);
+    if manager.take_desktop_retry() {
+        manager.reconcile_desktop();
+    }
+    assert!(
+        !manager.workspace.layout.contains(bottom),
+        "a hidden, app-cloaked HWND without a desktop GUID kept the bottom tile"
+    );
+    settle(manager, 1);
+    assert_eq!(frame(top), manager.area.unwrap());
+    assert_eq!(b.map(geometry_changes), b_changes);
+    select_desktop(manager, &homes, A, None);
+    cloak(bottom, false);
+    set_visible(bottom, true);
+    manager.event(EVENT_OBJECT_UNCLOAKED, bottom);
+    manager.event(EVENT_OBJECT_SHOW, bottom);
+    settle(manager, 2);
+    assert_eq!(super::join_frames(frame(top), frame(bottom)), manager.area);
+    assert_eq!(b.map(geometry_changes), b_changes);
+
+    // Other apps cloak the window themselves and keep both WS_VISIBLE and
+    // their current desktop GUID. Allow transient switch cloaks to settle.
+    manager.take_desktop_retry();
+    cloak(bottom, true);
+    assert!(!crate::native::hidden_or_minimized(bottom));
+    manager.event(EVENT_OBJECT_CLOAKED, bottom);
+    assert!(manager.workspace.layout.contains(bottom));
+    // The runtime schedules the first settle pass for every CLOAKED event.
+    manager.take_desktop_retry();
+    manager.reconcile_desktop();
+    assert!(manager.workspace.layout.contains(bottom));
+    assert!(
+        manager.take_desktop_retry(),
+        "no timer scheduled to verify the app-cloaked tile"
+    );
+    manager.reconcile_desktop();
+    settle(manager, 1);
+    assert_eq!(frame(top), manager.area.unwrap());
+    cloak(bottom, false);
+    manager.event(EVENT_OBJECT_UNCLOAKED, bottom);
+    settle(manager, 2);
+    assert_eq!(super::join_frames(frame(top), frame(bottom)), manager.area);
+    assert_eq!(b.map(geometry_changes), b_changes);
+
     // Move one HWND to B using the shell. It leaves A immediately and receives
     // one tile on B when visited; B's previous frames hold in the meantime.
     let transferred = [(a[0], B), (a[1], A), (b[0], B), (b[1], B)];

@@ -1363,6 +1363,7 @@ internal static class DesktopSmoke {
             Until("Manager should restore all six fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Five real windows: three plus two slots, level DWM heights after resize and horizontal moves");
             Console.WriteLine("PASS  Virtual desktop switch events preserve both layouts, resized splits and pending moves on the first return");
+            Console.WriteLine("PASS  A hidden, app-cloaked tray window releases the bottom tile and rejoins when shown");
             Console.WriteLine(windows.Any(w => GetProp(w, "Rustile.Smoke.StaggeredPassed") != IntPtr.Zero)
                 ? "PASS  Staggered Down shares the lower tile with backfill, then takes it; Up shares the L before completing the return"
                 : "SKIP  Staggered preview: the remainder is below the application minimum on this display");
