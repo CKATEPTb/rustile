@@ -1,3 +1,4 @@
+mod capture;
 mod view;
 
 use std::{
@@ -24,21 +25,12 @@ use crate::settings::{Chord, Command, Settings, Shortcut};
 const CLASS: *const u16 = w!("Rustile.Shortcuts");
 const TITLE: *const u16 = w!("Горячие клавиши — Rustile");
 const STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-const MODS: [(u32, &str); 4] = [
-    (MOD_WIN, "Win"),
-    (MOD_CONTROL, "Ctrl"),
-    (MOD_ALT, "Alt"),
-    (MOD_SHIFT, "Shift"),
-];
-const MOD_BASE: i32 = 500;
-const KEY: i32 = 504;
-const APPLY: i32 = 505;
+const RESET_ALL: i32 = 505;
 const STATUS: i32 = 506;
-const EDIT_TITLE: i32 = 507;
-const KEY_LABEL: i32 = 508;
 const VIEW: i32 = 510;
 const SECTION: i32 = 520;
 const ROW: i32 = 1000;
+const RESET_ROW: i32 = 1100;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -53,14 +45,17 @@ fn caption(hwnd: HWND, s: &str) {
 }
 
 fn row_id(action: Shortcut) -> i32 {
-    ROW + Shortcut::ALL
-        .iter()
-        .position(|&s| s == action)
-        .expect("listed shortcut") as i32
+    ROW + action.index() as i32
 }
 
 fn row_action(id: i32) -> Option<Shortcut> {
     Shortcut::ALL.get(id.checked_sub(ROW)? as usize).copied()
+}
+
+fn reset_action(id: i32) -> Option<Shortcut> {
+    Shortcut::ALL
+        .get(id.checked_sub(RESET_ROW)? as usize)
+        .copied()
 }
 
 pub(super) struct ShortcutWindow {
@@ -71,9 +66,10 @@ pub(super) struct ShortcutWindow {
     selected: Cell<Shortcut>,
     command: Cell<Option<Command>>,
     saving: Cell<bool>,
+    capture: RefCell<Option<capture::Capture>>,
     scroll: Cell<i32>,
     colors: Cell<Colors>,
-    fonts: RefCell<Option<Fonts>>,
+    fonts: RefCell<Option<view::EditorFonts>>,
 }
 
 impl Default for ShortcutWindow {
@@ -86,6 +82,7 @@ impl Default for ShortcutWindow {
             selected: Cell::new(Shortcut::MoveLeft),
             command: Cell::default(),
             saving: Cell::new(false),
+            capture: RefCell::default(),
             scroll: Cell::new(0),
             colors: Cell::new(Colors::current()),
             fonts: RefCell::default(),
@@ -137,8 +134,8 @@ impl ShortcutWindow {
                 GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut y_dpi);
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
-                    right: self.p(850),
-                    bottom: self.p(570),
+                    right: self.p(920),
+                    bottom: self.p(610),
                     ..Default::default()
                 };
                 AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());
@@ -173,7 +170,6 @@ impl ShortcutWindow {
                 self.apply_theme(hwnd);
                 self.layout(hwnd);
                 self.update_rows();
-                self.select(Shortcut::MoveLeft);
             }
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -207,8 +203,8 @@ impl ShortcutWindow {
         self.saving.set(false);
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
-            self.update_apply();
-            caption(child(hwnd, STATUS), error.unwrap_or("Сочетание сохранено"));
+            self.update_rows();
+            caption(child(hwnd, STATUS), error.unwrap_or("Настройки сохранены"));
         }
     }
 
@@ -217,116 +213,176 @@ impl ShortcutWindow {
         if hwnd.is_null() || (msg.hwnd != hwnd && unsafe { IsChild(hwnd, msg.hwnd) } == 0) {
             return false;
         }
-        // Let a dropped-down native combo handle Escape and Enter itself.
-        let combo = child(hwnd, KEY);
-        unsafe {
-            if msg.hwnd == combo && SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) != 0 {
-                return false;
+        if msg.message == capture::KEY_EVENT {
+            return false; // The editor handles its hook notifications directly.
+        }
+        if let Some(down) = capture::is_key_down(msg.message) {
+            let key = msg.wParam as u16;
+            if self.capture.borrow().is_some() {
+                self.capture_key(key, down);
+                return true;
             }
-            let id = GetDlgCtrlID(msg.hwnd);
-            if msg.message == WM_KEYDOWN
-                && msg.wParam == VK_RETURN as usize
-                && (row_action(id).is_some() || id == APPLY)
+            let id = unsafe { GetDlgCtrlID(msg.hwnd) };
+            if let Some(action) = row_action(id)
+                && matches!(key, VK_RETURN | VK_F2)
             {
-                if msg.lParam & (1 << 30) == 0 {
-                    SendMessageW(msg.hwnd, BM_CLICK, 0, 0);
+                // Start on release so the activation key cannot bind itself.
+                if !down {
+                    self.start_capture(action);
                 }
                 return true;
             }
-            IsDialogMessageW(hwnd, msg) != 0
+            if key == VK_RETURN && (reset_action(id).is_some() || id == RESET_ALL) {
+                if down && msg.lParam & (1 << 30) == 0 {
+                    unsafe { SendMessageW(msg.hwnd, BM_CLICK, 0, 0) };
+                }
+                return true;
+            }
+            if key == VK_ESCAPE && down && msg.lParam & (1 << 30) != 0 {
+                return true;
+            }
         }
+        unsafe { IsDialogMessageW(hwnd, msg) != 0 }
     }
 
     fn p(&self, dip: i32) -> i32 {
         scale(dip, self.dpi.get())
     }
+
     fn row(&self, action: Shortcut) -> HWND {
         child(child(self.hwnd.get(), VIEW), row_id(action))
     }
 
+    fn recording(&self, action: Shortcut) -> bool {
+        self.selected.get() == action && self.capture.borrow().is_some()
+    }
+
+    fn binding_text(&self, action: Shortcut) -> String {
+        if self.selected.get() == action
+            && let Some(capture) = self.capture.borrow().as_ref()
+        {
+            return capture.keys.label();
+        }
+        self.settings.get().chord(action).label()
+    }
+
+    fn update_row(&self, action: Shortcut) {
+        let row = self.row(action);
+        caption(
+            row,
+            &format!("{}, {}", action.label(), self.binding_text(action)),
+        );
+        unsafe { InvalidateRect(row, null(), 0) };
+    }
+
     fn update_rows(&self) {
+        let hwnd = self.hwnd.get();
+        let view = child(hwnd, VIEW);
+        let settings = self.settings.get();
+        let defaults = Settings::default();
         for action in Shortcut::ALL {
-            let row = self.row(action);
-            caption(
-                row,
-                &format!(
-                    "{}, {}",
-                    action.label(),
-                    self.settings.get().chord(action).label()
-                ),
-            );
-            unsafe { InvalidateRect(row, null(), 0) };
+            self.update_row(action);
+            let changed = settings.chord(action) != defaults.chord(action);
+            unsafe {
+                EnableWindow(
+                    child(view, RESET_ROW + action.index() as i32),
+                    (changed && !self.saving.get()) as i32,
+                )
+            };
         }
-    }
-
-    fn select(&self, action: Shortcut) {
-        let hwnd = self.hwnd.get();
-        let previous = self.selected.replace(action);
-        let chord = self.settings.get().chord(action);
-        caption(child(hwnd, EDIT_TITLE), action.label());
-        caption(child(hwnd, STATUS), "");
-        unsafe {
-            for (i, (flag, _)) in MODS.iter().enumerate() {
-                SendMessageW(
-                    child(hwnd, MOD_BASE + i as i32),
-                    BM_SETCHECK,
-                    usize::from(chord.mods & flag != 0),
-                    0,
-                );
-            }
-            if let Some(i) = Chord::keys().iter().position(|&k| k == chord.key) {
-                SendMessageW(child(hwnd, KEY), CB_SETCURSEL, i, 0);
-            }
-            InvalidateRect(self.row(previous), null(), 0);
-            InvalidateRect(self.row(action), null(), 0);
-        }
-        self.update_apply();
-    }
-
-    fn draft(&self) -> Option<Chord> {
-        let hwnd = self.hwnd.get();
-        let mut mods = 0;
-        for (i, (flag, _)) in MODS.iter().enumerate() {
-            if unsafe { SendMessageW(child(hwnd, MOD_BASE + i as i32), BM_GETCHECK, 0, 0) }
-                == BST_CHECKED as isize
-            {
-                mods |= flag;
-            }
-        }
-        let index = unsafe { SendMessageW(child(hwnd, KEY), CB_GETCURSEL, 0, 0) };
-        Some(Chord {
-            mods,
-            key: *Chord::keys().get(index as usize)?,
-        })
-    }
-
-    fn update_apply(&self) {
-        let changed = self
-            .draft()
-            .is_some_and(|c| c != self.settings.get().chord(self.selected.get()));
+        // Profiles in older files can differ even when individual overrides
+        // happen to reproduce all factory chords.
+        let can_reset = settings
+            .changed(Command::ResetShortcuts)
+            .is_ok_and(|s| s != settings);
         unsafe {
             EnableWindow(
-                child(self.hwnd.get(), APPLY),
-                i32::from(changed && !self.saving.get()),
+                child(hwnd, RESET_ALL),
+                (can_reset && !self.saving.get()) as i32,
             )
         };
     }
 
-    fn apply(&self) {
-        let Some(chord) = self.draft() else { return };
+    fn select(&self, action: Shortcut) {
+        let old = self.selected.get();
+        if old != action {
+            self.end_capture();
+            self.selected.set(action);
+            unsafe {
+                InvalidateRect(self.row(old), null(), 0);
+                InvalidateRect(self.row(action), null(), 0);
+            }
+            caption(child(self.hwnd.get(), STATUS), view::HINT);
+        }
+    }
+
+    fn start_capture(&self, action: Shortcut) {
+        if self.saving.get() || self.recording(action) {
+            return;
+        }
+        self.select(action);
+        unsafe { SetFocus(self.row(action)) };
+        match capture::Capture::start(self.hwnd.get()) {
+            Ok(capture) => {
+                self.capture.replace(Some(capture));
+                self.update_row(action);
+                caption(
+                    child(self.hwnd.get(), STATUS),
+                    "Отпустите все клавиши, чтобы сохранить сочетание. Esc — отмена.",
+                );
+            }
+            Err(e) => self.result(Some(&e)),
+        }
+    }
+
+    fn end_capture(&self) {
+        if self.capture.take().is_some() {
+            self.update_row(self.selected.get());
+            caption(child(self.hwnd.get(), STATUS), view::HINT);
+        }
+    }
+
+    fn capture_key(&self, key: u16, down: bool) {
+        use capture::Event;
+        let event = self
+            .capture
+            .borrow_mut()
+            .as_mut()
+            .map(|c| c.keys.key(key, down));
         let action = self.selected.get();
-        if self.saving.get() || chord == self.settings.get().chord(action) {
+        match event {
+            None | Some(Event::Unchanged) => {}
+            Some(Event::Changed) => self.update_row(action),
+            Some(Event::Cancel) => self.end_capture(),
+            Some(Event::Ambiguous) => {
+                self.end_capture();
+                self.result(Some(
+                    "Используйте одну основную клавишу вместе с модификаторами.",
+                ));
+            }
+            Some(Event::Complete(chord)) => {
+                self.end_capture();
+                self.submit(Command::Shortcut(action, chord));
+            }
+        }
+    }
+
+    fn submit(&self, command: Command) {
+        if self.saving.get() {
             return;
         }
-        let command = Command::Shortcut(action, chord);
-        if let Err(e) = self.settings.get().changed(command) {
-            self.result(Some(&e));
-            return;
+        self.end_capture();
+        let settings = self.settings.get();
+        match settings.changed(command) {
+            Err(e) => self.result(Some(&e)),
+            Ok(next) if next == settings => {}
+            Ok(_) => {
+                self.saving.set(true);
+                self.command.set(Some(command));
+                self.update_rows();
+                unsafe { PostMessageW(self.owner.get(), WM_NULL, 0, 0) };
+            }
         }
-        self.command.set(Some(command));
-        self.saving.set(true);
-        self.update_apply();
-        unsafe { PostMessageW(self.owner.get(), WM_NULL, 0, 0) };
     }
 }
 
@@ -383,31 +439,56 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ui.apply_theme(hwnd);
                 0
             }
+            capture::KEY_EVENT => {
+                let current = ui
+                    .capture
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.generation == wp);
+                if current {
+                    ui.capture_key(lp as u16, lp & (1 << 16) != 0);
+                }
+                0
+            }
+            WM_ACTIVATE if (wp & 0xffff) == WA_INACTIVE as usize => {
+                ui.end_capture();
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
                 let event = (wp >> 16) as u32;
                 if let Some(action) = row_action(id) {
-                    if event == BN_CLICKED {
+                    if event == BN_DOUBLECLICKED {
+                        ui.start_capture(action);
+                    } else if event == BN_CLICKED {
                         ui.select(action);
-                        SetFocus(child(hwnd, MOD_BASE));
                     } else if event == BN_SETFOCUS {
+                        ui.select(action);
                         ui.reveal_row(hwnd, lp as HWND);
                     }
-                } else if id == APPLY && event == BN_CLICKED {
-                    ui.apply();
-                } else if ((MOD_BASE..KEY).contains(&id) && event == BN_CLICKED)
-                    || (id == KEY && event == CBN_SELCHANGE)
-                {
-                    caption(child(hwnd, STATUS), "");
-                    ui.update_apply();
+                } else if let Some(action) = reset_action(id) {
+                    if event == BN_CLICKED {
+                        SetFocus(ui.row(action));
+                        ui.submit(Command::ResetShortcut(action));
+                    } else if event == BN_SETFOCUS {
+                        ui.end_capture();
+                        ui.reveal_row(hwnd, lp as HWND);
+                    }
+                } else if id == RESET_ALL {
+                    if event == BN_CLICKED {
+                        SetFocus(ui.row(ui.selected.get()));
+                        ui.submit(Command::ResetShortcuts);
+                    } else if event == BN_SETFOCUS {
+                        ui.end_capture();
+                    }
                 } else if id == IDCANCEL && lp == 0 {
-                    DestroyWindow(hwnd);
+                    if ui.capture.borrow().is_some() {
+                        ui.end_capture();
+                    } else {
+                        DestroyWindow(hwnd);
+                    }
                 }
                 0
-            }
-            WM_MEASUREITEM if wp == KEY as usize && lp != 0 => {
-                (*(lp as *mut MEASUREITEMSTRUCT)).itemHeight = ui.p(26) as u32;
-                1
             }
             WM_DRAWITEM if lp != 0 => {
                 ui.draw(&*(lp as *const DRAWITEMSTRUCT));
@@ -417,16 +498,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ui.background(hwnd, wp as HDC);
                 1
             }
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => {
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 let colors = ui.colors.get();
-                let bg = if msg == WM_CTLCOLORLISTBOX {
-                    colors.control
-                } else {
-                    colors.background
-                };
-                SetBkColor(wp as HDC, bg);
-                SetTextColor(wp as HDC, colors.text);
-                SetDCBrushColor(wp as HDC, bg);
+                SetBkColor(wp as HDC, colors.background);
+                SetTextColor(
+                    wp as HDC,
+                    if GetDlgCtrlID(lp as HWND) == STATUS {
+                        colors.secondary
+                    } else {
+                        colors.text
+                    },
+                );
+                SetDCBrushColor(wp as HDC, colors.background);
                 GetStockObject(DC_BRUSH) as isize
             }
             WM_MOUSEWHEEL => {
@@ -434,6 +517,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_NCDESTROY => {
+                ui.capture.take();
                 ui.hwnd.set(null_mut());
                 ui.scroll.set(0);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

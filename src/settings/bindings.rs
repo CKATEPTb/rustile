@@ -13,7 +13,6 @@ enum Group {
     Grow,
     Shrink,
     Finish,
-    Quit,
 }
 
 macro_rules! shortcuts {
@@ -23,7 +22,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 20] = [$( Self::$name, )+];
+            pub const ALL: [Self; 19] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -52,7 +51,6 @@ shortcuts! {
     ShrinkDown,  "Сузить снизу",       Shrink, VK_DOWN;
     Confirm,     "Применить размер",   Finish, VK_RETURN;
     Cancel,      "Отменить изменение", Finish, VK_ESCAPE;
-    Quit,        "Выйти из Rustile",   Quit, VK_Q;
 }
 
 impl Shortcut {
@@ -69,7 +67,7 @@ impl Shortcut {
     }
 
     fn shares_context(self, other: Self) -> bool {
-        self == Self::Quit || other == Self::Quit || self.is_resize() == other.is_resize()
+        self.is_resize() == other.is_resize()
     }
 
     fn inherited(self, settings: &Settings) -> Chord {
@@ -80,7 +78,6 @@ impl Shortcut {
             Group::StartResize => settings.resize.bits(),
             Group::Grow | Group::Finish => 0,
             Group::Shrink => MOD_SHIFT,
-            Group::Quit => MOD_CONTROL | MOD_ALT | MOD_SHIFT,
         };
         Chord { mods, key }
     }
@@ -219,17 +216,22 @@ impl Chord {
         .into()
     }
 
+    pub fn modifier_labels(mods: u32) -> impl Iterator<Item = &'static str> {
+        [
+            (MOD_CONTROL, "Ctrl"),
+            (MOD_ALT, "Alt"),
+            (MOD_WIN, "Win"),
+            (MOD_SHIFT, "Shift"),
+        ]
+        .into_iter()
+        .filter_map(move |(bit, name)| (mods & bit != 0).then_some(name))
+    }
+
     pub fn label(self) -> String {
         let mut text = String::new();
-        for (bit, name) in [
-            (MOD_CONTROL, "Ctrl+"),
-            (MOD_ALT, "Alt+"),
-            (MOD_WIN, "Win+"),
-            (MOD_SHIFT, "Shift+"),
-        ] {
-            if self.mods & bit != 0 {
-                text.push_str(name);
-            }
+        for modifier in Self::modifier_labels(self.mods) {
+            text.push_str(modifier);
+            text.push('+');
         }
         text.push_str(&Self::key_label(self.key));
         text
@@ -239,7 +241,7 @@ impl Chord {
         if !Self::keys().contains(&self.key)
             || self.mods & !(MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN) != 0
         {
-            return Err("Выберите клавишу из списка и допустимые модификаторы.".into());
+            return Err("Сочетание содержит неподдерживаемую клавишу или модификатор.".into());
         }
         if !action.is_resize()
             && self.mods & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0
@@ -251,7 +253,6 @@ impl Chord {
             VK_X | VK_L => self.mods == MOD_WIN,
             VK_TAB => self.mods & !MOD_SHIFT == MOD_ALT || self.mods == MOD_WIN,
             VK_DELETE => self.mods == (MOD_CONTROL | MOD_ALT),
-            VK_F12 => action == Shortcut::Quit,
             _ => false,
         };
         if reserved {
@@ -267,8 +268,18 @@ impl Chord {
 // In memory, a fixed table keeps the hook allocation-free. The file contains
 // only overrides, keyed by action name so adding an action preserves old files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(from = "BTreeMap<Shortcut, Chord>", into = "BTreeMap<Shortcut, Chord>")]
+#[serde(from = "StoredOverrides", into = "BTreeMap<Shortcut, Chord>")]
 pub(super) struct Overrides([Option<Chord>; Shortcut::ALL.len()]);
+
+// Accept the retired setting independently, even if its chord is malformed.
+// Keep normal validation for every other key and omit it when writing the file.
+#[derive(Deserialize)]
+struct StoredOverrides {
+    #[serde(rename = "quit")]
+    _legacy_quit: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    bindings: BTreeMap<Shortcut, Chord>,
+}
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
@@ -276,10 +287,10 @@ impl Overrides {
     }
 }
 
-impl From<BTreeMap<Shortcut, Chord>> for Overrides {
-    fn from(map: BTreeMap<Shortcut, Chord>) -> Self {
+impl From<StoredOverrides> for Overrides {
+    fn from(stored: StoredOverrides) -> Self {
         let mut overrides = Self::default();
-        for (action, chord) in map {
+        for (action, chord) in stored.bindings {
             overrides.0[action.index()] = Some(chord);
         }
         overrides

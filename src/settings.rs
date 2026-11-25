@@ -57,7 +57,18 @@ pub(crate) enum Command {
     Gap(u8),
     Padding(u8),
     Shortcut(Shortcut, Chord),
+    ResetShortcut(Shortcut),
+    ResetShortcuts,
     Exit,
+}
+
+impl Command {
+    pub fn changes_shortcuts(self) -> bool {
+        matches!(
+            self,
+            Self::Shortcut(..) | Self::ResetShortcut(_) | Self::ResetShortcuts
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -120,6 +131,14 @@ impl Settings {
             Command::Gap(value) => self.gap = value,
             Command::Padding(value) => self.padding = value,
             Command::Shortcut(action, chord) => self.assign(action, chord),
+            Command::ResetShortcut(action) => self.assign(action, Self::default().chord(action)),
+            Command::ResetShortcuts => {
+                let defaults = Self::default();
+                self.focus = defaults.focus;
+                self.movement = defaults.movement;
+                self.resize = defaults.resize;
+                self.shortcuts = defaults.shortcuts;
+            }
             Command::Exit => {}
         }
         self.validated()
@@ -302,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn binding_collisions_follow_modes_and_global_quit() {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_H, VK_X};
+    fn binding_collisions_are_checked_within_each_mode() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_H, VK_Q, VK_X};
         let settings = Settings::default();
         let assign =
             |action, mods, key| settings.changed(Command::Shortcut(action, Chord { mods, key }));
@@ -323,18 +342,100 @@ mod tests {
                 ))
                 .is_err()
         );
-        for action in [Shortcut::GrowUp, Shortcut::MoveRight] {
-            assert!(
-                settings
-                    .changed(Command::Shortcut(action, settings.chord(Shortcut::Quit)))
-                    .is_err()
-            );
-        }
+        assert!(assign(Shortcut::MoveRight, MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_Q).is_ok());
         assert!(assign(Shortcut::MoveLeft, MOD_WIN, VK_X).is_err());
         assert!(assign(Shortcut::MoveLeft, 0, VK_H).is_err());
         assert!(assign(Shortcut::MoveLeft, MOD_SHIFT, VK_H).is_err());
         assert!(assign(Shortcut::MoveLeft, 0, VK_F8).is_ok());
         assert!(assign(Shortcut::GrowUp, 0, VK_H).is_ok());
+    }
+
+    #[test]
+    fn old_quit_setting_is_ignored_without_discarding_other_shortcuts() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_K;
+        let text = "gap = 11\n[shortcuts]\nmove_down = { mods = 2, key = 75 }\n";
+        for retired in ["{ mods = 3, key = 118 }", "'unused legacy value'"] {
+            let loaded: Settings = toml::from_str(&format!("{text}quit = {retired}")).unwrap();
+            let loaded = loaded.validated().unwrap();
+            assert_eq!(loaded.gap, 11);
+            assert_eq!(
+                loaded.chord(Shortcut::MoveDown),
+                Chord {
+                    mods: MOD_CONTROL,
+                    key: VK_K
+                }
+            );
+            let persisted = toml::to_string_pretty(&loaded).unwrap();
+            assert!(!persisted.contains("quit"));
+            assert_eq!(toml::from_str::<Settings>(&persisted).unwrap(), loaded);
+        }
+        assert!(
+            toml::from_str::<Settings>(&format!("{text}misspelled = {{ mods = 1, key = 88 }}"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn one_factory_shortcut_can_replace_a_legacy_profile_setting_and_all_can_be_reset_together() {
+        let profile: Settings = toml::from_str(
+            "focus = 'ctrl+alt'\nmovement = 'alt+shift'\nresize = 'ctrl+shift'\n\
+             enabled = false\noutline = 3\ngap = 13\npadding = 15\n\
+             [shortcuts]\nmove_left = { mods = 2, key = 72 }",
+        )
+        .unwrap();
+        let profile = profile.validated().unwrap();
+        let factory = Settings::default();
+        let one = profile
+            .changed(Command::ResetShortcut(Shortcut::FocusLeft))
+            .unwrap();
+        for action in Shortcut::ALL {
+            let expected = if action == Shortcut::FocusLeft {
+                factory.chord(action)
+            } else {
+                profile.chord(action)
+            };
+            assert_eq!(one.chord(action), expected);
+        }
+        let saved = toml::to_string_pretty(&one).unwrap();
+        let reloaded: Settings = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded, one);
+        let all = reloaded.changed(Command::ResetShortcuts).unwrap();
+        assert_eq!(
+            all,
+            Settings {
+                enabled: false,
+                outline: 3,
+                gap: 13,
+                padding: 15,
+                ..factory
+            }
+        );
+        assert!(!toml::to_string_pretty(&all).unwrap().contains("shortcuts"));
+    }
+
+    #[test]
+    fn conflicting_single_reset_reports_the_other_action_and_reset_all_is_atomic() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_K;
+        let factory = Settings::default();
+        let custom = factory
+            .changed(Command::Shortcut(
+                Shortcut::FocusLeft,
+                Chord {
+                    mods: MOD_ALT,
+                    key: VK_K,
+                },
+            ))
+            .unwrap()
+            .changed(Command::Shortcut(
+                Shortcut::MoveDown,
+                factory.chord(Shortcut::FocusLeft),
+            ))
+            .unwrap();
+        let error = custom
+            .changed(Command::ResetShortcut(Shortcut::FocusLeft))
+            .unwrap_err();
+        assert!(error.contains(Shortcut::MoveDown.label()));
+        assert_eq!(custom.changed(Command::ResetShortcuts).unwrap(), factory);
     }
 
     #[test]

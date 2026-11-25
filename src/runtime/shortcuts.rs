@@ -50,9 +50,7 @@ impl Routes {
     fn new(settings: Settings) -> Self {
         let mut keys = [None; 256];
         for action in Shortcut::ALL {
-            let Some(id) = command_id(action) else {
-                continue;
-            };
+            let id = command_id(action);
             let chord = settings.chord(action);
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
             if action.is_resize() {
@@ -72,22 +70,15 @@ impl Routes {
         // An explicitly assigned modal chord wins over the implicit variants
         // that let a user keep the opener's modifiers held in resize mode.
         for action in Shortcut::ALL {
-            if let Some(id) = command_id(action) {
-                let chord = settings.chord(action);
-                let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
-                row.for_mode(action)[chord.mods as usize] = id;
-            }
-        }
-        // RegisterHotKey also owns Quit while a managed tile is being resized.
-        let quit = settings.chord(Shortcut::Quit);
-        if let Some(row) = &mut keys[usize::from(quit.key)] {
-            row.resize[quit.mods as usize] = 0;
+            let chord = settings.chord(action);
+            let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
+            row.for_mode(action)[chord.mods as usize] = command_id(action);
         }
         Self(keys)
     }
 }
 
-fn command_id(action: Shortcut) -> Option<u8> {
+fn command_id(action: Shortcut) -> u8 {
     use Shortcut::*;
     let id = match action {
         FocusLeft => FOCUS,
@@ -109,9 +100,8 @@ fn command_id(action: Shortcut) -> Option<u8> {
         ShrinkDown => SHRINK + 3,
         Confirm => CONFIRM,
         Cancel => CANCEL,
-        Quit => return None, // Registered independently, including on unmanaged windows.
     };
-    Some(id as u8)
+    id as u8
 }
 
 #[derive(Debug, PartialEq)]
@@ -650,14 +640,23 @@ mod tests {
     }
 
     #[test]
-    fn global_quit_takes_precedence_over_an_inherited_resize_alias() {
+    fn former_exit_chord_passes_to_apps_and_is_available_for_remapping() {
         let mut k = Keyboard::new();
-        k.assign(Shortcut::StartResize, MOD_ALT, VK_F8);
-        k.assign(Shortcut::Quit, MOD_ALT, VK_LEFT);
-        assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
-        assert_eq!(k.key(VK_LEFT, true, MOD_ALT), Action::Pass);
-        assert_eq!(k.key(VK_LEFT, false, 0), Action::Pass);
-        assert_eq!(k.key(VK_LEFT, true, 0), Action::Command(EXPAND));
+        let mods = MOD_CONTROL | MOD_ALT | MOD_SHIFT;
+        for mode in [Mode::Resize, Mode::Normal] {
+            k.state.mode = mode;
+            assert_eq!(k.key(VK_Q, true, mods), Action::Pass);
+            assert_eq!(k.key(VK_Q, false, 0), Action::Pass);
+        }
+        k.assign(Shortcut::MoveLeft, mods, VK_Q);
+        assert_eq!(k.key(VK_Q, true, mods), Action::Command(MOVE));
+        assert_eq!(k.key(VK_Q, false, 0), Action::Consume);
+        k.settings = k
+            .settings
+            .changed(Command::ResetShortcut(Shortcut::MoveLeft))
+            .unwrap();
+        assert_eq!(k.key(VK_Q, true, mods), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, true, WIN_SHIFT), Action::Command(MOVE));
     }
 
     #[test]
