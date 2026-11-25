@@ -1,6 +1,7 @@
 mod bsp;
 mod edge;
 mod grid;
+mod vacancy;
 
 #[cfg(test)]
 mod focused_insert_tests;
@@ -9,6 +10,7 @@ mod move_sequence_tests;
 
 use bsp::{Bsp, Cut};
 use grid::{Grid, Shape};
+use vacancy::Vacancy;
 
 pub type Id = isize;
 const GAP: i32 = 8;
@@ -86,24 +88,39 @@ impl Rect {
         })
     }
 
-    // At a T, the narrow tile enters at its aligned outer edge. Return the
-    // direction of the remaining half of the host, where its filler must lie.
-    fn entry_side(self, host: Self, movement: Direction, gap: i32) -> Option<Direction> {
+    // Split the destination across the direction of travel. Matching outer
+    // edges preserve an existing divider; offset tiles enter the closer half.
+    fn enter_host(
+        self,
+        host: Self,
+        movement: Direction,
+        moving: Window,
+        resident: Window,
+        gap: i32,
+    ) -> Option<(Self, Self)> {
         let across = movement.axis().perpendicular();
+        let (a, b) = across.bounds(self);
+        let (c, d) = across.bounds(host);
         if movement.distance(self, host) != i64::from(gap)
-            || across.length(self) >= across.length(host)
+            || a.max(c) >= b.min(d)
+            || (a, b) == (c, d)
         {
             return None;
         }
-        let (a, b) = across.bounds(self);
-        let (c, d) = across.bounds(host);
-        if a == c {
-            Some(across.direction(false))
-        } else if b == d {
-            Some(across.direction(true))
+        let (min, max) = across.divider_limits(host, moving, resident, gap)?;
+        let usable = across.length(host) - gap;
+        let length = if (a == c || b == d) && across.length(self) < across.length(host) {
+            across.length(self)
         } else {
-            None
+            usable / 2 + usable % 2
         }
+        .clamp(min, max);
+        Some(if a + b <= c + d {
+            across.split_at(host, length, gap)
+        } else {
+            let (resident, moving) = across.split_at(host, usable - length, gap);
+            (moving, resident)
+        })
     }
 
     // For an L-shaped pair the shared outer edge fixes the new divider.
@@ -301,7 +318,7 @@ struct SharedPair {
     partition: Partition,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Partition {
     Divider {
         axis: Axis,
@@ -310,9 +327,7 @@ enum Partition {
         whole: i32,
     },
     Corner,
-    Enter {
-        filler: usize,
-    },
+    Enter(Vacancy),
 }
 
 impl SharedPair {
@@ -413,19 +428,14 @@ impl SharedPair {
                 return (windows[self.source].fits(through) && windows[self.target].fits(arm))
                     .then_some((through, arm));
             }
-            Partition::Enter { .. } => {
-                let (source, host) = (cells[self.source], cells[self.target]);
-                let side = source.entry_side(host, self.direction, gap)?;
-                let across = side.axis();
-                let (min, max) =
-                    across.divider_limits(host, windows[self.source], windows[self.target], gap)?;
-                let width = across.length(source).clamp(min, max);
-                if side.towards_start() {
-                    let (host_part, entering) =
-                        across.split_at(host, across.length(host) - gap - width, gap);
-                    return Some((entering, host_part));
-                }
-                return Some(across.split_at(host, width, gap));
+            Partition::Enter(_) => {
+                return cells[self.source].enter_host(
+                    cells[self.target],
+                    self.direction,
+                    windows[self.source],
+                    windows[self.target],
+                    gap,
+                );
             }
         };
         let region = cells[self.source].joined(cells[self.target], self.direction.axis(), gap)?;
@@ -446,22 +456,24 @@ impl SharedPair {
         })
     }
 
-    fn filler(&self) -> Option<usize> {
-        match self.partition {
-            Partition::Enter { filler } => Some(filler),
+    fn vacancy(&self) -> Option<&Vacancy> {
+        match &self.partition {
+            Partition::Enter(vacancy) => Some(vacancy),
             _ => None,
         }
     }
 
     fn slots(&self) -> impl Iterator<Item = usize> {
-        [self.source, self.target].into_iter().chain(self.filler())
+        [self.source, self.target]
+            .into_iter()
+            .chain(self.vacancy().into_iter().flat_map(Vacancy::slots))
     }
 
     fn remap(&mut self, slot: impl Fn(usize) -> usize) {
         self.source = slot(self.source);
         self.target = slot(self.target);
-        if let Partition::Enter { filler } = &mut self.partition {
-            *filler = slot(*filler);
+        if let Partition::Enter(vacancy) = &mut self.partition {
+            vacancy.remap(slot);
         }
     }
 
@@ -469,20 +481,10 @@ impl SharedPair {
         let Some((source, target)) = self.rectangles(cells, windows, gap) else {
             return false;
         };
-        if let Some(filler) = self.filler() {
-            let old = cells[self.source];
-            let Some(side) = old.entry_side(cells[self.target], self.direction, gap) else {
-                return false;
-            };
-            let Some(expanded) = old.joined(cells[filler], side.axis(), gap) else {
-                return false;
-            };
-            if side.distance(old, cells[filler]) != i64::from(gap)
-                || !windows[filler].fits(expanded)
-            {
-                return false;
-            }
-            cells[filler] = expanded;
+        if let Some(vacancy) = self.vacancy()
+            && !vacancy.apply(self.source, cells, gap)
+        {
+            return false;
         }
         cells[self.source] = source;
         cells[self.target] = target;
@@ -548,13 +550,21 @@ impl Layout {
         self.bsp.rects(self.grid.rects(area), self.grid.gap)
     }
 
-    pub fn placements(&self, area: Rect) -> Vec<(Id, Rect)> {
+    fn visible_rects(&self, area: Rect) -> Vec<Rect> {
         let mut visible = self.cell_rects(area);
         for pair in &self.shared {
             // Pending moves have disjoint participants.
             pair.apply(&mut visible, &self.occupants, self.grid.gap);
         }
-        self.occupants.iter().map(|w| w.id).zip(visible).collect()
+        visible
+    }
+
+    pub fn placements(&self, area: Rect) -> Vec<(Id, Rect)> {
+        self.occupants
+            .iter()
+            .map(|w| w.id)
+            .zip(self.visible_rects(area))
+            .collect()
     }
 
     fn slot(&self, id: Id) -> Option<usize> {
@@ -664,7 +674,7 @@ impl Layout {
         }
         let mut remaining = self.shared.clone();
         remaining.swap_remove(index);
-        if !self.rebuild_cells(area, &cells, remaining) {
+        if self.rebuild_cells(area, &cells, remaining).is_none() {
             // A non-slicing arrangement can have no straight cut across the
             // region. Finish only the active pair before splitting its slot.
             let original = self.cell_rects(area);
@@ -674,10 +684,13 @@ impl Layout {
         true
     }
 
-    fn rebuild_cells(&mut self, area: Rect, cells: &[Rect], shared: Vec<SharedPair>) -> bool {
-        let Some((bsp, order)) = Bsp::from_rects(area, cells, self.grid.gap) else {
-            return false;
-        };
+    fn rebuild_cells(
+        &mut self,
+        area: Rect,
+        cells: &[Rect],
+        shared: Vec<SharedPair>,
+    ) -> Option<Vec<usize>> {
+        let (bsp, order) = Bsp::from_rects(area, cells, self.grid.gap)?;
         self.shared = shared;
         let mut slots = vec![0; order.len()];
         self.occupants = order
@@ -694,7 +707,7 @@ impl Layout {
         self.bsp = bsp;
         self.grid
             .set_shape(Shape::candidates(1, area, self.grid.gap)[0]);
-        true
+        Some(slots)
     }
 
     pub fn insert_near(&mut self, id: Id, anchor: Id, area: Rect, minimum: (i32, i32)) -> bool {
@@ -784,7 +797,7 @@ impl Layout {
         if let Some(index) = self
             .shared
             .iter()
-            .position(|pair| pair.filler().is_some() && pair.slots().any(|s| s == slot))
+            .position(|pair| pair.vacancy().is_some() && pair.slots().any(|s| s == slot))
         {
             self.freeze_pair(
                 index,
@@ -866,46 +879,27 @@ impl Layout {
         let Some(source) = self.slot(id) else {
             return false;
         };
-        let visible = self.placements(area);
-        let from = visible[source].1;
-        let mut next = self.clone();
-        let completed_entry = if let Some(index) = next
+        let visible = self.visible_rects(area);
+        let from = visible[source];
+        let (next, completed_entry) = if let Some(index) = self
             .shared
             .iter()
             .position(|pair| pair.source == source && pair.direction == direction)
         {
+            let mut next = self.clone();
             let pair = next.shared.swap_remove(index);
             let cells = next.cell_rects(area);
             if !next.exchange(source, pair.target, area, &cells) {
                 return false;
             }
-            pair.filler().map(|_| cells[pair.target])
+            (next, pair.vacancy().map(|_| cells[pair.target]))
         } else {
-            let neighbor = nearest(from, direction, visible.iter().map(|tile| tile.1));
-            // A narrower window can enter the facing portion of its host if
-            // an adjacent tile in its old row can reclaim the vacancy.
-            let filler = neighbor.and_then(|target| {
-                let side = from.entry_side(visible[target].1, direction, self.grid.gap)?;
-                visible.iter().position(|&(_, r)| {
-                    side.distance(from, r) == i64::from(self.grid.gap)
-                        && from.joined(r, side.axis(), self.grid.gap).is_some()
-                })
-            });
-            let entered = filler.is_some()
-                && next.move_from_visible(source, neighbor, filler, direction, area, &visible);
-            if !entered {
-                if filler.is_some() {
-                    // Failed previews may already have materialized the filler's
-                    // pending move. Retry without disturbing that bystander.
-                    next = self.clone();
-                }
-                if !next.move_from_visible(source, neighbor, None, direction, area, &visible) {
-                    return false;
-                }
-            }
-            None
+            let Some(next) = self.begin_move(source, direction, area, &visible) else {
+                return false;
+            };
+            (next, None)
         };
-        let to = next.placements(area)[next.slot(id).expect("moving window remains tiled")].1;
+        let to = next.visible_rects(area)[next.slot(id).expect("moving window remains tiled")];
         // A window already inside the target row/column can finish by taking
         // the rest of that very slot without changing its center along the arrow.
         let took_host = completed_entry.is_some_and(|host| {
@@ -921,67 +915,124 @@ impl Layout {
         true
     }
 
+    fn begin_move(
+        &self,
+        source: usize,
+        direction: Direction,
+        area: Rect,
+        visible: &[Rect],
+    ) -> Option<Self> {
+        let from = visible[source];
+        let target = nearest(from, direction, visible.iter().copied());
+        let gap = self.grid.gap;
+        let attempt = |pair| {
+            let mut next = self.clone();
+            next.move_from_visible(source, target, pair, direction, area, visible)
+                .then_some(next)
+        };
+        if let Some(to) = target {
+            let host = visible[to];
+            let across = direction.axis().perpendicular();
+            let mut local = SharedPair::new(source, to, direction, visible, &self.occupants, gap);
+            // A wider source can turn an L locally. A narrower source should
+            // enter the host first so it visibly leaves its original band.
+            if across.length(from) >= across.length(host)
+                && let Some(pair) = local.take()
+                && let Some(next) = attempt(Some(pair))
+            {
+                return Some(next);
+            }
+            if from
+                .enter_host(
+                    host,
+                    direction,
+                    self.occupants[source],
+                    self.occupants[to],
+                    gap,
+                )
+                .is_some()
+            {
+                for vacancy in Vacancy::candidates(source, to, direction, visible, gap) {
+                    let entry = SharedPair {
+                        source,
+                        target: to,
+                        direction,
+                        partition: Partition::Enter(vacancy),
+                    };
+                    if let Some(next) = attempt(Some(entry)) {
+                        return Some(next);
+                    }
+                }
+            }
+            if let Some(pair) = local
+                && let Some(next) = attempt(Some(pair))
+            {
+                return Some(next);
+            }
+        }
+        attempt(None)
+    }
+
     fn move_from_visible(
         &mut self,
         source: usize,
         target: Option<usize>,
-        filler: Option<usize>,
+        mut preview: Option<SharedPair>,
         direction: Direction,
         area: Rect,
-        visible: &[(Id, Rect)],
+        visible: &[Rect],
     ) -> bool {
         // A different command starts from the displayed tiles. Bake only the
         // previews it touches; other pairs keep their pending second press.
         let mut cells = self.cell_rects(area);
-        let mut remaining = self.shared.clone();
-        remaining.retain(|pair| {
-            let involved = pair
-                .slots()
-                .any(|s| s == source || Some(s) == target || Some(s) == filler);
-            if involved {
-                for slot in pair.slots() {
-                    cells[slot] = visible[slot].1;
+        let (mut source, mut target) = (source, target);
+        if !self.shared.is_empty() {
+            let mut touched = vec![false; cells.len()];
+            touched[source] = true;
+            if let Some(to) = target {
+                touched[to] = true;
+            }
+            if let Some(pair) = &preview {
+                for i in pair.slots() {
+                    touched[i] = true;
                 }
             }
-            !involved
-        });
-        let (source, target, filler) = if remaining.len() != self.shared.len() {
-            if !self.rebuild_cells(area, &cells, remaining) {
-                return false;
+            let mut remaining = self.shared.clone();
+            remaining.retain(|pair| {
+                if pair.slots().any(|s| touched[s]) {
+                    for slot in pair.slots() {
+                        cells[slot] = visible[slot];
+                    }
+                    return false;
+                }
+                true
+            });
+            if remaining.len() != self.shared.len() {
+                let Some(slots) = self.rebuild_cells(area, &cells, remaining) else {
+                    return false;
+                };
+                if let Some(pair) = &mut preview {
+                    pair.remap(|s| slots[s]);
+                }
+                source = slots[source];
+                target = target.map(|s| slots[s]);
+                cells = self.cell_rects(area);
             }
-            cells = self.cell_rects(area);
-            let remap = |slot: usize| self.slot(visible[slot].0).expect("visible tile remains");
-            (remap(source), target.map(remap), filler.map(remap))
-        } else {
-            (source, target, filler)
-        };
+        }
         let Some(target) = target else {
             return self.move_to_edge(source, direction, area);
         };
-        let pair = match filler {
-            Some(filler) => Some(SharedPair {
-                source,
-                target,
-                direction,
-                partition: Partition::Enter { filler },
-            }),
-            None => SharedPair::new(
-                source,
-                target,
-                direction,
+        if let Some(pair) = preview {
+            self.shared.push(pair);
+            return SharedPair::can_freeze(
+                &self.shared,
+                area,
                 &cells,
                 &self.occupants,
                 self.grid.gap,
-            ),
-        };
-        if let Some(pair) = pair {
-            self.shared.push(pair);
-            if SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants, self.grid.gap) {
-                return true;
-            }
-            self.shared.pop();
+            );
         }
-        filler.is_none() && self.exchange(source, target, area, &cells)
+        self.exchange(source, target, area, &cells)
     }
 
     fn exchange(&mut self, source: usize, target: usize, area: Rect, cells: &[Rect]) -> bool {
@@ -1020,8 +1071,8 @@ impl Layout {
             .iter()
             .position(|p| p.slots().any(|s| s == slot))
         {
-            if self.shared[index].filler().is_some() {
-                // All three windows can start a resize from their visible frame.
+            if self.shared[index].vacancy().is_some() {
+                // Every participant starts a resize from its displayed frame.
                 let mut displayed = self.clone();
                 if !displayed.freeze_pair(index, area) {
                     return None;
@@ -1033,7 +1084,7 @@ impl Layout {
             let pair = &mut self.shared[index];
             companion = pair.other(slot);
             let (source, target) = pair.rectangles(&cells, &self.occupants, self.grid.gap)?;
-            let previous = pair.partition;
+            let previous = pair.partition.clone();
             let Partition::Divider {
                 axis,
                 source_first,

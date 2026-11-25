@@ -46,6 +46,20 @@ fn transpose(rect: Rect) -> Rect {
     }
 }
 
+fn orient_toward(mut r: Rect, area: Rect, dir: Direction, mirror: bool) -> Rect {
+    if mirror {
+        r.x = area.x + area.w - (r.x - area.x) - r.w;
+    }
+    if matches!(dir, Direction::Down | Direction::Right) {
+        r.y = area.y + area.h - (r.y - area.y) - r.h;
+    }
+    if dir.axis() == super::Axis::X {
+        transpose(r)
+    } else {
+        r
+    }
+}
+
 // Each band must extend all the way to both edges. Counting windows alone
 // would miss a phantom cell at the end of an incomplete row.
 fn assert_packed(layout: &Layout, count: usize, area: Rect) {
@@ -494,16 +508,7 @@ const TELEGRAM: Id = 4;
 
 // IDs 1 and 2 are the wide windows. IDs 3вЂ“6 are their four narrow neighbors.
 fn explorer_junction(direction: Direction, source_width: i32, host_min: i32) -> (Layout, Rect) {
-    let orient = |mut r: Rect| {
-        if matches!(direction, Direction::Down | Direction::Right) {
-            r.y = DESKTOP.y + DESKTOP.h - (r.y - DESKTOP.y) - r.h;
-        }
-        if direction.axis() == super::Axis::X {
-            transpose(r)
-        } else {
-            r
-        }
-    };
+    let orient = |r| orient_toward(r, DESKTOP, direction, false);
     let area = orient(DESKTOP);
     let (top, bottom) = super::Axis::Y.split_at(DESKTOP, 564, GAP);
     let (top_left, host) = super::Axis::X.split_at(top, 948, GAP);
@@ -520,7 +525,7 @@ fn explorer_junction(direction: Direction, source_width: i32, host_min: i32) -> 
         };
         assert!(layout.insert_with_minimum(i as Id + 1, area, min));
     }
-    assert!(layout.rebuild_cells(area, &cells, vec![]));
+    assert!(layout.rebuild_cells(area, &cells, vec![]).is_some());
     (layout, area)
 }
 
@@ -567,6 +572,155 @@ fn narrow_window_enters_its_aligned_half_before_taking_the_wide_neighbors_slot()
             exchanged.insert(2, old);
             assert_eq!(frames(&layout, area), exchanged);
         }
+    }
+}
+
+fn assert_band_reclaimed(
+    before: &Frames,
+    after: &Frames,
+    mut remaining: Vec<Id>,
+    band: Rect,
+    across: super::Axis,
+    gap: i32,
+) {
+    remaining.sort_by_key(|id| across.bounds(before[id]).0);
+    let prior_widths: i32 = remaining.iter().map(|id| across.length(before[id])).sum();
+    let available = across.length(band) - (remaining.len() as i32 - 1) * gap;
+    let (mut start, end) = across.bounds(band);
+    for id in remaining {
+        let r = after[&id];
+        let along = across.perpendicular();
+        assert_eq!(along.bounds(r), along.bounds(band));
+        let (lo, hi) = across.bounds(r);
+        assert_eq!(lo, start, "hole or reordered tile {id}");
+        start = hi + i64::from(gap);
+        let ideal =
+            f64::from(available) * f64::from(across.length(before[&id])) / f64::from(prior_widths);
+        assert!((f64::from(across.length(r)) - ideal).abs() <= 1.0);
+    }
+    assert_eq!(start - i64::from(gap), end);
+}
+
+#[test]
+fn offset_window_shares_the_nearest_half_and_its_old_band_recovers_the_space() {
+    use super::Axis::{X, Y};
+
+    // The upper band has one tall tile and a stack of two on its right.
+    // The lower band's four tiles are sized independently of the upper band.
+    let base = Rect {
+        x: -1907,
+        y: 37,
+        w: 1914,
+        h: 1144,
+    };
+    for (gap, first, second, third, moving, host_min) in [
+        (4, 474, 476, 475, 6, MIN_WIDTH),
+        (13, 517, 284, 418, 6, MIN_WIDTH),
+        // The host needs more than half, but fits back in the old source slot.
+        (5, 450, 358, 740, 6, 689),
+        // This window straddles the upper divider; most of it faces the host.
+        (7, 484, 463, 551, 5, MIN_WIDTH),
+    ] {
+        let (upper, lower) = Y.split_at(base, 714, gap);
+        let (left, right) = X.split_at(upper, 635, gap);
+        let (above_host, host) = Y.split_at(right, 308, gap);
+        let (a, rest) = X.split_at(lower, first, gap);
+        let (b, rest) = X.split_at(rest, second, gap);
+        let (c, d) = X.split_at(rest, third, gap);
+        for dir in [
+            Direction::Up,
+            Direction::Down,
+            Direction::Left,
+            Direction::Right,
+        ] {
+            for mirror in [false, true] {
+                let orient = |r| orient_toward(r, base, dir, mirror);
+                let area = orient(base);
+                let cells = [left, host, above_host, a, b, c, d].map(orient);
+                let mut layout = Layout::with_gap(gap);
+                for id in 1..=7 {
+                    let width = if id == 2 { host_min } else { MIN_WIDTH };
+                    let minimum = if dir.axis() == X {
+                        (MIN_WIDTH, width)
+                    } else {
+                        (width, MIN_HEIGHT)
+                    };
+                    assert!(layout.insert_with_minimum(id, area, minimum));
+                }
+                assert!(layout.rebuild_cells(area, &cells, vec![]).is_some());
+                let before = frames(&layout, area);
+                let across = dir.axis().perpendicular();
+                let center = |r: Rect| {
+                    let (a, b) = across.bounds(r);
+                    a + b
+                };
+                assert_eq!(layout.neighbor(moving, dir, area), Some(2));
+                assert!(layout.move_window(moving, dir, area));
+                let shared = frames(&layout, area);
+                let (entry, peer) = (shared[&moving], shared[&2]);
+                assert_eq!(
+                    entry.joined(peer, across, gap),
+                    Some(before[&2]),
+                    "{dir:?} from {moving} with gap {gap}: {shared:?}"
+                );
+                let half = (across.length(before[&2]) - gap) / 2;
+                assert!(across.length(peer).abs_diff(half.max(host_min)) <= 1);
+                assert!(across.length(peer) >= host_min);
+                assert_eq!(
+                    center(entry) < center(peer),
+                    center(before[&moving]) < center(before[&2])
+                );
+                assert_progress(before[&moving], entry, dir);
+                for id in [1, 3] {
+                    assert_eq!(shared[&id], before[&id]);
+                }
+
+                let remaining = (4..=7).filter(|&id| id != moving).collect();
+                assert_band_reclaimed(&before, &shared, remaining, orient(lower), across, gap);
+
+                assert!(layout.move_window(moving, dir, area));
+                let taken = frames(&layout, area);
+                stationary(&before, &taken, moving, 2);
+                assert_eq!([taken[&moving], taken[&2]], [before[&2], before[&moving]]);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_offset_move_only_reflows_the_contiguous_part_of_the_row() {
+    use super::Axis::{X, Y};
+    let area = Rect { w: 4080, ..AREA };
+    let (left, rest) = X.split_at(area, 317, GAP);
+    let (body, right) = X.split_at(rest, 3291, GAP);
+    let (top, bottom) = Y.split_at(body, 593, GAP);
+    let (above_left, host) = X.split_at(top, 608, GAP);
+    for count in [2, 5, 11] {
+        let mut cells = vec![left, right, above_left, host];
+        let mut rest = bottom;
+        for n in (2..=count).rev() {
+            let (tile, tail) = X.split_at(rest, (rest.w - (n - 1) * GAP) / n, GAP);
+            cells.push(tile);
+            rest = tail;
+        }
+        cells.push(rest);
+        let mut layout = populated(cells.len() as Id, area);
+        assert!(layout.rebuild_cells(area, &cells, vec![]).is_some());
+        let old = frames(&layout, area);
+        let moving = 5 + Id::try_from((count - 1) / 2).unwrap();
+        assert_eq!(layout.neighbor(moving, Direction::Up, area), Some(4));
+        assert!(layout.move_window(moving, Direction::Up, area));
+        let preview = frames(&layout, area);
+        assert_eq!(preview[&moving].joined(preview[&4], X, GAP), Some(host));
+        let survivors = (5..=cells.len() as Id).filter(|&id| id != moving).collect();
+        assert_band_reclaimed(&old, &preview, survivors, bottom, X, GAP);
+        for id in [1, 2, 3] {
+            assert_eq!(preview[&id], old[&id]);
+        }
+        assert!(layout.move_window(moving, Direction::Up, area));
+        let taken = frames(&layout, area);
+        stationary(&old, &taken, moving, 4);
+        assert_eq!([taken[&moving], taken[&4]], [host, old[&moving]]);
     }
 }
 
@@ -945,11 +1099,24 @@ fn intersecting_corner_moves_in_five_tiles_keep_next_commands_usable() {
     assert_eq!(layout.neighbor(3, Direction::Down, area), Some(5));
     assert!(layout.move_window(3, Direction::Down, area));
     let before = frames(&layout, area);
-    stationary(&initial, &before, 3, 5);
+    assert_eq!(
+        before[&3].joined(before[&5], super::Axis::X, GAP),
+        Some(initial[&5])
+    );
+    assert_eq!(
+        initial[&2].joined(initial[&3], super::Axis::Y, GAP),
+        Some(before[&2])
+    );
+    for id in [1, 4] {
+        assert_eq!(before[&id], initial[&id]);
+    }
     assert_progress(initial[&3], before[&3], Direction::Down);
-    // A shared corner here can create a pinwheel with no straight divider
-    // spanning the workspace. Whether the previous key shared or took over,
-    // window 5 must still respond to its next arrow.
+    // The original L would produce a pinwheel. Enter the destination first,
+    // then finish into the same slots used by the subsequent crossing moves.
+    assert!(layout.move_window(3, Direction::Down, area));
+    let before = frames(&layout, area);
+    stationary(&initial, &before, 3, 5);
+    assert_eq!([before[&3], before[&5]], [initial[&5], initial[&3]]);
     let neighbor = layout.neighbor(5, Direction::Right, area);
     assert!(layout.move_window(5, Direction::Right, area));
     let moved = frames(&layout, area);
@@ -1032,7 +1199,7 @@ fn moving_left_from_chat_in_three_columns_releases_its_old_position_on_the_first
             assert!(layout.insert_with_minimum(id, DESKTOP, min));
         }
         let columns = [(8, 683), (699, 502), (1209, 703)].map(|(x, w)| Rect { x, w, ..DESKTOP });
-        assert!(layout.rebuild_cells(DESKTOP, &columns, vec![]));
+        assert!(layout.rebuild_cells(DESKTOP, &columns, vec![]).is_some());
         let before = frames(&layout, DESKTOP);
         assert_eq!([before[&browser], before[&chat], before[&folder]], columns);
         assert!(layout.move_window(chat, Direction::Left, DESKTOP));

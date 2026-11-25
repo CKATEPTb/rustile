@@ -23,7 +23,7 @@ mod virtual_desktops;
 
 // The C# harness creates the fixture windows on a private Win32 desktop.
 // Confirm both the desktop and the window membership before touching geometry.
-fn fixtures() -> [Id; 6] {
+fn fixtures<const N: usize>() -> [Id; N] {
     let expected = env::var("RUSTILE_SMOKE_DESKTOP").unwrap();
     let uuid = expected.strip_prefix("rustile-smoke-").unwrap();
     assert!(uuid.len() == 32 && uuid.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -717,6 +717,110 @@ fn share_upper_tile_in_six_windows(manager: &mut Manager, windows: [Id; 6], area
     assert_eq!([active, host, filler].map(frame), [upper, lower, side]);
     assert_eq!(untouched.map(frame), outside);
     assert_eq!(native::foreground(), foreground);
+}
+
+#[test]
+#[ignore = "run with tests/desktop-smoke.ps1 on its isolated Win32 desktop"]
+fn share_offset_upper_tile() {
+    native::init_dpi();
+    let windows = fixtures();
+    let [
+        top_right,
+        host,
+        bottom_left,
+        bottom_middle,
+        source,
+        top_left,
+        bottom_right,
+    ] = windows;
+    let failure_file = env::var_os("RUSTILE_SMOKE_FAILURE").unwrap();
+    std::panic::set_hook(Box::new(move |failure| {
+        let _ = std::fs::write(&failure_file, failure.to_string());
+    }));
+    let originals = windows.map(frame);
+    let foreground = native::foreground();
+    let area = native::work_area().unwrap().inset_for_tiles(6);
+    let (min_height, _) = tall_fixture_minimum(top_left);
+    // Start with a compact 2x2. Its tall top-left fixture makes the top-right
+    // cell taller than wide, so its focused split makes two stacked tiles.
+    let side = (min_height + 200).min(area.w).min(area.h);
+    let mut manager = Manager::new();
+    manager.area = Some(Rect {
+        w: side,
+        h: side,
+        ..area
+    });
+    for id in [top_left, top_right, bottom_left, source] {
+        assert!(manager.admit(id, None));
+    }
+    assert!(manager.admit(host, Some(top_right)));
+    manager.area = Some(area);
+    for (id, anchor) in [(bottom_middle, bottom_left), (bottom_right, source)] {
+        assert!(manager.admit(id, Some(anchor)));
+    }
+    manager.apply();
+    settle(&manager, 7);
+    assert!(manager.begin_resize(top_left));
+    for _ in 0..3 {
+        manager.resize(top_left, Direction::Left, false);
+    }
+    manager.finish_mode(true);
+    settle(&manager, 7);
+
+    let [fixed_right, target, first, second, from, fixed_left, last] = windows.map(frame);
+    let upper_region = join_frames(fixed_right, target).unwrap();
+    assert_eq!(fixed_right.y, area.y);
+    let upper_region = join_frames(fixed_left, upper_region).unwrap();
+    let lower_region = join_frames(
+        join_frames(first, second).unwrap(),
+        join_frames(from, last).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(join_frames(upper_region, lower_region), Some(area));
+    assert_eq!(target.y + target.h + 8, from.y);
+    assert!(target.x < from.x && from.x + from.w < target.x + target.w);
+    assert!(2 * from.x + from.w < 2 * target.x + target.w);
+
+    move_and_settle(&mut manager, source, Direction::Up, &windows);
+    assert_split(target, source, host, true);
+    assert!(frame(source).w.abs_diff(frame(host).w) <= 1);
+    assert_eq!([top_left, top_right].map(frame), [fixed_left, fixed_right]);
+    let remaining = [bottom_left, bottom_middle, bottom_right].map(frame);
+    assert!(remaining[0].x < remaining[1].x && remaining[1].x < remaining[2].x);
+    assert_eq!(
+        join_frames(
+            join_frames(remaining[0], remaining[1]).unwrap(),
+            remaining[2]
+        ),
+        Some(lower_region)
+    );
+    for (expanded, old) in remaining.into_iter().zip([first, second, last]) {
+        assert!(
+            expanded.w > old.w,
+            "all three windows should share the released space"
+        );
+    }
+
+    move_and_settle(&mut manager, source, Direction::Up, &windows);
+    assert_eq!(
+        windows.map(frame),
+        [fixed_right, from, first, second, target, fixed_left, last]
+    );
+    assert_eq!(native::foreground(), foreground);
+    manager.shutdown();
+    until("restored all seven native frames", || {
+        windows.map(frame) == originals
+    });
+    unsafe {
+        assert_ne!(
+            SetPropW(
+                source as _,
+                w!("Rustile.Smoke.OffsetSevenPassed"),
+                1usize as _
+            ),
+            0
+        );
+    }
 }
 
 fn check_normal_placement(id: Id) {

@@ -139,7 +139,7 @@ impl EdgeMove<'_> {
             .cloned()
             .collect();
         let mut candidate = layout.clone();
-        if !candidate.rebuild_cells(self.area, &rects, shares) {
+        if candidate.rebuild_cells(self.area, &rects, shares).is_none() {
             return false;
         }
         let (needs, children) = candidate

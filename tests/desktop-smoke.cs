@@ -772,15 +772,18 @@ internal static class DesktopSmoke {
             // assertion in the smoke output, including actual and expected frames.
             string failureFile = Path.ChangeExtension(self, ".log");
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_FAILURE", failureFile);
-            try {
-                var geometry = new Child(managerTests, "--exact manager::desktop_test::move_windows --ignored", desktopName);
-                children.Add(geometry);
-                Require(geometry.Exited(20000), "Hidden geometry test timed out");
-                Require(geometry.ExitCode == 0, File.Exists(failureFile)
-                    ? File.ReadAllText(failureFile) : "Explicit-window move test failed on the hidden desktop");
-            } finally {
-                File.Delete(failureFile);
-            }
+            Action<string> geometryTest = delegate(string name) {
+                try {
+                    var geometry = new Child(managerTests, "--exact manager::desktop_test::" + name + " --ignored", desktopName);
+                    children.Add(geometry);
+                    Require(geometry.Exited(20000), "Hidden geometry test timed out: " + name);
+                    Require(geometry.ExitCode == 0, File.Exists(failureFile)
+                        ? File.ReadAllText(failureFile) : "Hidden geometry test failed: " + name);
+                } finally {
+                    File.Delete(failureFile);
+                }
+            };
+            geometryTest("move_windows");
             Require(GetProp(windows[0], "Rustile.Smoke.MovePassed") != IntPtr.Zero, "Manager test did not run");
             Until("Manager should restore all six fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Five real windows: three plus two slots, level DWM heights after resize and horizontal moves");
@@ -796,6 +799,15 @@ internal static class DesktopSmoke {
             Console.WriteLine("PASS  Three columns: Left puts the chat above the browser, then takes its column; Explorer keeps its frame");
             Console.WriteLine("PASS  A single Left takes the browser's column when the apps cannot stack");
             Console.WriteLine("PASS  Six windows: Up enters the aligned half of the upper tile; another Up takes that tile and restores the lower neighbor");
+            Array.Resize(ref windows, 7);
+            Array.Resize(ref originals, 7);
+            Array.Resize(ref fixtures, 7);
+            launch(6);
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Select(w => w.ToInt64())));
+            geometryTest("share_offset_upper_tile");
+            Require(GetProp(windows[4], "Rustile.Smoke.OffsetSevenPassed") != IntPtr.Zero, "Seven-window geometry test did not run");
+            Until("Manager should restore all seven fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
+            Console.WriteLine("PASS  Seven windows: Up into an offset wider tile shares that tile and fills the bottom row; a second Up exchanges the original slots");
         } finally {
             children.Reverse();
             foreach (var child in children) child.Dispose();
