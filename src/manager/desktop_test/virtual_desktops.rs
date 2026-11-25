@@ -2,7 +2,7 @@ use windows_sys::Win32::{
     Foundation::RECT,
     Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
     UI::WindowsAndMessaging::{
-        EVENT_OBJECT_CLOAKED, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_OBJECT_CLOAKED, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
         EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         EVENT_SYSTEM_MINIMIZESTART, GetWindowRect, IsIconic, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
         SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
@@ -10,7 +10,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{Direction, Id, Manager, Rect, frame, settle, until};
+use super::{Direction, Id, Manager, Rect, frame, set_visible, settle, until};
 use crate::native::desktops::{DesktopId, DesktopMembership};
 
 const A: DesktopId = DesktopId(1);
@@ -100,6 +100,94 @@ fn shift_frame(id: Id) {
     });
 }
 
+fn first_show_after_all_hide(
+    manager: &mut Manager,
+    previous: [Id; 3],
+    fresh: Id,
+    outside: [Id; 2],
+) {
+    let home = |manager: &mut Manager, visible: &[Id]| {
+        manager.desktops.set_memberships(
+            previous
+                .into_iter()
+                .chain([fresh])
+                .map(|id| {
+                    let membership = if visible.contains(&id) {
+                        DesktopMembership::Current(B)
+                    } else {
+                        DesktopMembership::Unknown
+                    };
+                    (id, membership)
+                })
+                .chain(outside.map(|id| (id, DesktopMembership::Other(A)))),
+        );
+    };
+    let untouched = outside.map(frame);
+    set_visible(fresh, false);
+    home(manager, &[]);
+    for id in previous {
+        set_visible(id, false);
+        manager.event(EVENT_OBJECT_HIDE, id);
+    }
+    // No visible HWND identifies B yet. These events are indistinguishable
+    // from the beginning of a desktop switch, so preserve its layout.
+    manager.reconcile_desktop();
+    assert!(
+        previous
+            .iter()
+            .all(|&id| manager.workspace.layout.contains(id))
+    );
+    // First return a retained tile at exactly its last requested bounds. Then
+    // try a brand-new HWND with no visible anchor. In either case the only
+    // incoming event is SHOW; no timer is delivered unless the manager asks.
+    for first in [previous[0], fresh] {
+        home(manager, &[first]);
+        set_visible(first, true);
+        if first != fresh {
+            assert_eq!(manager.windows[&first].requested, Some(frame(first)));
+        }
+        manager.take_desktop_retry();
+        manager.event(EVENT_OBJECT_SHOW, first);
+        if manager.take_desktop_retry() {
+            manager.reconcile_desktop();
+        }
+        settle(manager, 1);
+        assert_eq!(frame(first), manager.area.unwrap());
+        if first != fresh {
+            home(manager, &[]);
+            set_visible(first, false);
+            manager.event(EVENT_OBJECT_HIDE, first);
+            manager.reconcile_desktop();
+            assert!(manager.workspace.layout.contains(first));
+        }
+    }
+
+    home(manager, &[previous[0], previous[1], previous[2], fresh]);
+    for id in previous {
+        set_visible(id, true);
+        manager.event(EVENT_OBJECT_SHOW, id);
+    }
+    manager.reconcile_desktop();
+    settle(manager, 4);
+    set_visible(fresh, false);
+    home(manager, &previous);
+    manager.event(EVENT_OBJECT_HIDE, fresh);
+    manager.reconcile_desktop();
+    settle(manager, 3);
+    let [a, b, c] = previous.map(frame);
+    assert!(
+        [(a, b, c), (a, c, b), (b, c, a)]
+            .into_iter()
+            .any(|(a, b, c)| {
+                super::join_frames(a, b).and_then(|joined| super::join_frames(joined, c))
+                    == manager.area
+            }),
+        "the three real frames must fill the area after the fourth window hides"
+    );
+    assert_eq!(outside.map(frame), untouched);
+    set_visible(fresh, true);
+}
+
 pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     let mut a = [windows[0], windows[1]];
     let b = [windows[2], windows[3]];
@@ -144,6 +232,18 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     assert_eq!(a.map(geometry_changes), a_changes, "A moved while B opened");
     let b_tiles = b.map(frame);
     let b_changes = b.map(geometry_changes);
+
+    // The same real SW_HIDE with an unknown membership must not release an A
+    // slot while a B peer confirms that B is the active workspace.
+    set_visible(a[1], false);
+    select_desktop(manager, &homes, B, Some(a[1]));
+    manager.event(EVENT_OBJECT_HIDE, a[1]);
+    manager.reconcile_desktop();
+    assert_eq!(b.map(frame), b_tiles);
+    assert_eq!(b.map(geometry_changes), b_changes);
+    set_visible(a[1], true);
+    select_desktop(manager, &homes, B, None);
+    manager.event(EVENT_OBJECT_SHOW, a[1]);
 
     // The shell now reports all A handles as current while DWM still cloaks
     // the first one. Drawing its sibling at full width would visibly flicker.
@@ -207,6 +307,39 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     manager.reconcile_desktop();
     settle(manager, a.len());
 
+    // A tray app can keep its HWND but lose its virtual-desktop membership
+    // while hidden. Its visible peer still identifies A unambiguously.
+    set_visible(a[0], false);
+    select_desktop(manager, &homes, A, Some(a[0]));
+    manager.event(EVENT_OBJECT_HIDE, a[0]);
+    if manager.workspace.layout.contains(a[0]) {
+        assert!(
+            manager.take_desktop_retry(),
+            "a deferred HIDE must wake the normal settle path"
+        );
+    }
+    until(
+        "hidden tray HWND with unknown membership still occupies an A tile",
+        || {
+            manager.reconcile_desktop();
+            !manager.workspace.layout.contains(a[0])
+        },
+    );
+    settle(manager, 1);
+    assert_eq!(
+        frame(a[1]),
+        manager.area.unwrap(),
+        "the visible peer must reclaim the tray slot"
+    );
+    assert_eq!(b.map(geometry_changes), b_changes);
+    set_visible(a[0], true);
+    select_desktop(manager, &homes, A, None);
+    manager.event(EVENT_OBJECT_SHOW, a[0]);
+    manager.reconcile_desktop();
+    settle(manager, 2);
+    assert_eq!(super::join_frames(frame(a[0]), frame(a[1])), manager.area);
+    assert_eq!(b.map(geometry_changes), b_changes);
+
     // Move one HWND to B using the shell. It leaves A immediately and receives
     // one tile on B when visited; B's previous frames hold in the meantime.
     let transferred = [(a[0], B), (a[1], A), (b[0], B), (b[1], B)];
@@ -222,6 +355,8 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     settle(manager, 3);
     assert!(manager.workspace.layout.contains(a[0]));
     assert!(b.iter().all(|id| manager.workspace.layout.contains(*id)));
+
+    first_show_after_all_hide(manager, [a[0], b[0], b[1]], spare[0], [a[1], spare[1]]);
 
     // Return the injected adapter to the private test desktop before the
     // harness restores and verifies the originals of every fixture.

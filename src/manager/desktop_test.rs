@@ -458,7 +458,7 @@ fn focused_arrivals(manager: &mut Manager, windows: [Id; 6], area: Rect) {
 
     set_visible(e, false);
     manager.event(EVENT_OBJECT_HIDE, e);
-    manager.settle_hidden();
+    manager.settle_hidden(true);
     manager.apply();
     settle(manager, 4);
     assert_eq!(

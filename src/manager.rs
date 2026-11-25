@@ -225,7 +225,11 @@ impl Manager {
                     DesktopMembership::Other(key) | DesktopMembership::Current(key) => {
                         self.migrate(id, key);
                     }
-                    DesktopMembership::Unknown => self.needs_desktop_retry = true,
+                    DesktopMembership::Unknown => {
+                        // A tray app can keep a hidden HWND without a Shell GUID
+                        // until its next SHOW. Waiting longer will not resolve it.
+                        self.needs_desktop_retry |= !native::hidden_or_minimized(id);
+                    }
                 }
             }
         }
@@ -265,7 +269,7 @@ impl Manager {
         {
             self.select(desktop);
         }
-        self.settle_hidden();
+        self.settle_hidden(!visible.is_empty());
         let resume = self
             .current
             .is_some_and(|key| self.windows.values().any(|w| w.desktop == key));
@@ -288,13 +292,22 @@ impl Manager {
         self.place_tiles(true);
     }
 
-    // A HIDE can precede both the Shell cloak and the membership change.
-    // Leave the tile intact until the transition settles and Windows confirms
-    // the window is still on this desktop and is actually hidden/ineligible.
-    fn settle_hidden(&mut self) {
+    fn settle_hidden(&mut self, desktop_confirmed: bool) {
         let Some(area) = self.area else { return };
         for (id, _) in self.workspace.layout.placements(area) {
-            if self.on_current(id) && !native::cloaked(id) && !native::eligible(id) {
+            let release = match self.desktops.membership(id) {
+                DesktopMembership::Current(key) if self.current == Some(key) => {
+                    !native::eligible(id)
+                }
+                // Hiding to the tray may unregister the HWND from the Shell.
+                // A visible peer identifies this workspace even after the hidden
+                // window's own GetWindowDesktopId starts returning no result.
+                DesktopMembership::Unknown => desktop_confirmed && native::hidden_or_minimized(id),
+                _ => false,
+            };
+            // A desktop switch can hide windows while their GUIDs are in flux.
+            // Keep their layout until Windows finishes the cloak transition.
+            if release && !native::cloaked(id) {
                 self.suspend(id);
             }
         }
@@ -551,9 +564,19 @@ impl Manager {
         if self.dragging == Some(id) {
             return;
         }
-        if !self.workspace.layout.contains(id) {
+        let was_tiled = self.workspace.layout.contains(id);
+        if was_tiled && matches!(event, EVENT_OBJECT_SHOW | EVENT_SYSTEM_MINIMIZEEND) {
+            // If every window hid, the first one back can still be at its old
+            // coordinates. Its return now identifies the other hidden slots.
+            self.needs_desktop_retry = true;
+        }
+        if !was_tiled {
             self.rollback_resize();
-            self.admit_new(id);
+            // A newly shown window can be the first visible peer after all
+            // others hid to the tray. Reconcile their stale slots before retrying.
+            if !self.admit_new(id) {
+                self.needs_desktop_retry = true;
+            }
             self.apply();
         } else if event == EVENT_SYSTEM_MOVESIZEEND
             || (matches!(event, EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_FOREGROUND)

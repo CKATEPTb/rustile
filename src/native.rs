@@ -242,6 +242,10 @@ pub fn minimized_or_maximized(id: Id) -> bool {
     unsafe { IsIconic(id as HWND) != 0 || IsZoomed(id as HWND) != 0 }
 }
 
+pub fn hidden_or_minimized(id: Id) -> bool {
+    unsafe { IsWindowVisible(id as HWND) == 0 || IsIconic(id as HWND) != 0 }
+}
+
 /// Visible frame and work area for an already-managed tile on the primary display.
 pub fn outline_frame(id: Id) -> Option<(Rect, Rect)> {
     let hwnd = id as HWND;
