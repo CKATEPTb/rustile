@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
     CANCEL, CLOSE_WINDOW, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE,
-    SHRINK, START_RESIZE, TOGGLE_MAXIMIZE,
+    SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
 };
 use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
@@ -26,16 +26,24 @@ struct KeyRoutes {
 }
 
 impl KeyRoutes {
-    fn for_mode(&mut self, action: Shortcut) -> &mut [u8; 16] {
-        if action.is_resize() {
-            &mut self.resize
-        } else {
-            &mut self.normal
+    fn bind(&mut self, action: Shortcut, mods: u32) {
+        let id = command_id(action);
+        if !action.is_resize() {
+            self.normal[mods as usize] = id;
+        }
+        if action.is_resize() || action == Shortcut::ToggleMosaic {
+            self.resize[mods as usize] = id;
         }
     }
 
-    fn command(self, target: ShortcutTarget, mode: Mode, mods: u32) -> Option<i32> {
-        let commands = match mode {
+    fn binding(
+        self,
+        state: Snapshot,
+        pending: Pending,
+        mods: u32,
+        foreground: impl FnOnce() -> isize,
+    ) -> Option<BoundCommand> {
+        let commands = match pending.mode(state) {
             Mode::Normal => self.normal,
             Mode::Resize => self.resize,
         };
@@ -44,21 +52,39 @@ impl KeyRoutes {
             .copied()
             .filter(|&id| id != 0)
             .map(i32::from)?;
-        match target {
-            ShortcutTarget::Tile {
-                can_maximize: false,
-                ..
-            } if id == TOGGLE_MAXIMIZE => None,
-            ShortcutTarget::Tile { .. } => Some(id),
-            ShortcutTarget::Expanded(_) if matches!(id, CLOSE_WINDOW | TOGGLE_MAXIMIZE) => Some(id),
-            ShortcutTarget::Expanded(_) => None,
-        }
+        let target = if id == TOGGLE_MOSAIC {
+            0 // Pause/resume belongs to Rustile even when there are no tiled windows.
+        } else {
+            let target = state.target?;
+            match target {
+                ShortcutTarget::Tile {
+                    can_maximize: false,
+                    ..
+                } if id == TOGGLE_MAXIMIZE => return None,
+                ShortcutTarget::Expanded(_) if !matches!(id, CLOSE_WINDOW | TOGGLE_MAXIMIZE) => {
+                    return None;
+                }
+                _ => {}
+            }
+            if target.id() != foreground() {
+                return None;
+            }
+            target.id()
+        };
+        Some(BoundCommand {
+            id,
+            target,
+            focus_epoch: state.focus_epoch,
+            mods,
+        })
     }
 }
 
 struct Routes([Option<KeyRoutes>; 256]);
 
 impl Routes {
+    const EMPTY: Self = Self([None; 256]);
+
     fn new(settings: Settings) -> Self {
         let mut keys = [None; 256];
         for action in Shortcut::ALL {
@@ -88,7 +114,7 @@ impl Routes {
                 continue;
             };
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
-            row.for_mode(action)[chord.mods as usize] = command_id(action);
+            row.bind(action, chord.mods);
         }
         Self(keys)
     }
@@ -108,6 +134,7 @@ fn command_id(action: Shortcut) -> u8 {
         StartResize => START_RESIZE,
         CloseWindow => CLOSE_WINDOW,
         ToggleMaximize => TOGGLE_MAXIMIZE,
+        ToggleMosaic => TOGGLE_MOSAIC,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -203,7 +230,9 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
             focus_epoch: 0,
             handled: 0,
         },
-        keys: Routes::new(Settings::default()),
+        // Global shortcuts can fire before the manager has sampled a window.
+        // Arm them only when the user's actual settings have been loaded.
+        keys: Routes::EMPTY,
     })
 });
 
@@ -249,7 +278,7 @@ impl Pending {
     fn transition(self, command: i32, focus_epoch: usize) -> Option<Self> {
         let mode = match command {
             START_RESIZE => Mode::Resize,
-            CONFIRM | CANCEL => Mode::Normal,
+            CONFIRM | CANCEL | TOGGLE_MOSAIC => Mode::Normal,
             _ => return None,
         };
         // Low eight bits of WPARAM carry the command. Ticket zero denotes a
@@ -319,17 +348,12 @@ fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
         let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
         (routing.focus, routing.keys.0[slot]?)
     };
-    let target = state.target?;
-    if target.id() != unsafe { GetForegroundWindow() } as isize {
-        return None;
-    }
-    let mods = modifiers();
-    Some(BoundCommand {
-        id: key.command(target, pending.mode(state), mods)?,
-        target: target.id(),
-        focus_epoch: state.focus_epoch,
-        mods,
-    })
+    key.binding(
+        state,
+        pending,
+        modifiers(),
+        || unsafe { GetForegroundWindow() } as isize,
+    )
 }
 
 unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isize {
@@ -446,6 +470,7 @@ impl Hook {
 impl Drop for Hook {
     fn drop(&mut self) {
         update(None, Mode::Normal, 0);
+        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
         unsafe { PostThreadMessageW(self.id, WM_QUIT, 0, 0) };
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -498,7 +523,11 @@ mod tests {
             let slot = usize::from(key);
             let routes = Routes::new(self.settings);
             let command = routes.0[slot].and_then(|route| {
-                route.command(self.state.target?, self.pending.mode(self.state), mods)
+                route
+                    .binding(self.state, self.pending, mods, || {
+                        self.state.target.map_or(0, ShortcutTarget::id)
+                    })
+                    .map(|b| b.id)
             });
             let action = self.held[slot].route(down, command);
             if let Action::Command(id) = action
@@ -507,6 +536,52 @@ mod tests {
                 self.pending = next;
             }
             action
+        }
+    }
+
+    #[test]
+    fn mosaic_toggles_once_per_press_across_pause_and_modal_focus_changes() {
+        let mut keyboard = Keyboard::new();
+        assert_eq!(
+            keyboard.key(VK_RETURN, true, MOD_WIN),
+            Action::Command(START_RESIZE)
+        );
+        assert_eq!(
+            keyboard.key(VK_Y, true, MOD_WIN),
+            Action::Command(TOGGLE_MOSAIC)
+        );
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+
+        keyboard.state.target = None;
+        keyboard.state.focus_epoch += 1;
+        assert_eq!(keyboard.key(VK_Y, true, MOD_WIN), Action::Consume);
+        assert_eq!(keyboard.key(VK_Y, false, 0), Action::Consume);
+        assert_eq!(
+            keyboard.key(VK_Y, true, MOD_WIN),
+            Action::Command(TOGGLE_MOSAIC)
+        );
+        keyboard.state.target = Some(ShortcutTarget::Expanded(222));
+        assert_eq!(keyboard.key(VK_Y, true, MOD_WIN), Action::Consume);
+        assert_eq!(keyboard.key(VK_Y, false, 0), Action::Consume);
+    }
+
+    #[test]
+    fn only_the_configured_global_chord_can_bypass_a_stale_target() {
+        let mut keyboard = Keyboard::new();
+        keyboard.assign(Shortcut::ToggleMosaic, MOD_ALT, VK_F8);
+        let routes = Routes::new(keyboard.settings);
+        for mode in [Mode::Normal, Mode::Resize] {
+            keyboard.state.mode = mode;
+            let command = |key: u16, mods| {
+                routes.0[key as usize]?
+                    .binding(keyboard.state, Pending::NEW, mods, || 999)
+                    .map(|b| (b.id, b.target))
+            };
+            assert_eq!(command(VK_F8, MOD_ALT), Some((TOGGLE_MOSAIC, 0)));
+            assert_eq!(command(VK_F8, MOD_ALT | MOD_WIN), None);
+            assert_eq!(command(VK_Y, MOD_WIN), None);
+            assert_eq!(command(VK_LEFT, MOD_WIN), None);
         }
     }
 
@@ -824,7 +899,7 @@ mod tests {
             .changed(Command::ReassignShortcut(
                 Shortcut::ShrinkUp,
                 chord,
-                Shortcut::GrowLeft,
+                Shortcut::GrowLeft.into(),
             ))
             .unwrap();
         keyboard.state.mode = Mode::Resize;

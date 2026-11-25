@@ -29,6 +29,7 @@ use crate::tray::Tray;
 pub(crate) const START_RESIZE: i32 = 1;
 pub(crate) const CLOSE_WINDOW: i32 = 2;
 pub(crate) const TOGGLE_MAXIMIZE: i32 = 3;
+pub(crate) const TOGGLE_MOSAIC: i32 = 4;
 const FOCUS: i32 = 10;
 pub(crate) const EXPAND: i32 = 20;
 const SHRINK: i32 = 30;
@@ -261,7 +262,6 @@ impl Preferences<'_> {
         self.saved = saved;
         hook.set_settings(next);
         tray.set_settings(next);
-        refresh(manager, 0);
         Ok(())
     }
 }
@@ -385,6 +385,7 @@ fn pump(
         if drag_timer.matches(&message) {
             manager.refresh_drop_preview(false);
         }
+        let mut shortcut_command = None;
         if message.message == OUTLINE_SETTINGS_CHANGED {
             refresh(manager, 0);
         } else if message.message == RESIZE_HINT_CHANGED {
@@ -394,10 +395,14 @@ fn pump(
             let target = message.lParam;
             let command = (message.wParam & 0xff) as i32;
             let ticket = message.wParam >> 8;
-            if target != 0 && target == crate::native::foreground() {
-                dispatch(manager, target, command);
+            if command == TOGGLE_MOSAIC && target == 0 {
+                shortcut_command = Some((Command::Toggle, ticket));
+            } else {
+                if target != 0 && target == crate::native::foreground() {
+                    dispatch(manager, target, command);
+                }
+                refresh(manager, ticket);
             }
-            refresh(manager, ticket);
         } else if !tray.pre_translate(&message) {
             unsafe {
                 TranslateMessage(&message);
@@ -413,7 +418,10 @@ fn pump(
                 }
             }
         }
-        while let Some(command) = tray.take_command() {
+        while let Some((command, ticket)) = shortcut_command
+            .take()
+            .or_else(|| tray.take_command().map(|command| (command, 0)))
+        {
             match command {
                 Command::Exit => return Ok(()),
                 Command::SetStartup(mode) => {
@@ -440,6 +448,7 @@ fn pump(
                 _ => {}
             }
             let result = preferences.apply(manager, hook, tray, command);
+            refresh(manager, ticket);
             if let Err(detail) = &result {
                 // The inline control must display the last accepted value when
                 // the layout rejects a spacing change or the save fails.

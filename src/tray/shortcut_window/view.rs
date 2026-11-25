@@ -37,7 +37,10 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             QuickReverseDown,
         ],
     ),
-    ("Управление окном", &[Shortcut::CloseWindow, ToggleMaximize]),
+    (
+        "Управление окнами",
+        &[Shortcut::CloseWindow, ToggleMaximize, ToggleMosaic],
+    ),
 ];
 
 impl ShortcutWindow {

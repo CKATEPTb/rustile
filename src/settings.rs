@@ -2,7 +2,7 @@ mod bindings;
 
 use crate::profile_io;
 use bindings::Overrides;
-pub(crate) use bindings::{Chord, Shortcut};
+pub(crate) use bindings::{BindingOwners, Chord, Shortcut};
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
 
@@ -61,7 +61,7 @@ pub(crate) enum Command {
     Gap(u8),
     Padding(u8),
     Shortcut(Shortcut, Chord),
-    ReassignShortcut(Shortcut, Chord, Shortcut),
+    ReassignShortcut(Shortcut, Chord, BindingOwners),
     ResetShortcut(Shortcut),
     ResetShortcuts,
     Exit,
@@ -160,15 +160,17 @@ impl Settings {
 
     pub fn changed_for_save(mut self, command: Command, live: Self) -> Result<Self, String> {
         // A launch-only opener can own a chord (or supply an alias) which is
-        // free in the stored profile. Persist the two actions the user confirmed.
-        if let Command::ReassignShortcut(action, chord, owner) = command {
-            if live.conflict(action, chord) != Some(owner) {
+        // free in the stored profile. Persist exactly the transfer shown in the editor.
+        if let Command::ReassignShortcut(action, chord, owners) = command {
+            if live.conflict(action, chord) != Some(owners)
+                || self.conflict(action, chord).is_some_and(|stored| {
+                    stored.actions().any(|s| !owners.actions().any(|a| a == s))
+                })
+            {
                 return Err(OWNER_CHANGED.into());
             }
-            if self.conflict(action, chord).is_none() {
-                self.transfer_confirmed(action, chord, owner)?;
-                return self.validated();
-            }
+            self.transfer_confirmed(action, chord, owners)?;
+            return self.validated();
         }
         self.changed(command)
     }
@@ -310,13 +312,13 @@ mod tests {
         );
         assert_eq!(
             profile.conflict(Shortcut::QuickLeft, quick_left),
-            Some(Shortcut::FocusLeft)
+            Some(Shortcut::FocusLeft.into())
         );
         let remapped = profile
             .changed(Command::ReassignShortcut(
                 Shortcut::QuickLeft,
                 quick_left,
-                Shortcut::FocusLeft,
+                Shortcut::FocusLeft.into(),
             ))
             .unwrap();
         assert_eq!(remapped.binding(Shortcut::FocusLeft), None);
@@ -346,9 +348,9 @@ mod tests {
             assert_eq!(action.default_chord(), chord);
             assert_eq!(profile.binding(action), None);
             assert_eq!(profile.binding(owner), Some(chord));
-            assert_eq!(profile.conflict(action, chord), Some(owner));
+            assert_eq!(profile.conflict(action, chord), Some(owner.into()));
             let moved = profile
-                .changed(Command::ReassignShortcut(action, chord, owner))
+                .changed(Command::ReassignShortcut(action, chord, owner.into()))
                 .unwrap();
             let roundtrip: Settings = toml::from_str(&toml::to_string(&moved).unwrap()).unwrap();
             assert_eq!(roundtrip.binding(action), Some(chord));
@@ -358,6 +360,82 @@ mod tests {
             profile.changed(Command::ResetShortcuts).unwrap(),
             Settings::default()
         );
+    }
+
+    #[test]
+    fn mosaic_shortcut_preserves_legacy_owners_in_each_mode_and_transfers_both_on_confirmation() {
+        use Shortcut::{FocusUp, GrowUp, ToggleMosaic};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_Y;
+
+        let chord = Chord {
+            mods: MOD_WIN,
+            key: VK_Y,
+        };
+        assert_eq!(Settings::default().binding(ToggleMosaic), Some(chord));
+        let normal = "shortcuts.focus_up = { mods = 8, key = 89 }";
+        let resize = "shortcuts.grow_up = { mods = 8, key = 89 }";
+        let both = format!("{normal}\n{resize}");
+        for (profile, owners) in [
+            (normal, BindingOwners::One(FocusUp)),
+            (resize, BindingOwners::One(GrowUp)),
+            (both.as_str(), BindingOwners::Both(FocusUp, GrowUp)),
+        ] {
+            let settings = toml::from_str::<Settings>(profile)
+                .unwrap()
+                .validated()
+                .unwrap();
+            assert_eq!(settings.binding(ToggleMosaic), None);
+            assert_eq!(settings.conflict(ToggleMosaic, chord), Some(owners));
+            if matches!(owners, BindingOwners::Both(_, _)) {
+                assert!(
+                    settings
+                        .changed(Command::ReassignShortcut(
+                            ToggleMosaic,
+                            chord,
+                            FocusUp.into()
+                        ))
+                        .is_err()
+                );
+            }
+            let moved = settings
+                .changed(Command::ReassignShortcut(ToggleMosaic, chord, owners))
+                .unwrap();
+            assert_eq!(moved.binding(ToggleMosaic), Some(chord));
+            for owner in owners.actions() {
+                assert_eq!(moved.binding(owner), None);
+                assert_eq!(moved.conflict(owner, chord), Some(ToggleMosaic.into()));
+            }
+            let saved = toml::to_string(&moved).unwrap();
+            assert_eq!(
+                toml::from_str::<Settings>(&saved)
+                    .unwrap()
+                    .validated()
+                    .unwrap(),
+                moved
+            );
+        }
+    }
+
+    #[test]
+    fn assigning_a_global_chord_confirms_the_normal_binding_and_modal_alias() {
+        use Shortcut::{FocusLeft, GrowLeft, ToggleMosaic};
+
+        let settings = Settings::default();
+        let chord = FocusLeft.default_chord();
+        let owners = BindingOwners::Both(FocusLeft, GrowLeft);
+        assert_eq!(settings.conflict(ToggleMosaic, chord), Some(owners));
+        assert!(
+            settings
+                .changed(Command::Shortcut(ToggleMosaic, chord))
+                .is_err()
+        );
+        let moved = settings
+            .changed(Command::ReassignShortcut(ToggleMosaic, chord, owners))
+            .unwrap();
+        assert_eq!(moved.binding(FocusLeft), None);
+        assert_eq!(moved.binding(GrowLeft), None);
+        assert!(!moved.resize_alias(GrowLeft, chord));
+        assert_eq!(moved.binding(ToggleMosaic), Some(chord));
     }
 
     #[test]
@@ -547,9 +625,9 @@ mod tests {
         let owner = Shortcut::FocusLeft;
         let action = Shortcut::MoveDown;
         let chord = owner.default_chord();
-        assert_eq!(original.conflict(action, chord), Some(owner));
+        assert_eq!(original.conflict(action, chord), Some(owner.into()));
         let moved = original
-            .changed(Command::ReassignShortcut(action, chord, owner))
+            .changed(Command::ReassignShortcut(action, chord, owner.into()))
             .unwrap();
         let text = toml::to_string_pretty(&moved).unwrap();
         assert!(text.contains("disabled"));
@@ -567,7 +645,11 @@ mod tests {
         // A stale confirmation must not transfer the binding again.
         assert!(
             loaded
-                .changed(Command::ReassignShortcut(Shortcut::MoveUp, chord, owner))
+                .changed(Command::ReassignShortcut(
+                    Shortcut::MoveUp,
+                    chord,
+                    owner.into()
+                ))
                 .is_err()
         );
         assert!(loaded.changed(Command::ResetShortcut(owner)).is_err());
@@ -590,7 +672,7 @@ mod tests {
         };
         assert_eq!(
             original.conflict(Shortcut::ShrinkUp, chord),
-            Some(Shortcut::GrowLeft)
+            Some(Shortcut::GrowLeft.into())
         );
         assert!(
             original
@@ -601,7 +683,7 @@ mod tests {
             .changed(Command::ReassignShortcut(
                 Shortcut::ShrinkUp,
                 chord,
-                Shortcut::GrowLeft,
+                Shortcut::GrowLeft.into(),
             ))
             .unwrap();
         assert_eq!(transferred.binding(Shortcut::GrowLeft), None);
@@ -613,13 +695,13 @@ mod tests {
         let legacy = legacy.validated().unwrap();
         assert_eq!(
             legacy.conflict(Shortcut::ShrinkDown, chord),
-            Some(Shortcut::ShrinkUp)
+            Some(Shortcut::ShrinkUp.into())
         );
         let next = legacy
             .changed(Command::ReassignShortcut(
                 Shortcut::ShrinkDown,
                 chord,
-                Shortcut::ShrinkUp,
+                Shortcut::ShrinkUp.into(),
             ))
             .unwrap();
         assert_eq!(next.binding(Shortcut::ShrinkUp), None);
@@ -629,7 +711,7 @@ mod tests {
         );
         assert_eq!(
             next.conflict(Shortcut::ShrinkRight, chord),
-            Some(Shortcut::ShrinkDown)
+            Some(Shortcut::ShrinkDown.into())
         );
     }
 
@@ -638,7 +720,8 @@ mod tests {
         let saved = Settings::default();
         let live = saved.with_resize_override(Modifier::CtrlAlt).unwrap();
         let chord = live.binding(Shortcut::StartResize).unwrap();
-        let command = Command::ReassignShortcut(Shortcut::FocusUp, chord, Shortcut::StartResize);
+        let command =
+            Command::ReassignShortcut(Shortcut::FocusUp, chord, Shortcut::StartResize.into());
         assert!(saved.changed(command).is_err());
         let persisted = saved.changed_for_save(command, live).unwrap();
         assert_eq!(persisted, live.changed(command).unwrap());

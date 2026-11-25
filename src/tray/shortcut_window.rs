@@ -21,7 +21,7 @@ use super::{
     paint::{self, Colors, Fonts},
     scale,
 };
-use crate::settings::{Chord, Command, Settings, Shortcut};
+use crate::settings::{BindingOwners, Chord, Command, Settings, Shortcut};
 
 const CLASS: *const u16 = w!("Rustile.Shortcuts");
 const TITLE: *const u16 = w!("Горячие клавиши — Rustile");
@@ -144,7 +144,7 @@ impl ShortcutWindow {
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
                     right: self.p(760),
-                    bottom: self.p(540),
+                    bottom: self.p(569),
                     ..Default::default()
                 };
                 AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());

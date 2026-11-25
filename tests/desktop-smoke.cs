@@ -14,6 +14,7 @@ using System.Windows.Forms;
 // synthesizes user input. Window messages target only its isolated processes.
 internal static class DesktopSmoke {
     const uint WmClose = 0x10, RustileShortcut = 0x8002;
+    const int ToggleMosaic = 4;
     const uint TrayCallback = 0x8000 + 20;
     const int TraySelect = 0x400, TrayContext = 0x7b, TrayKeyboard = 0x401;
     const int ShowFixtureDialog = 0x8001, RequestFocus = 0x8002;
@@ -470,7 +471,7 @@ internal static class DesktopSmoke {
         CaptureKey(row, modifier, false, system);
     }
     static string[] ShortcutLabels(IntPtr editor) {
-        return Enumerable.Range(1000, 29).Select(id => ControlText(EditorControl(editor, id))).ToArray();
+        return Enumerable.Range(1000, 30).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
     static void EmptyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
@@ -831,9 +832,9 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1029) == IntPtr.Zero
-            && initial[27].Contains("Win+") && initial[28].Contains("Win+"),
-            "The page should expose 29 editable shortcuts including both window actions");
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1030) == IntPtr.Zero
+            && initial[27].Contains("Win+") && initial[28].Contains("Win+") && initial[29].Contains("Win+"),
+            "The page should expose 30 editable shortcuts including the mosaic toggle");
         var arrows = new[] { "←", "→", "↑", "↓" };
         for (int i = 0; i < arrows.Length; ++i) {
             Require(initial[19 + i].EndsWith("Win+Alt+" + arrows[i])
@@ -852,6 +853,13 @@ internal static class DesktopSmoke {
         var focusLeft = EditorControl(editor, 1000);
         var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
         var beforeCapture = File.ReadAllText(file);
+        var toggle = EditorControl(editor, 1029);
+        BeginRecording(toggle);
+        EnterChord(toggle, Keys.ControlKey, Keys.F8);
+        Until("The mosaic shortcut should be reassignable", () => ControlText(toggle).EndsWith("Ctrl+F8"));
+        ClickControl(editor, 1129);
+        Until("Resetting the mosaic shortcut should restore its default", () =>
+            ControlText(toggle) == initial[29] && File.ReadAllText(file) == beforeCapture);
         ClickControl(editor, 1005);
         Require(ControlText(right) == initial[5], "A single click started recording a shortcut");
         BeginRecording(left);
@@ -914,6 +922,20 @@ internal static class DesktopSmoke {
         TrayOpen(tray, TraySelect, area);
         TrayButton(tray, "Мозаика, Выключена");
         Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Pause moved a tiled window");
+        var floating = tiled[0];
+        floating.Offset(7, 5);
+        SetFixtureFrame(pair[0], floating);
+        Until("A paused tile should accept a manual move", () => VisibleFrame(pair[0]) == floating);
+        // Exercise the shortcut hook's real message downstream of key matching.
+        // A paused manager has no keyboard target, including on this private desktop.
+        manager.Send(RustileShortcut, ToggleMosaic);
+        TrayButton(tray, "Мозаика, Включена");
+        Require(File.ReadAllLines(file).Contains("enabled = true"), "Shortcut resume was not persisted");
+        Until("Shortcut resume should return the moved fixture to its tile", () => pair.Select(VisibleFrame).SequenceEqual(tiled));
+        manager.Send(RustileShortcut, ToggleMosaic);
+        TrayButton(tray, "Мозаика, Выключена");
+        Require(File.ReadAllLines(file).Contains("enabled = false"), "Shortcut pause was not persisted");
+        Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Shortcut pause changed existing window geometry");
         TrayKey(tray, "По краям экрана", Keys.End);
         TrayFocus(tray, "Выйти из Rustile");
         TrayClick(tray, "Выйти из Rustile");
@@ -973,6 +995,7 @@ internal static class DesktopSmoke {
             pair.Select(Bounds).SequenceEqual(originals));
         Console.WriteLine("PASS  Compact shortcut editor: OEM key on last release, conflict cancel/transfer, persisted disabled action and resets");
         Console.WriteLine("PASS  Tray pause, exit while paused, saved shortcut/outline/spacing, paused restart and resume");
+        Console.WriteLine("PASS  The mosaic shortcut resumes without a target and pauses again, in sync with the open tray and saved state");
     }
     // Direction encodings match the WM_APP command sent by the shortcut hook.
     static int NeighborDirection(Rectangle origin, Rectangle other) {

@@ -25,7 +25,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 29] = [$( Self::$name, )+];
+            pub const ALL: [Self; 30] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -64,6 +64,7 @@ shortcuts! {
     QuickReverseDown,  "Вниз (обратно)",     QuickReverse, VK_DOWN;
     CloseWindow,    "Закрыть окно",              Window, VK_Q;
     ToggleMaximize, "Развернуть или восстановить", Window, VK_F;
+    ToggleMosaic,   "Переключить мозаику",        Window, VK_Y;
 }
 
 impl Shortcut {
@@ -84,7 +85,9 @@ impl Shortcut {
     }
 
     fn shares_context(self, other: Self) -> bool {
-        self.is_resize() == other.is_resize()
+        self == Self::ToggleMosaic
+            || other == Self::ToggleMosaic
+            || self.is_resize() == other.is_resize()
     }
 
     fn inherited(self, settings: &Settings) -> Chord {
@@ -100,6 +103,35 @@ impl Shortcut {
             Group::Window => MOD_WIN,
         };
         Chord { mods, key }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingOwners {
+    One(Shortcut),
+    Both(Shortcut, Shortcut),
+}
+
+impl From<Shortcut> for BindingOwners {
+    fn from(action: Shortcut) -> Self {
+        Self::One(action)
+    }
+}
+
+impl BindingOwners {
+    pub(super) fn actions(self) -> impl Iterator<Item = Shortcut> {
+        let (first, second) = match self {
+            Self::One(a) => (a, None),
+            Self::Both(a, b) => (a, Some(b)),
+        };
+        std::iter::once(first).chain(second)
+    }
+
+    pub(crate) fn labels(self) -> String {
+        match self {
+            Self::One(a) => format!("«{}»", a.label()),
+            Self::Both(a, b) => format!("«{}» и «{}»", a.label(), b.label()),
+        }
     }
 }
 
@@ -353,29 +385,38 @@ impl Settings {
         }
     }
 
-    pub fn conflict(&self, action: Shortcut, chord: Chord) -> Option<Shortcut> {
-        let context = Shortcut::ALL
-            .into_iter()
-            .filter(|&other| action.shares_context(other));
-        // Explicit bindings win over the variants that keep the resize opener held.
-        let owner = context
-            .clone()
-            .find(|&other| self.binding(other) == Some(chord))
-            .or_else(|| {
-                context
-                    .into_iter()
-                    .find(|&other| self.resize_alias(other, chord))
-            });
-        owner.filter(|&other| action != other)
+    pub fn conflict(&self, action: Shortcut, chord: Chord) -> Option<BindingOwners> {
+        let owner = |resize| {
+            let context = Shortcut::ALL
+                .into_iter()
+                .filter(|other| *other == Shortcut::ToggleMosaic || other.is_resize() == resize);
+            // Explicit bindings win over the variants that keep the resize opener held.
+            context
+                .clone()
+                .find(|&other| self.binding(other) == Some(chord))
+                .or_else(|| {
+                    context
+                        .into_iter()
+                        .find(|&other| self.resize_alias(other, chord))
+                })
+                .filter(|&other| action != other)
+        };
+        if action != Shortcut::ToggleMosaic {
+            return owner(action.is_resize()).map(BindingOwners::One);
+        }
+        match (owner(false), owner(true)) {
+            (Some(a), Some(b)) => Some(BindingOwners::Both(a, b)),
+            (one, other) => one.or(other).map(BindingOwners::One),
+        }
     }
 
     pub(super) fn assign(&mut self, action: Shortcut, chord: Chord) -> Result<(), String> {
         chord.validate(action)?;
         if let Some(other) = self.conflict(action, chord) {
             return Err(format!(
-                "{} уже назначено на «{}».",
+                "{} уже назначено на {}.",
                 chord.label(),
-                other.label()
+                other.labels()
             ));
         }
         self.set_assigned(action, chord);
@@ -386,10 +427,12 @@ impl Settings {
         &mut self,
         action: Shortcut,
         chord: Chord,
-        owner: Shortcut,
+        owners: BindingOwners,
     ) -> Result<(), String> {
         chord.validate(action)?;
-        self.shortcuts.0[owner.index()] = Some(Binding::Disabled);
+        for owner in owners.actions() {
+            self.shortcuts.0[owner.index()] = Some(Binding::Disabled);
+        }
         self.set_assigned(action, chord);
         Ok(())
     }

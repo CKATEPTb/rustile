@@ -8,7 +8,7 @@ impl ShortcutWindow {
         &self,
         action: Shortcut,
         chord: Chord,
-        previous: Shortcut,
+        previous: BindingOwners,
     ) -> Result<(), String> {
         let owner = self.hwnd.get();
         let transfer = Command::ReassignShortcut(action, chord, previous);
@@ -31,12 +31,20 @@ impl ShortcutWindow {
         }
         self.transfer.set(Some(transfer));
         self.conflict.set(dialog);
-        let message = format!(
-            "{} уже назначено действию «{}». Перенести сочетание на «{}»? Прежнее действие останется без сочетания.",
-            chord.label(),
-            previous.label(),
-            action.label()
-        );
+        let message = match previous {
+            BindingOwners::One(_) => format!(
+                "{} уже назначено действию {}. Перенести сочетание на «{}»? Прежнее действие останется без сочетания.",
+                chord.label(),
+                previous.labels(),
+                action.label()
+            ),
+            BindingOwners::Both(_, _) => format!(
+                "{} уже назначено действиям {}. Перенести сочетание на «{}»? Оба прежних действия останутся без сочетания.",
+                chord.label(),
+                previous.labels(),
+                action.label()
+            ),
+        };
         caption(child(dialog, BODY), &message);
         unsafe {
             let mut owner_rect = RECT::default();
