@@ -55,6 +55,7 @@ impl Modifier {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Toggle,
+    SetStartup(crate::startup::Startup),
     Outline(u8),
     Gap(u8),
     Padding(u8),
@@ -151,7 +152,7 @@ impl Settings {
                 self.resize = defaults.resize;
                 self.shortcuts = defaults.shortcuts;
             }
-            Command::Exit => {}
+            Command::SetStartup(_) | Command::Exit => {}
         }
         self.validated()
     }

@@ -1,5 +1,9 @@
 use super::*;
-use crate::{settings::Settings, tray::menu};
+use crate::{
+    settings::{Command, Settings},
+    startup::Startup,
+    tray::menu,
+};
 
 struct Surface {
     dc: HDC,
@@ -55,10 +59,6 @@ fn mosaic_switch_smooths_both_curves_on_the_current_row_surface() {
         on_accent: rgb(0, 0, 255),
         ..Colors::current()
     };
-    let row = menu::rows(Settings::default())
-        .into_iter()
-        .find(|row| matches!(row.action, Action::Apply(Command::Toggle)))
-        .unwrap();
     for dpi in [96, 120, 144, 192] {
         let p = |dip| scale(dip, dpi);
         let (width, height) = (p(240), p(38));
@@ -76,7 +76,13 @@ fn mosaic_switch_smooths_both_curves_on_the_current_row_surface() {
         let right = width - p(10);
         let left = right - p(34);
         let cy = height / 2;
-        for enabled in [false, true] {
+        let settings = Settings::default();
+        for settings in [settings, settings.changed(Command::Toggle).unwrap()] {
+            let enabled = settings.enabled;
+            let row = menu::rows(settings, Some(Startup::Off))
+                .into_iter()
+                .find(|row| matches!(row.action, Action::Apply(Command::Toggle)))
+                .unwrap();
             let track = if enabled {
                 colors.accent
             } else {
@@ -91,7 +97,6 @@ fn mosaic_switch_smooths_both_curves_on_the_current_row_surface() {
                 fonts: &fonts,
                 header_icon: null_mut(),
                 keyboard: false,
-                enabled,
             };
             for hover in [false, true] {
                 painter.row(&item, &row, false, hover, false);

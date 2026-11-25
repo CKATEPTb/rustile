@@ -26,6 +26,7 @@ use windows_sys::Win32::{
 use windows_sys::core::w;
 
 use crate::settings::{Command, Settings};
+use crate::startup::Startup;
 use menu::{Action, Row};
 use paint::{Colors, Fonts, Painter};
 use shortcut_window::ShortcutWindow;
@@ -58,6 +59,7 @@ fn load_app_icon(width: i32, height: i32) -> HICON {
 
 struct State {
     settings: Cell<Settings>,
+    startup: Cell<Option<Startup>>,
     commands: RefCell<VecDeque<Command>>,
     applying: Cell<Option<Command>>,
     tray_icon: HICON,
@@ -114,6 +116,7 @@ impl Tray {
             }
             let state = Box::new(State {
                 settings: Cell::new(settings),
+                startup: Cell::new(None),
                 commands: RefCell::default(),
                 applying: Cell::new(None),
                 tray_icon: icon,
@@ -180,6 +183,47 @@ impl Tray {
 
     pub fn shortcut_result(&self, error: Option<&str>) {
         self.state.shortcuts.result(error);
+    }
+
+    pub fn set_startup(&self, value: Option<Startup>) {
+        self.state.applying.set(None);
+        let previous = self.state.startup.replace(value);
+        if previous == value || unsafe { IsWindowVisible(self.hwnd) } == 0 {
+            return;
+        }
+        let has_admin_row = |mode| matches!(mode, Some(Startup::Normal | Startup::Elevated));
+        if has_admin_row(previous) == has_admin_row(value) {
+            self.state.refresh_rows(self.hwnd);
+            return;
+        }
+        // The buttons are reused by index. Inserting the admin row moves Exit
+        // to a different HWND, so restore keyboard focus by its visible label.
+        let focus = unsafe { GetFocus() };
+        let focused = self
+            .state
+            .buttons
+            .borrow()
+            .iter()
+            .position(|&btn| btn == focus)
+            .and_then(|index| {
+                self.state
+                    .entries
+                    .borrow()
+                    .get(index)
+                    .map(|r| r.label.clone())
+            });
+        self.state.layout(self.hwnd);
+        if let Some(label) = focused {
+            let entries = self.state.entries.borrow();
+            let index = entries.iter().position(|r| r.label == label).or_else(|| {
+                entries
+                    .iter()
+                    .position(|r| matches!(r.action, Action::Apply(Command::SetStartup(_))))
+            });
+            if let Some(index) = index {
+                self.state.focus(self.hwnd, index);
+            }
+        }
     }
 
     pub fn pre_translate(&self, message: &MSG) -> bool {
@@ -321,6 +365,11 @@ impl State {
     fn show(&self, hwnd: HWND, point: POINT, keyboard: bool) {
         self.anchor.set(point);
         self.keyboard.set(keyboard);
+        self.startup.set(
+            Startup::read()
+                .inspect_err(|e| eprintln!("Rustile: {e}"))
+                .ok(),
+        );
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
         let (mut x, mut y) = (96, 96);
         unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
@@ -439,7 +488,7 @@ impl State {
 
     fn layout(&self, hwnd: HWND) {
         self.hot.set(null_mut());
-        let rows = menu::rows(self.settings.get());
+        let rows = menu::rows(self.settings.get(), self.startup.get());
         let count = rows.len();
         *self.entries.borrow_mut() = rows;
         let point = self.anchor.get();
@@ -593,7 +642,9 @@ impl State {
             }
             Some(Action::Apply(command)) => {
                 self.commands.borrow_mut().push_back(command);
-                self.hide(hwnd, true);
+                if !matches!(command, Command::SetStartup(_)) {
+                    self.hide(hwnd, true);
+                }
                 unsafe {
                     PostMessageW(hwnd, WM_NULL, 0, 0);
                 }
@@ -887,7 +938,6 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             .get()
                             .map_or(state.tray_icon, |(_, icon)| icon),
                         keyboard: state.keyboard.get(),
-                        enabled: state.settings.get().enabled,
                     };
                     let hover = state.hot.get() == draw.hwndItem;
                     let focus = GetFocus() == draw.hwndItem;

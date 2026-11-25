@@ -24,14 +24,14 @@ fn blend(from: [u8; 4], to: [u8; 4], coverage: f32) -> [u8; 4] {
 }
 
 impl Painter<'_> {
-    pub(super) fn draw_toggle(&self, dc: HDC, left: i32, mid: i32, selected: bool) {
+    pub(super) fn draw_toggle(&self, dc: HDC, left: i32, mid: i32, selected: bool, checked: bool) {
         let colors = self.colors;
         let surface = if selected {
             colors.hover
         } else {
             colors.background
         };
-        let mut track = if self.enabled {
+        let mut track = if checked {
             colors.accent
         } else {
             colors.secondary
@@ -52,7 +52,7 @@ impl Painter<'_> {
         let height = scale(18, self.dpi);
         let radius = height as f32 / 2.0;
         let right_center = width as f32 - radius;
-        let thumb_center = if self.enabled { right_center } else { radius };
+        let thumb_center = if checked { right_center } else { radius };
         let thumb_radius = 5.0 * self.dpi as f32 / 96.0;
 
         // Sample both curves at physical pixel centers. Only the one-pixel

@@ -1,4 +1,6 @@
 mod shortcuts;
+#[cfg(test)]
+mod tests;
 
 use std::cell::RefCell;
 use std::io;
@@ -24,6 +26,7 @@ use crate::layout::Direction;
 use crate::manager::Mode;
 use crate::native::desktops::object_name;
 use crate::settings::{Command, Modifier, Settings};
+use crate::startup;
 use crate::tray::Tray;
 
 const START_RESIZE: i32 = 1;
@@ -390,8 +393,19 @@ fn pump(
             }
         }
         while let Some(command) = tray.take_command() {
-            if command == Command::Exit {
-                return Ok(());
+            match command {
+                Command::Exit => return Ok(()),
+                Command::SetStartup(mode) => {
+                    match mode.apply() {
+                        Ok(()) => tray.set_startup(Some(mode)),
+                        Err(detail) => {
+                            tray.set_startup(startup::Startup::read().ok());
+                            show_error(&detail);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
             let result = preferences.apply(manager, hook, tray, command);
             if let Err(detail) = &result {
@@ -452,8 +466,25 @@ const USAGE: &str = "rustile [--resize-shortcut win+enter|ctrl+alt+enter]\nПо 
 
 pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let resize_override = match args.as_slice() {
+    run_with_args(&args)
+}
+
+fn run_with_args(args: &[String]) -> Result<(), String> {
+    let resize_override = match args {
         [] => None,
+        [flag] if flag == startup::ELEVATED_FLAG => {
+            // Windows may restore an instance before its logon entry runs.
+            // Check before asking for consent, then let the child own the mutex.
+            drop(Instance::acquire()?);
+            match startup::launch_elevated() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(detail) => show_error(&format!(
+                    "Rustile продолжит запуск с обычными правами.\n\n{detail}"
+                )),
+            }
+            None
+        }
         [flag] if flag == "--help" || flag == "-h" => {
             println!("{USAGE}");
             return Ok(());

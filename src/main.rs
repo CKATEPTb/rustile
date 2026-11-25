@@ -13,6 +13,8 @@ mod runtime;
 #[cfg(windows)]
 mod settings;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod tray;
 
 #[cfg(windows)]

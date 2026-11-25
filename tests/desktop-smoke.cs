@@ -603,11 +603,13 @@ internal static class DesktopSmoke {
         KeyDown(edit, finish);
         Until("Editing should finish inside the menu", () => !IsWindowVisible(edit) && IsWindowVisible(tray));
     }
-    static void TrayFocus(Child manager, IntPtr tray, string label) {
+    static void TrayFocus(IntPtr tray, string label) {
         var button = TrayButton(tray, label);
+        int pid;
+        int thread = (int)GetWindowThreadProcessId(tray, out pid);
         var info = new GuiThreadInfo { size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
         Until("Keyboard focus should move to " + label, () => {
-            if (!GetGUIThreadInfo(manager.ThreadId, ref info)) throw new Win32Exception();
+            if (!GetGUIThreadInfo(thread, ref info)) throw new Win32Exception();
             return info.focus == button;
         });
     }
@@ -670,13 +672,71 @@ internal static class DesktopSmoke {
             Math.Max(a.Top - b.Bottom, b.Top - a.Bottom));
         return Rectangle.Union(a, b) == Rectangle.Inflate(work, -padding, -padding) && distance == gap;
     }
+    static void StartupSettings(string testBinary, string desktop, Rectangle area) {
+        // Only this Rust test process redirects HKCU. Never send a startup
+        // command to the production instance used by the other smoke tests.
+        const string startup = "Запускать при входе в Windows", admin = "От имени администратора";
+        using (var manager = new Child(testBinary, "--exact runtime::tests::isolated_startup_tray --ignored", desktop)) {
+            var tray = TrayWindow(manager);
+            try {
+                TrayOpen(tray, TrayKeyboard, area);
+                var compact = Bounds(tray);
+                TrayButton(tray, startup + ", Выключено");
+                TrayKey(tray, startup, Keys.Down);
+                TrayFocus(tray, "Выйти из Rustile");
+                TrayKey(tray, "Выйти из Rustile", Keys.Up);
+                TrayFocus(tray, startup);
+                TrayKey(tray, startup, Keys.Space);
+                TrayButton(tray, startup + ", Включено");
+                TrayButton(tray, admin + ", Выключено");
+                TrayFocus(tray, startup);
+                var expanded = Bounds(tray);
+                Require(expanded.Height > compact.Height && expanded.Bottom == compact.Bottom
+                    && area.Contains(expanded), "Showing the administrator switch broke the tray anchor");
+                TrayKey(tray, startup, Keys.Down);
+                TrayFocus(tray, admin);
+                TrayKey(tray, admin, Keys.Enter);
+                TrayButton(tray, admin + ", Включено");
+                TrayFocus(tray, admin);
+                TrayKey(tray, admin, Keys.Escape);
+                Until("Escape should close startup settings", () => !IsWindowVisible(tray));
+                TrayOpen(tray, TrayContext, area);
+                TrayButton(tray, admin + ", Включено");
+                TrayClick(tray, admin);
+                TrayButton(tray, admin + ", Выключено");
+                TrayClick(tray, admin);
+                TrayButton(tray, admin + ", Включено");
+                TrayClick(tray, startup);
+                TrayButton(tray, startup + ", Выключено");
+                Require(Bounds(tray) == compact, "Disabling startup left the administrator row in the menu");
+                TrayClick(tray, startup);
+                TrayButton(tray, admin + ", Выключено");
+                TrayClick(tray, startup);
+                TrayButton(tray, startup + ", Выключено");
+                TrayKey(tray, startup, Keys.Down);
+                TrayFocus(tray, "Выйти из Rustile");
+                TrayClick(tray, "Выйти из Rustile");
+                Require(manager.Exited(5000) && manager.ExitCode == 0, "Isolated startup fixture did not exit cleanly");
+            } finally {
+                if (!manager.Exited(0)) {
+                    int pid;
+                    int thread = (int)GetWindowThreadProcessId(tray, out pid);
+                    if (thread != 0 && pid == manager.Pid) {
+                        PostThreadMessage(thread, 0x12 /* WM_QUIT */, IntPtr.Zero, IntPtr.Zero);
+                        manager.Exited(5000);
+                    }
+                }
+            }
+        }
+        Console.WriteLine("PASS  Startup switches update isolated HKCU through keyboard and mouse, keep the flyout anchored and restore the saved mode on reopen");
+    }
     static void TraySettings(Child manager, string rustile, string desktop, List<Child> children,
         IntPtr[] pair, Rectangle[] originals, Rectangle area) {
         var tray = TrayWindow(manager);
         TrayOpen(tray, TrayKeyboard, area);
-        TrayFocus(manager, tray, "Мозаика");
+        TrayFocus(tray, "Мозаика");
         TrayKey(tray, "Мозаика", Keys.Down);
-        TrayFocus(manager, tray, "Горячие клавиши");
+        TrayFocus(tray, "Горячие клавиши");
         TrayKey(tray, "Горячие клавиши", Keys.Escape);
         Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
         // Exercise a busy message queue as well: sent shell notifications take
@@ -711,7 +771,7 @@ internal static class DesktopSmoke {
         // Wheel input may be delivered to the focused row even when the
         // pointer is over a different setting. Use actual screen coordinates.
         TrayKey(tray, "Между окнами", Keys.Up);
-        TrayFocus(manager, tray, "Толщина обводки");
+        TrayFocus(tray, "Толщина обводки");
         var elsewhere = TrayButton(tray, "Толщина обводки");
         Wheel(elsewhere, gapRow, 60);
         Wheel(elsewhere, gapRow, 60);
@@ -822,8 +882,8 @@ internal static class DesktopSmoke {
         TrayOpen(tray, TraySelect, area);
         TrayButton(tray, "Мозаика, Выключена");
         Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Pause moved a tiled window");
-        TrayKey(tray, "По краям экрана", Keys.Down);
-        TrayFocus(manager, tray, "Выйти из Rustile");
+        TrayKey(tray, "По краям экрана", Keys.End);
+        TrayFocus(tray, "Выйти из Rustile");
         TrayClick(tray, "Выйти из Rustile");
         Require(manager.Exited(5000) && manager.ExitCode == 0, "Tray exit while paused failed");
         Until("Exit while paused should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
@@ -836,7 +896,10 @@ internal static class DesktopSmoke {
         TrayButton(tray, "Толщина обводки, 3 px");
         Require(pair.Select(Bounds).SequenceEqual(originals), "Disabled startup tiled the windows");
         editor = OpenShortcutEditor(restarted, tray, area);
-        Require(ShortcutLabels(editor).SequenceEqual(expected), "The row reset and its neighbor should survive restart");
+        var restored = ShortcutLabels(editor);
+        Require(restored.SequenceEqual(expected), "Shortcut labels changed after restart: " +
+            string.Join(", ", restored.Select((label, i) => label == expected[i] ? null :
+                String.Format("row {0}: '{1}' -> '{2}'", i, expected[i], label)).Where(diff => diff != null)));
         oneOverride = File.ReadAllText(file);
         ClickControl(editor, 1100); // Focus left's factory chord now belongs to Move left.
         ChooseConflict(restarted, editor, ConflictChoice.Escape);
@@ -1255,6 +1318,7 @@ internal static class DesktopSmoke {
             Array.Resize(ref fixtures, 6);
             launch(2); launch(3); launch(4); launch(5);
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_DESKTOP", desktopName);
+            StartupSettings(managerTests, desktopName, area);
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_MIN_HEIGHT", TallMinimum(area).ToString());
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Select(w => w.ToInt64())));
             // The hidden process has no console. Surface a failing Rust geometry

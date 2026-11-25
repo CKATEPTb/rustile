@@ -19,7 +19,6 @@ use super::{
     menu::{Action, Row},
     scale,
 };
-use crate::settings::Command;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Colors {
@@ -215,7 +214,6 @@ pub(super) struct Painter<'a> {
     pub fonts: &'a Fonts,
     pub header_icon: HICON,
     pub keyboard: bool,
-    pub enabled: bool,
 }
 
 // Use the same rectangles for native children, the editor and owner drawing.
@@ -332,7 +330,7 @@ impl Painter<'_> {
             && (hover || item.itemState & ODS_SELECTED != 0 || (focus && self.keyboard));
         let fg = if selected {
             hover_text
-        } else if row.enabled || matches!(row.action, Action::None) {
+        } else if row.enabled || header {
             primary
         } else {
             disabled
@@ -382,9 +380,9 @@ impl Painter<'_> {
             }
         }
 
-        if matches!(row.action, Action::Apply(Command::Toggle)) {
+        if let Some(checked) = row.checked {
             let left = rc.right - p(10) - p(34);
-            self.draw_toggle(dc, left, mid, selected);
+            self.draw_toggle(dc, left, mid, selected, checked);
             label.right = left - p(8);
         } else if matches!(row.action, Action::Adjust(_)) {
             let [left, value, right] = stepper_rects(item.rcItem, self.dpi, row.separator);
