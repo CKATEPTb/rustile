@@ -26,15 +26,22 @@ fn frame(layout: &Layout, id: Id) -> Rect {
         .1
 }
 
-fn check_step(layout: &mut Layout, id: Id, arrow: Direction, shift: bool, edge: Direction) {
+fn check_step(
+    layout: &mut Layout,
+    id: Id,
+    arrow: Direction,
+    shift: bool,
+    edge: Direction,
+    stops: &mut Option<ResizeStops>,
+) {
     let before = frame(layout, id);
-    assert_eq!(layout.resize(id, arrow, shift, AREA), Some(edge));
+    assert_eq!(layout.resize(id, arrow, shift, AREA, stops), Some(edge));
     let after = frame(layout, id);
     for side in [Left, Right, Up, Down] {
         let delta = side.coordinate(after) - side.coordinate(before);
         let expected = if side != edge {
             0
-        } else if arrow.towards_start() {
+        } else if arrow.towards_start() != shift {
             -1
         } else {
             1
@@ -48,16 +55,27 @@ fn check_step(layout: &mut Layout, id: Id, arrow: Direction, shift: bool, edge: 
 }
 
 #[test]
-fn interior_arrows_expand_the_named_edge_and_shift_moves_the_opposite_edge() {
+fn shift_reverses_the_same_visible_edge_in_every_direction() {
     let layout = grid(9);
-    for (arrow, opposite) in [(Left, Right), (Right, Left), (Up, Down), (Down, Up)] {
-        check_step(&mut layout.clone(), 5, arrow, false, arrow);
-        check_step(&mut layout.clone(), 5, arrow, true, opposite);
+    for arrow in [Left, Right, Up, Down] {
+        let mut layout = layout.clone();
+        let target = i32::try_from(arrow.coordinate(frame(&layout, 5))).unwrap() + 13;
+        assert!(layout.resize_edge_to(5, arrow, target, AREA));
+        assert_eq!(arrow.coordinate(frame(&layout, 5)), i64::from(target));
+        let mut stops = None;
+        let initial = layout.placements(AREA);
+        check_step(&mut layout, 5, arrow, false, arrow, &mut stops);
+        let first_step = layout.placements(AREA);
+        check_step(&mut layout, 5, arrow, false, arrow, &mut stops);
+        check_step(&mut layout, 5, arrow, true, arrow, &mut stops);
+        assert_eq!(layout.placements(AREA), first_step);
+        check_step(&mut layout, 5, arrow, true, arrow, &mut stops);
+        assert_eq!(layout.placements(AREA), initial);
     }
 }
 
 #[test]
-fn outward_arrows_at_the_work_area_shrink_only_the_opposite_edge() {
+fn outward_arrows_compress_against_the_work_area_and_shift_expands_back() {
     let layout = grid(9);
     for (id, outer, inner) in [
         (4, Left, Right),
@@ -66,28 +84,52 @@ fn outward_arrows_at_the_work_area_shrink_only_the_opposite_edge() {
         (8, Down, Up),
     ] {
         let mut layout = layout.clone();
+        let mut stops = None;
+        let initial = layout.placements(AREA);
         assert_eq!(outer.coordinate(frame(&layout, id)), outer.coordinate(AREA));
-        check_step(&mut layout, id, outer, false, inner);
-        let before = layout.placements(AREA);
-        assert_eq!(layout.resize(id, inner, true, AREA), None);
-        assert_eq!(layout.placements(AREA), before);
+        check_step(&mut layout, id, outer, false, inner, &mut stops);
+        check_step(&mut layout, id, outer, true, inner, &mut stops);
+        assert_eq!(layout.placements(AREA), initial);
+        check_step(&mut layout, id, inner, false, inner, &mut stops);
+        check_step(&mut layout, id, inner, true, inner, &mut stops);
+        assert_eq!(layout.placements(AREA), initial);
     }
 }
 
 #[test]
-fn a_neighbor_at_its_minimum_does_not_redirect_a_resize_to_the_other_edge() {
+fn both_commands_leave_a_full_span_alone() {
+    let mut layout = grid(1);
+    let before = layout.placements(AREA);
+    let mut stops = None;
+    for arrow in [Left, Right, Up, Down] {
+        for shift in [false, true] {
+            assert_eq!(layout.resize(1, arrow, shift, AREA, &mut stops), None);
+            assert_eq!(layout.placements(AREA), before);
+        }
+    }
+}
+
+#[test]
+fn reversing_a_clamped_step_restores_the_manually_sized_divider() {
     let mut layout = Layout::with_gap(GAP_PX);
     for id in 1..=9 {
         let width = if id == 4 { 371 } else { MIN_WIDTH };
         assert!(layout.insert_with_minimum(id, AREA, (width, MIN_HEIGHT)));
     }
-    assert!(layout.resize_edge_to(5, Left, i32::MIN, AREA));
+    let target = frame(&layout, 4).x + 371 + GAP_PX + 7;
+    assert!(layout.resize_edge_to(5, Left, target, AREA));
+    assert_eq!(frame(&layout, 5).x, target);
+    let manual = layout.placements(AREA);
+    let mut stops = None;
+    check_step(&mut layout, 5, Left, false, Left, &mut stops);
     let left = frame(&layout, 4);
     assert_eq!(left.w, 371);
     assert_eq!(left.x + left.w + GAP_PX, frame(&layout, 5).x);
     let before = layout.placements(AREA);
-    assert_eq!(layout.resize(5, Left, false, AREA), None);
+    assert_eq!(layout.resize(5, Left, false, AREA, &mut stops), None);
     assert_eq!(layout.placements(AREA), before);
+    check_step(&mut layout, 5, Left, true, Left, &mut stops);
+    assert_eq!(layout.placements(AREA), manual);
 }
 
 #[test]
@@ -97,7 +139,10 @@ fn a_nested_tile_uses_its_visible_edge_and_keeps_the_far_divider_still() {
         assert!(layout.insert_near(id, anchor, AREA, (MIN_WIDTH, MIN_HEIGHT)));
     }
     let far = frame(&layout, 4);
-    check_step(&mut layout, 2, Left, false, Left);
+    let mut stops = None;
+    check_step(&mut layout, 2, Left, false, Left, &mut stops);
+    assert_eq!(frame(&layout, 4), far);
+    check_step(&mut layout, 2, Left, true, Left, &mut stops);
     assert_eq!(frame(&layout, 4), far);
     assert_eq!(
         Right.coordinate(frame(&layout, 1)) + i64::from(GAP_PX),
@@ -106,12 +151,14 @@ fn a_nested_tile_uses_its_visible_edge_and_keeps_the_far_divider_still() {
 }
 
 #[test]
-fn a_rotated_pair_can_shrink_at_the_displayed_divider_and_complete_its_move() {
+fn a_rotated_pair_can_resize_both_ways_at_the_displayed_divider_and_complete_its_move() {
     let mut layout = grid(2);
     let destination = frame(&layout, 2);
     assert!(layout.move_window(1, Right, AREA));
     assert_eq!(frame(&layout, 1).y + frame(&layout, 1).h, AREA.y + AREA.h);
-    check_step(&mut layout, 1, Down, true, Up);
+    let mut stops = None;
+    check_step(&mut layout, 1, Down, false, Up, &mut stops);
+    check_step(&mut layout, 1, Down, true, Up, &mut stops);
     assert_eq!(
         Down.coordinate(frame(&layout, 2)) + i64::from(GAP_PX),
         Up.coordinate(frame(&layout, 1))

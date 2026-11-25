@@ -58,7 +58,11 @@ fn clamping_a_row_to_its_minimum_preserves_unconstrained_column_weights() {
 fn reserving_a_panel_preserves_custom_dividers_and_a_pending_move() {
     let old = area(1901, 1053);
     let mut layout = inventory(6, old);
-    assert!(layout.resize(1, Direction::Right, false, old).is_some());
+    assert!(
+        layout
+            .resize(1, Direction::Right, false, old, &mut None)
+            .is_some()
+    );
     assert!(layout.move_window(1, Direction::Right, old));
     let before = layout.placements(old);
     let reserved = Rect {

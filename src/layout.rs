@@ -523,6 +523,13 @@ impl Window {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ResizeStops {
+    edge: Direction,
+    origin: i64,
+    step: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
     grid: Grid,
@@ -1333,13 +1340,14 @@ impl Layout {
         &mut self,
         id: Id,
         direction: Direction,
-        shrink: bool,
+        reverse: bool,
         area: Rect,
+        stops: &mut Option<ResizeStops>,
     ) -> Option<Direction> {
         let slot = self.slot(id)?;
         let tiles = self.visible_rects(area);
         let active = tiles[slot];
-        let edge = if shrink || direction.coordinate(active) == direction.coordinate(area) {
+        let edge = if direction.coordinate(active) == direction.coordinate(area) {
             direction.opposite()
         } else {
             direction
@@ -1349,20 +1357,36 @@ impl Layout {
             return None;
         }
 
-        // Put keyboard stops at 5% intervals around the midpoint of these two
-        // tiles. Reversing from a clamped minimum returns to the previous stop.
-        let axis = edge.axis();
-        let total = i64::from(axis.length(active)) + i64::from(axis.length(peer));
-        let first = if edge.towards_start() { peer } else { active };
-        let step = (total / 20).max(1);
-        let offset = i64::from(axis.length(first)) - (total + 1) / 2;
-        let delta = if direction.towards_start() {
-            -(step - (-offset).rem_euclid(step))
+        let current = edge.coordinate(active);
+        // Anchor steps to where this divider was picked up, including after a
+        // mouse resize. A partial step at an app minimum can then be reversed.
+        let run = stops.filter(|run| run.edge == edge).unwrap_or_else(|| {
+            let axis = edge.axis();
+            let span = i64::from(axis.length(active)) + i64::from(axis.length(peer));
+            ResizeStops {
+                edge,
+                origin: current,
+                step: (span / 20).max(1),
+            }
+        });
+        let offset = current - run.origin;
+        let motion = if reverse {
+            direction.opposite()
         } else {
-            step - offset.rem_euclid(step)
+            direction
         };
-        let target = i32::try_from(edge.coordinate(active) + delta).ok()?;
-        self.resize_edge_to(id, edge, target, area).then_some(edge)
+        let delta = if motion.towards_start() {
+            -(run.step - (-offset).rem_euclid(run.step))
+        } else {
+            run.step - offset.rem_euclid(run.step)
+        };
+        let target = i32::try_from(current + delta).ok()?;
+        if self.resize_edge_to(id, edge, target, area) {
+            *stops = Some(run);
+            Some(edge)
+        } else {
+            None
+        }
     }
 }
 
@@ -1411,7 +1435,11 @@ mod tests {
             let moved = layout.placements(area);
             assert!(moved.contains(&(2, start[0].1)));
             assert!(moved.contains(&(1, start[1].1)));
-            assert!(layout.resize(2, Direction::Right, false, area).is_some());
+            assert!(
+                layout
+                    .resize(2, Direction::Right, false, area, &mut None)
+                    .is_some()
+            );
             let resized = layout.placements(area);
             assert_eq!(resized[0].1.joined(resized[1].1, Axis::X, gap), Some(area));
         }
@@ -1537,9 +1565,13 @@ mod tests {
         }
         let original = layout.cell_rects(area);
         let mut before_minimum = original.clone();
+        let mut stops = None;
         loop {
             let before = layout.cell_rects(area);
-            if layout.resize(1, Direction::Right, false, area).is_none() {
+            if layout
+                .resize(1, Direction::Right, false, area, &mut stops)
+                .is_none()
+            {
                 break;
             }
             before_minimum = before;
@@ -1548,7 +1580,7 @@ mod tests {
         assert_eq!(final_cells[1].w, MIN_WIDTH);
         assert_eq!(&final_cells[2..], &original[2..]);
         assert_eq!(
-            layout.resize(1, Direction::Left, false, area),
+            layout.resize(1, Direction::Left, false, area, &mut stops),
             Some(Direction::Right)
         );
         assert_eq!(layout.cell_rects(area), before_minimum);

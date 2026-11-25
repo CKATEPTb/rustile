@@ -41,14 +41,14 @@ shortcuts! {
     MoveUp,      "Переместить вверх",  Move, VK_UP;
     MoveDown,    "Переместить вниз",   Move, VK_DOWN;
     StartResize, "Войти в режим",      StartResize, VK_RETURN;
-    GrowLeft,    "Расширить влево",    Grow, VK_LEFT;
-    GrowRight,   "Расширить вправо",   Grow, VK_RIGHT;
-    GrowUp,      "Расширить вверх",    Grow, VK_UP;
-    GrowDown,    "Расширить вниз",     Grow, VK_DOWN;
-    ShrinkLeft,  "Правый край влево",  Shrink, VK_LEFT;
-    ShrinkRight, "Левый край вправо",  Shrink, VK_RIGHT;
-    ShrinkUp,    "Нижний край вверх",  Shrink, VK_UP;
-    ShrinkDown,  "Верхний край вниз",  Shrink, VK_DOWN;
+    GrowLeft,    "Влево",              Grow, VK_LEFT;
+    GrowRight,   "Вправо",             Grow, VK_RIGHT;
+    GrowUp,      "Вверх",              Grow, VK_UP;
+    GrowDown,    "Вниз",               Grow, VK_DOWN;
+    ShrinkLeft,  "Влево (обратно)",    Shrink, VK_LEFT;
+    ShrinkRight, "Вправо (обратно)",   Shrink, VK_RIGHT;
+    ShrinkUp,    "Вверх (обратно)",    Shrink, VK_UP;
+    ShrinkDown,  "Вниз (обратно)",     Shrink, VK_DOWN;
     Confirm,     "Применить размер",   Finish, VK_RETURN;
     Cancel,      "Отменить изменение", Finish, VK_ESCAPE;
 }

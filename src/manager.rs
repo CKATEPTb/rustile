@@ -7,7 +7,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::hud::{FocusOutline, ResizeHud};
-use crate::layout::{Direction, Id, Layout, Rect};
+use crate::layout::{Direction, Id, Layout, Rect, ResizeStops};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
 use crate::native::{self, Cloak, Original, TileState};
 use crate::settings::Settings;
@@ -27,6 +27,7 @@ pub enum Mode {
 struct ResizeSession {
     target: Id,
     before: Layout,
+    stops: Option<ResizeStops>,
 }
 
 struct TrackedWindow {
@@ -818,6 +819,7 @@ impl Manager {
         self.session = Some(ResizeSession {
             target,
             before: self.workspace.layout.clone(),
+            stops: None,
         });
         self.hud.show(target, rect, None, &self.settings);
         true
@@ -855,16 +857,21 @@ impl Manager {
         }
     }
 
-    pub fn resize(&mut self, active: Id, dir: Direction, shrink: bool) {
-        let (Some(session), Some(area)) = (&self.session, self.area) else {
+    pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {
+        let eligible = self.can_act_on(active);
+        let (Some(session), Some(area)) = (&mut self.session, self.area) else {
             return;
         };
         let target = session.target;
-        if active != target || !self.can_act_on(target) {
+        if active != target || !eligible {
             self.finish_mode(false);
             return;
         }
-        if let Some(edge) = self.workspace.layout.resize(target, dir, shrink, area) {
+        if let Some(edge) =
+            self.workspace
+                .layout
+                .resize(target, dir, reverse, area, &mut session.stops)
+        {
             self.apply();
             if let Some((_, rect)) = self
                 .workspace

@@ -129,7 +129,10 @@ fn resizing_and_two_step_moves_use_the_new_dividers() {
     assert!(l.insert_near(2, 1, AREA, NATIVE));
     assert!(l.insert_near(3, 1, AREA, NATIVE));
     let before = frames(&l);
-    assert!(l.resize(1, Direction::Down, false, AREA).is_some());
+    assert!(
+        l.resize(1, Direction::Down, false, AREA, &mut None)
+            .is_some()
+    );
     let resized = frames(&l);
     assert!(resized[&1].h > before[&1].h);
     assert_eq!(resized[&2], before[&2]);

@@ -237,18 +237,48 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
 
     let initial: Vec<_> = windows.iter().map(|&id| (id, frame(id))).collect();
     let (left, center, right) = (frame(active), frame(middle), frame(end));
+    // Start on a pixel chosen by a mouse drag, between the keyboard stops.
+    assert!(
+        manager
+            .workspace
+            .layout
+            .resize_edge_to(middle, Direction::Left, center.x + 13, area)
+    );
+    manager.apply();
+    settle(manager, 5);
+    let frames = || windows.iter().map(|&id| frame(id)).collect::<Vec<_>>();
+    let custom = frames();
+    let offset_center = frame(middle);
+    let offset_left = frame(active);
     assert!(manager.begin_resize(middle));
     manager.resize(middle, Direction::Left, false);
     settle(manager, 5);
     let grown = frame(middle);
-    assert!(grown.x < center.x);
-    assert_eq!(grown.x + grown.w, center.x + center.w);
+    assert!(grown.x < offset_center.x);
+    assert_eq!(grown.x + grown.w, offset_center.x + offset_center.w);
     manager.resize(middle, Direction::Left, true);
     settle(manager, 5);
-    let shrunk = frame(middle);
-    assert_eq!(shrunk.x, grown.x);
-    assert!(shrunk.w < grown.w);
-    manager.finish_mode(false);
+    assert_eq!(frames(), custom);
+    manager.finish_mode(true);
+
+    assert_eq!(left.x, area.x);
+    assert!(manager.begin_resize(active));
+    manager.resize(active, Direction::Left, false);
+    settle(manager, 5);
+    let compressed = frame(active);
+    assert_eq!(compressed.x, left.x);
+    assert!(compressed.w < offset_left.w);
+    manager.resize(active, Direction::Left, true);
+    settle(manager, 5);
+    assert_eq!(frames(), custom);
+    manager.finish_mode(true);
+    assert!(
+        manager
+            .workspace
+            .layout
+            .resize_edge_to(middle, Direction::Left, center.x, area)
+    );
+    manager.apply();
     settle(manager, 5);
     assert!(initial.iter().all(|&(id, rect)| frame(id) == rect));
 
@@ -664,12 +694,12 @@ fn move_left_in_three_columns(
     settle(manager, 3);
     // Match the reported layout: the browser and Explorer are both wider
     // than the chat between them, and the browser/chat union is landscape.
-    for (id, direction, shrink) in [
-        (chat, Direction::Left, true),
+    for (id, direction, reverse) in [
+        (chat, Direction::Right, true),
         (browser, Direction::Right, false),
     ] {
         assert!(manager.begin_resize(id));
-        manager.resize(id, direction, shrink);
+        manager.resize(id, direction, reverse);
         manager.finish_mode(true);
         settle(manager, 3);
     }

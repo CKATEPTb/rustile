@@ -370,7 +370,7 @@ fn committed_resize_survives_ordinary_moves() {
     let host = bands[0][1];
     assert!(
         layout
-            .resize(moving, Direction::Right, false, AREA)
+            .resize(moving, Direction::Right, false, AREA, &mut None)
             .is_some()
     );
     let custom = frames(&layout, AREA);
@@ -428,7 +428,10 @@ fn physical_minima_limit_admission_and_manual_resizing_without_losing_windows() 
     let row = &rows(&original)[0];
     assert!(!layout.insert(row[1], area));
     assert!(!layout.insert(3, area));
-    assert_eq!(layout.resize(row[0], Direction::Right, false, area), None);
+    assert_eq!(
+        layout.resize(row[0], Direction::Right, false, area, &mut None),
+        None
+    );
     assert!(!layout.move_window(row[0], Direction::Left, area));
     assert!(!layout.move_window(999, Direction::Right, area));
     layout.remove(999);
@@ -486,12 +489,17 @@ fn application_minimum_heights_are_respected_on_the_realistic_four_window_layout
     );
     assert_eq!(exchanged[&bands[0][1]].h, exchanged[&host].h);
     assert_eq!(exchanged[&bands[1][1]].h, exchanged[&moving].h);
+    let mut stops = None;
     for dir in [Direction::Up, Direction::Down] {
         for _ in 0..30 {
-            layout.resize(moving, dir, false, area);
+            layout.resize(moving, dir, false, area, &mut stops);
             check(&layout);
         }
-        assert!(layout.resize(moving, dir, false, area).is_none());
+        assert!(
+            layout
+                .resize(moving, dir, false, area, &mut stops)
+                .is_none()
+        );
     }
 }
 
@@ -964,8 +972,9 @@ fn resizing_a_portrait_move_uses_the_horizontal_seam_for_either_occupant() {
     let before = check_desktop(&preview);
     for (active, seam) in [(TELEGRAM, Direction::Down), (TALL, Direction::Up)] {
         let mut layout = preview.clone();
+        let mut stops = None;
         assert_eq!(
-            layout.resize(active, Direction::Up, false, DESKTOP),
+            layout.resize(active, Direction::Up, false, DESKTOP, &mut stops),
             Some(seam)
         );
         let raised = check_desktop(&layout);
@@ -974,18 +983,11 @@ fn resizing_a_portrait_move_uses_the_horizontal_seam_for_either_occupant() {
         assert!(raised[&TALL].h > before[&TALL].h);
         assert_eq!(raised[&TALL].w, before[&TALL].w);
         assert_above(raised[&TELEGRAM], raised[&TALL]);
-        if active == TELEGRAM {
-            layout = preview.clone();
-        }
-        let previous = check_desktop(&layout);
         assert_eq!(
-            layout.resize(active, seam.opposite(), true, DESKTOP),
+            layout.resize(active, Direction::Up, true, DESKTOP, &mut stops),
             Some(seam)
         );
-        let shrunk = check_desktop(&layout);
-        assert!(shrunk[&active].h < previous[&active].h);
-        stationary(&previous, &shrunk, TALL, TELEGRAM);
-        assert_above(shrunk[&TELEGRAM], shrunk[&TALL]);
+        assert_eq!(check_desktop(&layout), before);
     }
 }
 
@@ -1519,9 +1521,12 @@ fn changing_commands_midway_through_a_constrained_move_keeps_every_window_valid(
                 assert_eq!(frames(&moved, DESKTOP), preview);
             }
             check(&moved);
-            for shrink in [false, true] {
+            for reverse in [false, true] {
                 let mut resized = pending.clone();
-                if resized.resize(id, dir, shrink, DESKTOP).is_none() {
+                if resized
+                    .resize(id, dir, reverse, DESKTOP, &mut None)
+                    .is_none()
+                {
                     assert_eq!(frames(&resized, DESKTOP), preview);
                 }
                 check(&resized);

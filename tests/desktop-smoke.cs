@@ -1213,8 +1213,11 @@ internal static class DesktopSmoke {
         Func<Rectangle, int> extent = r => horizontal ? r.Width : r.Height;
         int expanded = extent(Bounds(active));
         Require(expanded > extent(before[index]), "Plain arrow toward a neighbor should grow the active tile");
-        manager.Send(RustileShortcut, 30 + ((moved - 20) ^ 1), active);
-        Until("Shift with the opposite arrow should shrink the grown edge", () => extent(Bounds(active)) < expanded);
+        manager.Send(RustileShortcut, 30 + (moved - 20), active);
+        Until("Shift with the same arrow should restore every native frame exactly",
+            () => handles.Select(Bounds).SequenceEqual(before));
+        manager.Send(RustileShortcut, moved, active);
+        Until("Repeating the plain arrow should grow the same edge again", () => extent(Bounds(active)) == expanded);
         manager.Send(RustileShortcut, 41, active);
         Until("Escape should restore the initial split", () => handles.Select(Bounds).SequenceEqual(before));
         manager.Send(RustileShortcut, 1, active);
