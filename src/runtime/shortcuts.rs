@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::io;
 use std::ptr::{null, null_mut};
-use std::sync::{Mutex, mpsc};
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -12,13 +12,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::{CANCEL, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, SHRINK, START_RESIZE};
 use crate::manager::Mode;
+use crate::settings::Settings;
 
 // Only potential shortcuts have a slot. Modifiers themselves always pass
 // through, so tapping Win still opens Start.
 const KEYS: [u16; 6] = [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_RETURN, VK_ESCAPE];
 const ENTER: usize = 4;
 const ESC: usize = 5;
-const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
 #[derive(Debug, PartialEq)]
 enum Action {
@@ -46,7 +46,7 @@ impl Held {
         down: bool,
         mods: u32,
         mode: Option<Mode>,
-        opener: u32,
+        settings: Settings,
     ) -> Action {
         let press = &mut self.0[slot];
         let consumed = matches!(press, Press::Consumed | Press::ResizeArrow);
@@ -61,14 +61,24 @@ impl Held {
         if *press == Press::Passed {
             return Action::Pass;
         }
+        let opener = settings.resize.bits();
+        let resize_base = mods & !MOD_SHIFT;
+        let resize_arrow =
+            resize_base == 0 || resize_base == MOD_WIN || resize_base == (opener & !MOD_SHIFT);
         let id = match (mode, slot, mods) {
             (Some(Mode::Normal), ENTER, m) if m == opener => Some(START_RESIZE),
-            (Some(Mode::Normal), 0..=3, MOD_WIN) => Some(FOCUS + slot as i32),
-            (Some(Mode::Normal), 0..=3, WIN_SHIFT) => Some(MOVE + slot as i32),
-            (Some(Mode::Resize), 0..=3, 0 | MOD_WIN) => Some(EXPAND + slot as i32),
-            (Some(Mode::Resize), 0..=3, MOD_SHIFT | WIN_SHIFT) => Some(SHRINK + slot as i32),
+            (Some(Mode::Normal), 0..=3, m) if m == settings.focus.bits() => {
+                Some(FOCUS + slot as i32)
+            }
+            (Some(Mode::Normal), 0..=3, m) if m == settings.movement.bits() => {
+                Some(MOVE + slot as i32)
+            }
+            (Some(Mode::Resize), 0..=3, m) if resize_arrow => {
+                let base = if m & MOD_SHIFT == 0 { EXPAND } else { SHRINK };
+                Some(base + slot as i32)
+            }
             (Some(Mode::Resize), ENTER, m) if m == 0 || m == opener => Some(CONFIRM),
-            (Some(Mode::Resize), ESC, 0 | MOD_WIN) => Some(CANCEL),
+            (Some(Mode::Resize), ESC, m) if m == 0 || m == MOD_WIN || m == opener => Some(CANCEL),
             _ => None,
         };
         let repeatable = slot < ENTER && mode == Some(Mode::Resize);
@@ -99,13 +109,17 @@ struct Snapshot {
     mode: Mode,
     focus_epoch: usize,
     handled: usize,
+    settings: Settings,
 }
 
-static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot {
-    target: 0,
-    mode: Mode::Normal,
-    focus_epoch: 0,
-    handled: 0,
+static SNAPSHOT: LazyLock<Mutex<Snapshot>> = LazyLock::new(|| {
+    Mutex::new(Snapshot {
+        target: 0,
+        mode: Mode::Normal,
+        focus_epoch: 0,
+        handled: 0,
+        settings: Settings::default(),
+    })
 });
 
 pub(super) fn update(target: Option<isize>, mode: Mode, handled: usize) {
@@ -166,7 +180,6 @@ impl Pending {
 
 thread_local! {
     static OWNER: Cell<u32> = const { Cell::new(0) };
-    static OPENER: Cell<u32> = const { Cell::new(MOD_WIN) };
     static HELD: Cell<Held> = const { Cell::new(Held([Press::Up; KEYS.len()])) };
     static PENDING: Cell<Pending> = const { Cell::new(Pending::NEW) };
 }
@@ -192,9 +205,9 @@ fn modifiers() -> u32 {
     mods
 }
 
-fn mark_win_chord() {
-    // The shell otherwise observes Win down/up alone and opens Start after a
-    // consumed chord. This unused VK is also used by PowerToys Keyboard Manager.
+fn mark_modifier_used() {
+    // The shell or foreground app otherwise sees a bare Win or Alt release
+    // after a consumed chord and can activate Start or its menu bar.
     let dummy = |flags| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -223,7 +236,7 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             let mods = if down && active { modifiers() } else { 0 };
             let mut held = HELD.get();
             let previous = held.0[slot];
-            match held.route(slot, down, mods, mode, OPENER.get()) {
+            match held.route(slot, down, mods, mode, state.settings) {
                 Action::Consume => {
                     HELD.set(held);
                     return 1;
@@ -238,8 +251,8 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
                         if let Some(next) = transition {
                             PENDING.set(next);
                         }
-                        if previous == Press::Up && mods & MOD_WIN != 0 {
-                            mark_win_chord();
+                        if previous == Press::Up && mods & (MOD_WIN | MOD_ALT) != 0 {
+                            mark_modifier_used();
                         }
                         return 1;
                     }
@@ -263,7 +276,7 @@ pub(super) struct Hook {
 }
 
 impl Hook {
-    pub(super) fn install(opener: u32) -> Result<Self, String> {
+    pub(super) fn install(settings: Settings) -> Result<Self, String> {
         let owner = unsafe { GetCurrentThreadId() };
         let desktop = unsafe { GetThreadDesktop(owner) } as usize;
         let (ready, status) = mpsc::sync_channel(1);
@@ -271,7 +284,6 @@ impl Hook {
             .name("rustile-shortcuts".into())
             .spawn(move || {
                 OWNER.set(owner);
-                OPENER.set(opener);
                 // Match the manager's desktop, including an isolated test desktop.
                 if unsafe { SetThreadDesktop(desktop as HDESK) } == 0 {
                     let _ = ready.send(Err(io::Error::last_os_error()));
@@ -294,10 +306,14 @@ impl Hook {
             })
             .map_err(|e| format!("Поток сочетаний клавиш: {e}"))?;
         match status.recv() {
-            Ok(Ok(id)) => Ok(Self {
-                thread: Some(thread),
-                id,
-            }),
+            Ok(Ok(id)) => {
+                let hook = Self {
+                    thread: Some(thread),
+                    id,
+                };
+                hook.set_settings(settings);
+                Ok(hook)
+            }
             result => {
                 let _ = thread.join();
                 match result {
@@ -306,6 +322,10 @@ impl Hook {
                 }
             }
         }
+    }
+
+    pub(super) fn set_settings(&self, settings: Settings) {
+        SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).settings = settings;
     }
 }
 
@@ -322,6 +342,9 @@ impl Drop for Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Modifier;
+
+    const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
     // Exercise the hook's prediction and repeat handling before/after arbitrary
     // manager acknowledgements, without sending keyboard events to Windows.
@@ -329,7 +352,6 @@ mod tests {
         held: Held,
         state: Snapshot,
         pending: Pending,
-        opener: u32,
     }
 
     impl Keyboard {
@@ -341,15 +363,15 @@ mod tests {
                     mode: Mode::Normal,
                     focus_epoch: 1,
                     handled: 0,
+                    settings: Settings::default(),
                 },
                 pending: Pending::NEW,
-                opener: MOD_WIN,
             }
         }
 
         fn key(&mut self, slot: usize, down: bool, mods: u32) -> Action {
             let mode = (self.state.target != 0).then(|| self.pending.mode(self.state));
-            let action = self.held.route(slot, down, mods, mode, self.opener);
+            let action = self.held.route(slot, down, mods, mode, self.state.settings);
             if let Action::Command(id) = action
                 && let Some(next) = self.pending.transition(id, self.state.focus_epoch)
             {
@@ -458,12 +480,63 @@ mod tests {
         }
         assert_eq!(keyboard.key(0, true, MOD_CONTROL | WIN_SHIFT), Action::Pass);
         assert_eq!(keyboard.key(0, false, 0), Action::Pass);
-        keyboard.opener = MOD_CONTROL | MOD_ALT;
+        keyboard.state.settings.resize = Modifier::CtrlAlt;
         assert_eq!(keyboard.key(ENTER, true, MOD_WIN), Action::Pass);
         assert_eq!(keyboard.key(ENTER, false, 0), Action::Pass);
         assert_eq!(
             keyboard.key(ENTER, true, MOD_CONTROL | MOD_ALT),
             Action::Command(START_RESIZE)
         );
+    }
+
+    #[test]
+    fn editing_shortcuts_takes_effect_on_the_next_physical_press() {
+        let mut k = Keyboard::new();
+        assert_eq!(k.key(0, true, MOD_WIN), Action::Command(FOCUS));
+        assert_eq!(k.key(1, true, MOD_ALT), Action::Pass);
+        k.state.settings.focus = Modifier::Alt;
+        k.state.settings.movement = Modifier::CtrlAltShift;
+
+        // Neither a consumed nor a passed key switches owners mid-press.
+        assert_eq!(k.key(0, true, MOD_ALT), Action::Consume);
+        assert_eq!(k.key(0, false, 0), Action::Consume);
+        assert_eq!(k.key(1, true, MOD_ALT), Action::Pass);
+        assert_eq!(k.key(1, false, 0), Action::Pass);
+
+        for mods in [MOD_WIN, WIN_SHIFT] {
+            assert_eq!(k.key(2, true, mods), Action::Pass);
+            assert_eq!(k.key(2, false, 0), Action::Pass);
+        }
+        assert_eq!(k.key(1, true, MOD_ALT), Action::Command(FOCUS + 1));
+        assert_eq!(k.key(1, false, MOD_ALT), Action::Consume);
+        assert_eq!(
+            k.key(2, true, MOD_CONTROL | MOD_ALT | MOD_SHIFT),
+            Action::Command(MOVE + 2)
+        );
+        k.state.target = 0;
+        assert_eq!(k.key(2, false, 0), Action::Consume);
+        assert_eq!(k.key(0, true, MOD_ALT), Action::Pass);
+    }
+
+    #[test]
+    fn custom_resize_opener_supports_held_modifiers_and_shift_for_shrink() {
+        for opener in [Modifier::CtrlAlt, Modifier::CtrlAltShift] {
+            let mut k = Keyboard::new();
+            k.state.settings.resize = opener;
+            assert_eq!(
+                k.key(ENTER, true, opener.bits()),
+                Action::Command(START_RESIZE)
+            );
+            assert_eq!(k.key(ENTER, false, 0), Action::Consume);
+            for mods in [0, MOD_WIN, MOD_CONTROL | MOD_ALT] {
+                assert_eq!(k.key(2, true, mods), Action::Command(EXPAND + 2));
+                assert_eq!(
+                    k.key(2, true, mods | MOD_SHIFT),
+                    Action::Command(SHRINK + 2)
+                );
+                assert_eq!(k.key(2, false, 0), Action::Consume);
+            }
+            assert_eq!(k.key(ESC, true, opener.bits()), Action::Command(CANCEL));
+        }
     }
 }

@@ -1,15 +1,19 @@
-use super::{Axis, Direction, GAP, Rect, shifted_divider};
+use super::{Axis, Direction, Rect, shifted_divider};
 
 type Size = (i32, i32);
 
 // Find a full gutter with a roughly balanced number of tiles on each side.
-fn gutter<T>(members: &mut [T], bounds: impl Fn(&T) -> (i64, i64)) -> Option<(usize, i64)> {
+fn gutter<T>(
+    members: &mut [T],
+    bounds: impl Fn(&T) -> (i64, i64),
+    gap: i32,
+) -> Option<(usize, i64)> {
     members.sort_unstable_by_key(|tile| bounds(tile).0);
     let mut edge = i64::MIN;
     let mut best = None;
     for split in 1..members.len() {
         edge = edge.max(bounds(&members[split - 1]).1);
-        if bounds(&members[split]).0 - edge == i64::from(GAP) {
+        if bounds(&members[split]).0 - edge == i64::from(gap) {
             let distance = split.abs_diff(members.len() / 2);
             if best.is_none_or(|(score, _, _)| distance < score) {
                 best = Some((distance, split, edge));
@@ -37,13 +41,13 @@ impl Cut {
         }
     }
 
-    pub fn parts(self, rect: Rect) -> (Rect, Rect) {
+    pub fn parts(self, rect: Rect, gap: i32) -> (Rect, Rect) {
         let length = self.axis.length(rect);
-        let gap = GAP.min(length);
+        let gap = gap.min(length);
         let available = length - gap;
         let first = ((i64::from(available) * i64::from(self.part) + i64::from(self.whole) / 2)
             / i64::from(self.whole)) as i32;
-        self.axis.split_at(rect, first)
+        self.axis.split_at(rect, first, gap)
     }
 }
 
@@ -56,14 +60,14 @@ pub(super) struct Bsp(pub Vec<Cut>);
 impl Bsp {
     // Each pending pair must live on its own side of some lasting gutters.
     // Then finishing any selection of pairs leaves a representable layout.
-    pub fn separates_pairs(regions: &mut [(Rect, bool)]) -> bool {
+    pub fn separates_pairs(regions: &mut [(Rect, bool)], gap: i32) -> bool {
         if regions.iter().filter(|r| r.1).nth(1).is_none() {
             return true;
         }
         for axis in [Axis::X, Axis::Y] {
-            if let Some((split, _)) = gutter(regions, |r| axis.bounds(r.0)) {
+            if let Some((split, _)) = gutter(regions, |r| axis.bounds(r.0), gap) {
                 let (left, right) = regions.split_at_mut(split);
-                return Self::separates_pairs(left) && Self::separates_pairs(right);
+                return Self::separates_pairs(left, gap) && Self::separates_pairs(right, gap);
             }
         }
         false
@@ -72,10 +76,10 @@ impl Bsp {
     // A half-completed keyboard move can rotate a pair or change a T junction.
     // Recover cuts from the displayed gutters when such a pair becomes a
     // permanent part of the layout. The returned order maps slots to old slots.
-    pub fn from_rects(area: Rect, cells: &[Rect]) -> Option<(Self, Vec<usize>)> {
+    pub fn from_rects(area: Rect, cells: &[Rect], gap: i32) -> Option<(Self, Vec<usize>)> {
         let mut bsp = Self::default();
         let mut order = vec![0];
-        bsp.carve(0, area, (0..cells.len()).collect(), cells, &mut order)?;
+        bsp.carve(0, area, (0..cells.len()).collect(), cells, &mut order, gap)?;
         Some((bsp, order))
     }
 
@@ -86,6 +90,7 @@ impl Bsp {
         mut members: Vec<usize>,
         cells: &[Rect],
         order: &mut Vec<usize>,
+        gap: i32,
     ) -> Option<()> {
         if let [only] = members[..] {
             order[at] = only;
@@ -93,29 +98,29 @@ impl Bsp {
         }
         let longer = if area.w >= area.h { Axis::X } else { Axis::Y };
         for axis in [longer, longer.perpendicular()] {
-            if let Some((split, edge)) = gutter(&mut members, |&i| axis.bounds(cells[i])) {
+            if let Some((split, edge)) = gutter(&mut members, |&i| axis.bounds(cells[i]), gap) {
                 let cut = Cut {
                     at,
                     axis,
                     part: (edge - axis.bounds(area).0) as i32,
-                    whole: axis.length(area) - GAP,
+                    whole: axis.length(area) - gap,
                 };
-                let (a, b) = cut.parts(area);
+                let (a, b) = cut.parts(area, gap);
                 let right_at = order.len();
                 order.push(0);
                 self.0.push(cut);
                 let right = members.split_off(split);
-                self.carve(at, a, members, cells, order)?;
-                return self.carve(right_at, b, right, cells, order);
+                self.carve(at, a, members, cells, order, gap)?;
+                return self.carve(right_at, b, right, cells, order, gap);
             }
         }
         None
     }
 
-    pub fn rects(&self, mut cells: Vec<Rect>) -> Vec<Rect> {
+    pub fn rects(&self, mut cells: Vec<Rect>, gap: i32) -> Vec<Rect> {
         cells.reserve(self.0.len());
         for cut in &self.0 {
-            let (a, b) = cut.parts(cells[cut.at]);
+            let (a, b) = cut.parts(cells[cut.at], gap);
             cells[cut.at] = a;
             cells.push(b);
         }
@@ -129,8 +134,8 @@ impl Bsp {
             .rposition(|(i, cut)| slot == cut.at || slot == roots + i)
     }
 
-    pub fn ancestors(&self, area: Rect, mut slot: usize) -> Vec<Rect> {
-        let (_, parents) = self.leaves_and_parents(vec![area]);
+    pub fn ancestors(&self, area: Rect, mut slot: usize, gap: i32) -> Vec<Rect> {
+        let (_, parents) = self.leaves_and_parents(vec![area], gap);
         let mut path = Vec::new();
         for (i, cut) in self.0.iter().enumerate().rev() {
             if slot == cut.at || slot == i + 1 {
@@ -141,11 +146,11 @@ impl Bsp {
         path
     }
 
-    fn leaves_and_parents(&self, mut cells: Vec<Rect>) -> (Vec<Rect>, Vec<Rect>) {
+    fn leaves_and_parents(&self, mut cells: Vec<Rect>, gap: i32) -> (Vec<Rect>, Vec<Rect>) {
         let mut parents = Vec::with_capacity(self.0.len());
         for cut in &self.0 {
             parents.push(cells[cut.at]);
-            let (first, second) = cut.parts(cells[cut.at]);
+            let (first, second) = cut.parts(cells[cut.at], gap);
             cells[cut.at] = first;
             cells.push(second);
         }
@@ -177,32 +182,32 @@ impl Bsp {
 
     // Fold child requirements upward before fitting tracks or moving a
     // divider. Save each pair before its leading slot is reused by its parent.
-    pub fn minimums(&self, mut sizes: Vec<Size>) -> (Vec<Size>, Vec<(Size, Size)>) {
+    pub fn minimums(&self, mut sizes: Vec<Size>, gap: i32) -> (Vec<Size>, Vec<(Size, Size)>) {
         let mut children = Vec::with_capacity(self.0.len());
         for cut in self.0.iter().rev() {
             let b = sizes.pop().expect("a second child for every cut");
             let a = sizes[cut.at];
             children.push((a, b));
             sizes[cut.at] = match cut.axis {
-                Axis::X => (a.0.saturating_add(GAP).saturating_add(b.0), a.1.max(b.1)),
-                Axis::Y => (a.0.max(b.0), a.1.saturating_add(GAP).saturating_add(b.1)),
+                Axis::X => (a.0.saturating_add(gap).saturating_add(b.0), a.1.max(b.1)),
+                Axis::Y => (a.0.max(b.0), a.1.saturating_add(gap).saturating_add(b.1)),
             };
         }
         children.reverse();
         (sizes, children)
     }
 
-    pub fn fit(&mut self, mut cells: Vec<Rect>, minimums: &[(Size, Size)]) {
+    pub fn fit(&mut self, mut cells: Vec<Rect>, minimums: &[(Size, Size)], gap: i32) {
         for (cut, &(a, b)) in self.0.iter_mut().zip(minimums) {
             let rect = cells[cut.at];
-            let total = cut.axis.length(rect) - GAP;
-            let (mut first, mut second) = cut.parts(rect);
+            let total = cut.axis.length(rect) - gap;
+            let (mut first, mut second) = cut.parts(rect, gap);
             let old = cut.axis.length(first);
             let next = old.clamp(cut.axis.min_dimension(a), total - cut.axis.min_dimension(b));
             if old != next {
                 cut.part = next;
                 cut.whole = total;
-                (first, second) = cut.parts(rect);
+                (first, second) = cut.parts(rect, gap);
             }
             cells[cut.at] = first;
             cells.push(second);
@@ -212,14 +217,15 @@ impl Bsp {
     pub fn resize(
         &mut self,
         slot: usize,
-        direction: Direction,
-        shrink: bool,
+        motion: (Direction, bool),
         cells: Vec<Rect>,
         companion: Option<usize>,
         minimums: &[(Size, Size)],
+        gap: i32,
     ) -> Option<Direction> {
+        let (direction, shrink) = motion;
         let roots = cells.len();
-        let (cells, parents) = self.leaves_and_parents(cells);
+        let (cells, parents) = self.leaves_and_parents(cells, gap);
         let axis = direction.axis();
         let (mut lo, mut hi) = axis.bounds(cells[slot]);
         if let Some(other) = companion {
@@ -237,7 +243,7 @@ impl Bsp {
             if cut.axis != axis || shrink && direction.towards_start() != trailing {
                 continue;
             }
-            let (a, b) = cut.parts(parents[i]);
+            let (a, b) = cut.parts(parents[i], gap);
             if trailing && axis.bounds(b).0 != lo || !trailing && axis.bounds(a).1 != hi {
                 continue;
             }

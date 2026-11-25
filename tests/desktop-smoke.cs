@@ -13,13 +13,21 @@ using System.Windows.Forms;
 // Run via desktop-smoke.ps1. The harness never switches the input desktop or
 // synthesizes user input. Window messages target only its isolated processes.
 internal static class DesktopSmoke {
-    const uint WmClose = 0x10, WmQuit = 0x12, RustileShortcut = 0x8002;
+    const uint WmClose = 0x10, RustileShortcut = 0x8002;
+    const uint TrayCallback = 0x8000 + 20;
+    const int TraySelect = 0x400, TrayContext = 0x7b, TrayKeyboard = 0x401;
     const int ShowFixtureDialog = 0x8001, RequestFocus = 0x8002;
     const int ExtendedFrameBounds = 9, WindowCornerPreference = 33;
     static readonly int[] FixtureCorners = { 2, 3, 1 }; // round, small, square
 
     [StructLayout(LayoutKind.Sequential)]
     struct Rect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct GuiThreadInfo {
+        public int size, flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public Rect caretBounds;
+    }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct StartupInfo {
         public int cb;
@@ -50,17 +58,23 @@ internal static class DesktopSmoke {
         bool inherit, uint flags, IntPtr env, string workingDir, ref StartupInfo startup, out ProcessInfo process);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow visit, IntPtr arg);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumWindow visit, IntPtr arg);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, UIntPtr wp, StringBuilder text, uint flags,
+        uint timeout, out UIntPtr result);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetProp(IntPtr hwnd, string name);
     [DllImport("user32.dll")] static extern uint GetDpiForSystem();
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out Rect value, int size);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetGUIThreadInfo(int tid, ref GuiThreadInfo info);
     [DllImport("user32.dll")] static extern void NotifyWinEvent(uint winEvent, IntPtr hwnd, int objectId, int childId);
     [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll", SetLastError = true)] static extern bool PostThreadMessage(int tid, uint msg, IntPtr w, IntPtr l);
@@ -99,8 +113,9 @@ internal static class DesktopSmoke {
         readonly IntPtr process;
         public readonly int Pid;
         public readonly int ThreadId;
-        public Child(string exe, string args, string desktop) {
-            var startup = new StartupInfo { cb = Marshal.SizeOf(typeof(StartupInfo)), desktop = desktop };
+        public Child(string exe, string args, string desktop, bool launchHidden = false) {
+            var startup = new StartupInfo { cb = Marshal.SizeOf(typeof(StartupInfo)), desktop = desktop,
+                flags = launchHidden ? 1 /* STARTF_USESHOWWINDOW */ : 0, show = 0 /* SW_HIDE */ };
             ProcessInfo info;
             var line = new StringBuilder("\"" + exe + "\" " + args);
             if (!CreateProcess(exe, line, IntPtr.Zero, IntPtr.Zero, false, 0x08000000,
@@ -181,6 +196,142 @@ internal static class DesktopSmoke {
         Rect frame;
         Require(DwmGetWindowAttribute(hwnd, ExtendedFrameBounds, out frame, Marshal.SizeOf(typeof(Rect))) == 0, "Cannot read DWM frame");
         return Rectangle.FromLTRB(frame.Left, frame.Top, frame.Right, frame.Bottom);
+    }
+    static IntPtr TrayWindow(Child manager) {
+        IntPtr tray = IntPtr.Zero;
+        Until("Rustile should create its tray callback window", () => {
+            Require(!manager.Exited(0), "Rustile exited before its tray window appeared");
+            EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
+                int pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (pid != manager.Pid) return true;
+                var cls = new StringBuilder(80);
+                GetClassName(hwnd, cls, cls.Capacity);
+                if (cls.ToString() != "Rustile.Tray") return true;
+                tray = hwnd;
+                return false;
+            }, IntPtr.Zero);
+            return tray != IntPtr.Zero;
+        });
+        return tray;
+    }
+    static IntPtr TrayButton(IntPtr tray, string label) {
+        IntPtr button = IntPtr.Zero;
+        Until("Tray button should be visible: " + label, () => {
+            EnumChildWindows(tray, delegate(IntPtr hwnd, IntPtr unused) {
+                if (!IsWindowVisible(hwnd)) return true;
+                var cls = new StringBuilder(40);
+                GetClassName(hwnd, cls, cls.Capacity);
+                if (!String.Equals(cls.ToString(), "Button", StringComparison.OrdinalIgnoreCase)) return true;
+                var text = new StringBuilder(120);
+                UIntPtr length;
+                if (SendMessageTimeout(hwnd, 0x000d, (UIntPtr)text.Capacity, text, 2, 500, out length) == IntPtr.Zero)
+                    return true;
+                var name = text.ToString();
+                if (name != label && !name.StartsWith(label + ",", StringComparison.Ordinal)) return true;
+                button = hwnd;
+                return false;
+            }, IntPtr.Zero);
+            return button != IntPtr.Zero;
+        });
+        return button;
+    }
+    static void TrayClick(IntPtr tray, string label) {
+        var button = TrayButton(tray, label);
+        Require(IsWindowEnabled(button), "Tray button is disabled: " + label);
+        Message(button, 0x00f5); // BM_CLICK
+    }
+    static void TrayKey(IntPtr tray, string label, Keys key) {
+        var button = TrayButton(tray, label);
+        if (!PostMessage(button, 0x0100 /* WM_KEYDOWN */, (IntPtr)(int)key, IntPtr.Zero))
+            throw new Win32Exception();
+    }
+    static void TrayFocus(Child manager, IntPtr tray, string label) {
+        var button = TrayButton(tray, label);
+        var info = new GuiThreadInfo { size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        Until("Keyboard focus should move to " + label, () => {
+            if (!GetGUIThreadInfo(manager.ThreadId, ref info)) throw new Win32Exception();
+            return info.focus == button;
+        });
+    }
+    static void TrayOpen(IntPtr tray, int activation, Rectangle screen) {
+        // Version 4 shell callbacks carry the screen coordinates in wParam
+        // and the icon ID (high word) plus activation event in lParam.
+        int point = ((screen.Bottom - 12) << 16) | ((screen.Right - 12) & 0xffff);
+        if (!PostMessage(tray, TrayCallback, (IntPtr)point, (IntPtr)((1 << 16) | activation)))
+            throw new Win32Exception();
+        TrayButton(tray, "Мозаика");
+        Require(Screen.FromHandle(tray).WorkingArea.Contains(Bounds(tray)), "The tray popup extends outside its monitor's work area");
+    }
+    static void TrayChoose(IntPtr tray, int activation, Rectangle area, params string[] labels) {
+        TrayOpen(tray, activation, area);
+        foreach (var label in labels) TrayClick(tray, label);
+        Until("Choosing a tray command should dismiss the flyout", () => !IsWindowVisible(tray));
+    }
+    static bool HasSpacing(IntPtr[] pair, Rectangle work) {
+        int dpi = (int)GetDpiForSystem();
+        int padding = (12 * dpi + 48) / 96, gap = (16 * dpi + 48) / 96;
+        var a = VisibleFrame(pair[0]);
+        var b = VisibleFrame(pair[1]);
+        int distance = Math.Max(Math.Max(a.Left - b.Right, b.Left - a.Right),
+            Math.Max(a.Top - b.Bottom, b.Top - a.Bottom));
+        return Rectangle.Union(a, b) == Rectangle.Inflate(work, -padding, -padding) && distance == gap;
+    }
+    static void TraySettings(Child manager, string rustile, string desktop, List<Child> children,
+        IntPtr[] pair, Rectangle[] originals, Rectangle area) {
+        var tray = TrayWindow(manager);
+        TrayOpen(tray, TrayKeyboard, area);
+        TrayFocus(manager, tray, "Мозаика");
+        TrayKey(tray, "Мозаика", Keys.Down);
+        TrayFocus(manager, tray, "Горячие клавиши");
+        TrayKey(tray, "Горячие клавиши", Keys.Escape);
+        Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
+        TrayChoose(tray, TraySelect, area, "Между окнами", "16 px");
+        TrayChoose(tray, TrayContext, area, "По краям экрана", "12 px");
+        Until("The selected tray spacing should reach the DWM frames", () => HasSpacing(pair, area));
+        TrayOpen(tray, TrayKeyboard, area);
+        TrayKey(tray, "Толщина обводки", Keys.Right);
+        TrayFocus(manager, tray, "1 px");
+        TrayKey(tray, "3 px", Keys.Enter);
+        Until("Choosing a thickness with Enter should dismiss the flyout", () => !IsWindowVisible(tray));
+        TrayOpen(tray, TraySelect, area);
+        TrayClick(tray, "Горячие клавиши");
+        TrayClick(tray, "Перевести фокус");
+        Require(!IsWindowEnabled(TrayButton(tray, "Win+Shift+стрелки")), "A duplicate move binding was offered");
+        TrayClick(tray, "Alt+стрелки");
+        Until("Choosing a shortcut should dismiss the flyout", () => !IsWindowVisible(tray));
+        Console.WriteLine("PASS  Left, right and keyboard tray callbacks; live inner/outer spacing, outline option and conflict-aware shortcuts");
+
+        var tiled = pair.Select(VisibleFrame).ToArray();
+        TrayChoose(tray, TrayContext, area, "Мозаика");
+        TrayOpen(tray, TraySelect, area);
+        TrayButton(tray, "Мозаика, Выключена");
+        Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Pause moved a tiled window");
+        TrayClick(tray, "Вернуть исходные позиции");
+        Until("Explicit tray restore should recover both originals", () => pair.Select(Bounds).SequenceEqual(originals));
+        TrayOpen(tray, TrayKeyboard, area);
+        TrayClick(tray, "Выйти из Rustile");
+        Require(manager.Exited(5000) && manager.ExitCode == 0, "Tray exit failed");
+
+        var restarted = new Child(rustile, "", desktop, true);
+        children.Add(restarted);
+        tray = TrayWindow(restarted);
+        TrayOpen(tray, TrayContext, area);
+        TrayButton(tray, "Мозаика, Выключена");
+        TrayButton(tray, "Толщина обводки, 3 px");
+        Require(pair.Select(Bounds).SequenceEqual(originals), "Disabled startup tiled the windows");
+        TrayClick(tray, "Горячие клавиши");
+        TrayButton(tray, "Перевести фокус, Alt+стрелки");
+        TrayKey(tray, "Перевести фокус, Alt+стрелки", Keys.Left);
+        TrayButton(tray, "Мозаика, Выключена");
+        TrayFocus(restarted, tray, "Горячие клавиши");
+        TrayClick(tray, "Мозаика");
+        Until("Resume should use the stored inner and outer gaps", () => HasSpacing(pair, area));
+        TrayOpen(tray, TraySelect, area);
+        TrayClick(tray, "Выйти из Rustile");
+        Require(restarted.Exited(5000) && restarted.ExitCode == 0, "Second tray exit failed");
+        Until("Exit after resume should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
+        Console.WriteLine("PASS  Tray pause, explicit restore, paused restart, restored shortcut/outline/spacing, resume and tray exit");
     }
     // Direction encodings match the WM_APP command sent by the shortcut hook.
     static int NeighborDirection(Rectangle origin, Rectangle other) {
@@ -264,10 +415,14 @@ internal static class DesktopSmoke {
         var desktop = CreateDesktop(desktopName, IntPtr.Zero, IntPtr.Zero, 0, 0x007f, IntPtr.Zero);
         if (desktop == IntPtr.Zero) throw new Win32Exception();
         var children = new List<Child>();
+        var oldAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        var appData = Path.Combine(Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName), "local-appdata");
         bool ownsShortcut = false;
         const int fixtureShortcut = 0x5119;
         try {
             if (!SetThreadDesktop(desktop)) throw new Win32Exception();
+            Directory.CreateDirectory(appData);
+            Environment.SetEnvironmentVariable("LOCALAPPDATA", appData, EnvironmentVariableTarget.Process);
             var self = Process.GetCurrentProcess().MainModule.FileName;
             var windows = new IntPtr[3];
             var originals = new Rectangle[3];
@@ -285,7 +440,7 @@ internal static class DesktopSmoke {
             ownsShortcut = RegisterHotKey(IntPtr.Zero, fixtureShortcut, 8, 13);
             if (!ownsShortcut)
                 Require(Marshal.GetLastWin32Error() == 1409, "Could not establish a Win+Enter conflict");
-            var manager = new Child(rustile, "", desktopName);
+            var manager = new Child(rustile, "", desktopName, true);
             children.Add(manager);
             var area = Screen.PrimaryScreen.WorkingArea;
             Until("Existing windows should tile on launch", () => {
@@ -348,11 +503,8 @@ internal static class DesktopSmoke {
                 Until("Sibling should reclaim the exact original tile", () =>
                     windows.Take(2).Select(VisibleFrame).SequenceEqual(startupTiles));
             Console.WriteLine("PASS  Closing the third window reclaims its tile");
-            manager.Send(WmQuit, 0);
-            Require(manager.Exited(5000) && manager.ExitCode == 0, "Rustile did not exit cleanly");
-            Until("Original positions and sizes should be restored", () =>
-                Bounds(windows[0]) == originals[0] && Bounds(windows[1]) == originals[1]);
-            Console.WriteLine("PASS  Exit restores original geometry");
+            TraySettings(manager, rustile, desktopName, children, windows.Take(2).ToArray(),
+                originals.Take(2).ToArray(), area);
             Require(windows.Take(2).Select(CornerPreference).SequenceEqual(FixtureCorners.Take(2)), "Exit changed the fixtures' corners");
 
             Array.Resize(ref windows, 6);
@@ -392,6 +544,7 @@ internal static class DesktopSmoke {
         } finally {
             children.Reverse();
             foreach (var child in children) child.Dispose();
+            Environment.SetEnvironmentVariable("LOCALAPPDATA", oldAppData, EnvironmentVariableTarget.Process);
             if (ownsShortcut) UnregisterHotKey(IntPtr.Zero, fixtureShortcut);
             SetThreadDesktop(originalDesktop);
             CloseDesktop(desktop);

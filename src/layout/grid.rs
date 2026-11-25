@@ -8,7 +8,7 @@ pub(super) struct Shape {
 }
 
 impl Shape {
-    pub fn candidates(count: usize, area: Rect) -> Vec<Self> {
+    pub fn candidates(count: usize, area: Rect, gap: i32) -> Vec<Self> {
         let flow = if area.w >= area.h { Axis::X } else { Axis::Y };
         if count == 0 {
             return vec![Self {
@@ -18,8 +18,8 @@ impl Shape {
             }];
         }
         let capacity = |axis: Axis| {
-            ((i64::from(axis.length(area).max(0)) + i64::from(GAP))
-                / i64::from(axis.minimum() + GAP)) as usize
+            ((i64::from(axis.length(area).max(0)) + i64::from(gap))
+                / i64::from(axis.minimum() + gap)) as usize
         };
         let along = capacity(flow);
         let across = capacity(flow.perpendicular());
@@ -43,6 +43,7 @@ impl Shape {
 
 #[derive(Clone, Debug)]
 pub(super) struct Grid {
+    pub(super) gap: i32,
     flow: Axis,
     bands: Vec<i32>,
     segments: Vec<Vec<i32>>,
@@ -50,15 +51,20 @@ pub(super) struct Grid {
 
 impl Default for Grid {
     fn default() -> Self {
+        Self::new(GAP)
+    }
+}
+
+impl Grid {
+    pub fn new(gap: i32) -> Self {
         Self {
+            gap,
             flow: Axis::X,
             bands: Vec::new(),
             segments: Vec::new(),
         }
     }
-}
 
-impl Grid {
     pub fn set_shape(&mut self, shape: Shape) {
         let rotated = self.flow != shape.flow;
         self.flow = shape.flow;
@@ -122,14 +128,18 @@ impl Grid {
         &mut self,
         area: Rect,
         minima: &[(i32, i32)],
-        distribute: impl Fn(&[i32], i32, &[i32]) -> Option<Vec<i32>>,
+        distribute: impl Fn(&[i32], i32, &[i32], i32) -> Option<Vec<i32>>,
     ) -> bool {
         if self.bands.is_empty() {
             return true;
         }
         let across = self.flow.perpendicular();
-        let Some(bands) = distribute(&self.bands, across.length(area), &self.band_minima(minima))
-        else {
+        let Some(bands) = distribute(
+            &self.bands,
+            across.length(area),
+            &self.band_minima(minima),
+            self.gap,
+        ) else {
             return false;
         };
         let mut offset = 0;
@@ -139,7 +149,7 @@ impl Grid {
                 .iter()
                 .map(|&m| self.flow.min_dimension(m))
                 .collect();
-            let Some(sizes) = distribute(weights, self.flow.length(area), &min) else {
+            let Some(sizes) = distribute(weights, self.flow.length(area), &min, self.gap) else {
                 return false;
             };
             *weights = sizes;
@@ -151,12 +161,15 @@ impl Grid {
 
     pub fn rects(&self, area: Rect) -> Vec<Rect> {
         let across = self.flow.perpendicular();
-        let bands = spans(&self.bands, across.length(area), across.minimum());
+        let bands = spans(&self.bands, across.length(area), across.minimum(), self.gap);
         let mut result = Vec::new();
         for ((band_at, band_length), weights) in bands.into_iter().zip(&self.segments) {
-            for (segment_at, segment_length) in
-                spans(weights, self.flow.length(area), self.flow.minimum())
-            {
+            for (segment_at, segment_length) in spans(
+                weights,
+                self.flow.length(area),
+                self.flow.minimum(),
+                self.gap,
+            ) {
                 let (dx, dy, w, h) = match self.flow {
                     Axis::X => (segment_at, band_at, segment_length, band_length),
                     Axis::Y => (band_at, segment_at, band_length, segment_length),
@@ -213,7 +226,7 @@ impl Grid {
         } else {
             trailing.or(leading)
         }?;
-        let mut sizes = lengths(weights, axis.length(area), &mins)?;
+        let mut sizes = lengths(weights, axis.length(area), &mins, self.gap)?;
         let total = sizes[divider] + sizes[divider + 1];
         let next = super::shifted_divider(
             sizes[divider],
@@ -231,8 +244,8 @@ impl Grid {
 
 // Clamp existing divider positions to the space needed on either side. A
 // change propagates past a neighboring track only when it runs out of room.
-fn keep_dividers(weights: &[i32], length: i32, minima: &[i32]) -> Option<Vec<i32>> {
-    let mut sizes = lengths(weights, length, &vec![0; weights.len()])?;
+fn keep_dividers(weights: &[i32], length: i32, minima: &[i32], gap: i32) -> Option<Vec<i32>> {
+    let mut sizes = lengths(weights, length, &vec![0; weights.len()], gap)?;
     let usable: i64 = sizes.iter().map(|&size| i64::from(size)).sum();
     let mut reserved: i64 = minima.iter().map(|&min| i64::from(min)).sum();
     if reserved > usable {
@@ -249,11 +262,11 @@ fn keep_dividers(weights: &[i32], length: i32, minima: &[i32]) -> Option<Vec<i32
     Some(sizes)
 }
 
-fn lengths(weights: &[i32], length: i32, minima: &[i32]) -> Option<Vec<i32>> {
+fn lengths(weights: &[i32], length: i32, minima: &[i32], gap: i32) -> Option<Vec<i32>> {
     if weights.is_empty() {
         return Some(Vec::new());
     }
-    let mut remaining = i64::from(length) - i64::from(GAP) * (weights.len() - 1) as i64;
+    let mut remaining = i64::from(length) - i64::from(gap) * (weights.len() - 1) as i64;
     let mut reserved: i64 = minima.iter().map(|&m| i64::from(m)).sum();
     if remaining < reserved {
         return None;
@@ -271,25 +284,25 @@ fn lengths(weights: &[i32], length: i32, minima: &[i32]) -> Option<Vec<i32>> {
     Some(sizes)
 }
 
-fn spans(weights: &[i32], length: i32, min: i32) -> Vec<(i32, i32)> {
+fn spans(weights: &[i32], length: i32, min: i32, gap: i32) -> Vec<(i32, i32)> {
     if weights.is_empty() {
         return Vec::new();
     }
     let min = vec![min; weights.len()];
-    if let Some(sizes) = lengths(weights, length, &min) {
+    if let Some(sizes) = lengths(weights, length, &min, gap) {
         let mut pos = 0i32;
         return sizes
             .into_iter()
             .map(|size| {
                 let start = pos;
-                pos = pos.saturating_add(size).saturating_add(GAP);
+                pos = pos.saturating_add(size).saturating_add(gap);
                 (start, size)
             })
             .collect();
     }
     // A display can become smaller before the next admission/reflow. Keep all
     // frames inside it, shrinking the gutters too if necessary.
-    let gap = GAP.min(length.max(0) / (weights.len().saturating_sub(1).max(1) as i32));
+    let gap = gap.min(length.max(0) / (weights.len().saturating_sub(1).max(1) as i32));
     let usable = (length.max(0) - gap * (weights.len() - 1) as i32) as i64;
     let count = weights.len() as i64;
     (0..count)

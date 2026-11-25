@@ -64,6 +64,8 @@ struct Shape {
     h: i32,
     dpi: u32,
     radius_dip: i32,
+    thickness: u8,
+    inset: bool,
     palette: Palette,
 }
 
@@ -79,31 +81,39 @@ impl Shape {
     // These four non-overlapping strips leave the centre physically empty.
     // Coordinates are relative to the actual visible window frame.
     fn strips(self, work: Rect) -> [Rect; 4] {
-        let pad = (1.5 * self.scale() + 0.5).ceil() as i32;
-        let corner = (self.radius().ceil() as i32 + pad).min(self.h / 2);
-        let span = self.w + 2 * pad;
-        let side_width = 2 * pad;
+        // A flush layout draws the entire outline inside the frame so it
+        // cannot paint over a neighboring tile.
+        let outer = if self.inset {
+            0
+        } else {
+            (1.25 * self.scale() + 0.5).ceil() as i32
+        };
+        let offset = if self.inset { 1.25 } else { 0.0 };
+        let inner = ((f32::from(self.thickness) + offset) * self.scale() + 0.5).ceil() as i32;
+        let corner = (self.radius().ceil() as i32 + inner).min(self.h / 2);
+        let span = self.w + 2 * outer;
+        let side_width = outer + inner;
         [
             Rect {
-                x: -pad,
-                y: -pad,
+                x: -outer,
+                y: -outer,
                 w: span,
-                h: corner + pad,
+                h: corner + outer,
             },
             Rect {
-                x: -pad,
+                x: -outer,
                 y: self.h - corner,
                 w: span,
-                h: corner + pad,
+                h: corner + outer,
             },
             Rect {
-                x: -pad,
+                x: -outer,
                 y: corner,
                 w: side_width,
                 h: self.h - 2 * corner,
             },
             Rect {
-                x: self.w - pad,
+                x: self.w - inner,
                 y: corner,
                 w: side_width,
                 h: self.h - 2 * corner,
@@ -135,9 +145,11 @@ impl Shape {
             dx.max(dy) - radius
         };
         let coverage = |limit: f32| (0.5 + limit * self.scale() - distance).clamp(0.0, 1.0);
-        let edge = coverage(0.35);
-        let ink = (edge - coverage(-0.95)) * f32::from(self.palette.line[3]);
-        let rim = (coverage(1.25) - edge) * f32::from(self.palette.rim[3]);
+        let offset = if self.inset { 1.25 } else { 0.0 };
+        let edge = coverage(0.35 - offset);
+        let ink = (edge - coverage(0.05 - f32::from(self.thickness) - offset))
+            * f32::from(self.palette.line[3]);
+        let rim = (coverage(1.25 - offset) - edge) * f32::from(self.palette.rim[3]);
         let channel = |n: usize| {
             ((f32::from(self.palette.line[n]) * ink + f32::from(self.palette.rim[n]) * rim) / 255.0)
                 .round() as u8
@@ -161,7 +173,11 @@ impl Shape {
             }
             return;
         }
-        let corner = self.radius().ceil() as i32 + 1;
+        let corner = self
+            .radius()
+            .max((f32::from(self.thickness) + 1.5) * self.scale())
+            .ceil() as i32
+            + 1;
         let start = (corner - strip.x).clamp(0, strip.w) as usize;
         let end = (self.w - corner - strip.x).clamp(start as i32, strip.w) as usize;
         for (y, row) in pixels.chunks_exact_mut(width).enumerate() {
@@ -185,7 +201,11 @@ pub struct FocusOutline {
 }
 
 impl FocusOutline {
-    pub fn show(&mut self, id: Id) {
+    pub fn show(&mut self, id: Id, thickness: u8, inset: bool) {
+        if thickness == 0 {
+            self.hide();
+            return;
+        }
         let Some((frame, work)) = native::outline_frame(id) else {
             self.hide();
             return;
@@ -198,6 +218,8 @@ impl FocusOutline {
             w: frame.w,
             h: frame.h,
             dpi: unsafe { GetDpiForWindow(self.windows[0]) }.max(96),
+            thickness,
+            inset,
             radius_dip: native::corner_radius_dip(id),
             palette: Palette::current(),
         };
@@ -395,12 +417,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thick_flush_outlines_grow_inward_at_both_dpis() {
+        for dpi in [96, 144] {
+            let thin = Shape {
+                w: 200,
+                h: 120,
+                dpi,
+                radius_dip: 8,
+                thickness: 1,
+                inset: true,
+                palette: Palette::NORMAL,
+            };
+            let thick = Shape {
+                thickness: 4,
+                ..thin
+            };
+            assert_eq!(thick.pixel(70, -1), 0);
+            assert_eq!(thick.pixel(-1, 40), 0);
+            let inward = (3.0 * thick.scale()) as i32;
+            assert_eq!(thin.pixel(70, inward), 0);
+            assert_ne!(thick.pixel(70, inward), 0);
+            assert_eq!(thick.pixel(0, 0), 0);
+        }
+    }
+
+    #[test]
     fn contour_tracks_square_small_and_round_windows_at_both_dpis() {
         for dpi in [96, 144] {
             let shape = Shape {
                 w: 240,
                 h: 180,
                 dpi,
+                thickness: 1,
+                inset: false,
                 radius_dip: 8,
                 palette: Palette::NORMAL,
             };
@@ -437,6 +486,8 @@ mod tests {
                 w: 312,
                 h: 226,
                 dpi,
+                thickness: 1,
+                inset: false,
                 radius_dip: 8,
                 palette: Palette::NORMAL,
             };

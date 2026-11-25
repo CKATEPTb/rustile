@@ -52,11 +52,10 @@ pub fn work_area() -> Option<Rect> {
     monitor_info(monitor).map(|info| rect(info.rcWork))
 }
 
-// The prototype tiles the primary monitor. Its visible frame needs room for
-// both the DWM corners and the focus outline, including on scaled displays.
-pub fn tile_gutter_px() -> i32 {
+// The prototype tiles the primary monitor, whose DPI is the system DPI.
+pub fn spacing_px(dip: u8) -> i32 {
     let dpi = unsafe { GetDpiForSystem() }.max(96) as i32;
-    (8 * dpi + 48) / 96
+    (i32::from(dip) * dpi + 48) / 96
 }
 
 /// Windows does not expose a composited corner radius. Follow the application's

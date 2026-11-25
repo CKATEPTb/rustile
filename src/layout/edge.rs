@@ -1,4 +1,4 @@
-use super::{Bsp, Cut, Direction, GAP, Grid, Layout, Rect, Shape};
+use super::{Bsp, Cut, Direction, Grid, Layout, Rect, Shape};
 
 impl Layout {
     // Moving outwards can turn a split: two windows beside one another become
@@ -13,11 +13,11 @@ impl Layout {
         }
         let mut scopes: Vec<_> = cells
             .iter()
-            .filter_map(|&r| from.joined(r, across))
+            .filter_map(|&r| from.joined(r, across, self.grid.gap))
             .collect();
-        if let Some((tree, order)) = Bsp::from_rects(area, &cells) {
+        if let Some((tree, order)) = Bsp::from_rects(area, &cells, self.grid.gap) {
             let at = order.iter().position(|&i| i == slot).unwrap();
-            scopes.extend(tree.ancestors(area, at));
+            scopes.extend(tree.ancestors(area, at, self.grid.gap));
         }
         scopes.sort_by_key(|r| i64::from(r.w) * i64::from(r.h));
         scopes.dedup();
@@ -29,7 +29,7 @@ impl Layout {
                 .filter(|&i| scope.contains(cells[i]))
                 .collect();
             let local: Vec<_> = slots.iter().map(|&i| cells[i]).collect();
-            let Some((mut tree, order)) = Bsp::from_rects(scope, &local) else {
+            let Some((mut tree, order)) = Bsp::from_rects(scope, &local, self.grid.gap) else {
                 continue;
             };
             let mut rest: Vec<_> = order.iter().map(|&i| slots[i]).collect();
@@ -60,13 +60,15 @@ impl Layout {
                 (across.bounds(rect).0, dir.axis().bounds(rect).0)
             });
             let mins: Vec<_> = rest.iter().map(|&i| self.occupants[i].min).collect();
-            for shape in Shape::candidates(rest.len(), scope) {
-                let mut grid = Grid::default();
+            for shape in Shape::candidates(rest.len(), scope, self.grid.gap) {
+                let mut grid = Grid::new(self.grid.gap);
                 grid.set_shape(shape);
                 if !grid.fit(scope, &mins) {
                     continue;
                 }
-                if let Some((packed, order)) = Bsp::from_rects(scope, &grid.rects(scope)) {
+                if let Some((packed, order)) =
+                    Bsp::from_rects(scope, &grid.rects(scope), self.grid.gap)
+                {
                     let order: Vec<_> = order.iter().map(|&i| rest[i]).collect();
                     if proposal.apply(self, &packed, &order) {
                         return true;
@@ -91,7 +93,7 @@ impl EdgeMove<'_> {
         let axis = self.dir.axis();
         let across = axis.perpendicular();
         let source = self.cells[self.slot];
-        let total = axis.length(self.scope) - GAP;
+        let total = axis.length(self.scope) - layout.grid.gap;
         if total < 2 {
             return false;
         }
@@ -99,8 +101,10 @@ impl EdgeMove<'_> {
         let area = i64::from(source.w) * i64::from(source.h);
         let width = i64::from(across.length(self.scope));
         let preferred = ((area + width / 2) / width) as i32;
-        let (needs, _) =
-            remaining.minimums(rest.iter().map(|&i| layout.occupants[i].min).collect());
+        let (needs, _) = remaining.minimums(
+            rest.iter().map(|&i| layout.occupants[i].min).collect(),
+            layout.grid.gap,
+        );
         let min = axis.min_dimension(layout.occupants[self.slot].min);
         let max = total - axis.min_dimension(needs[0]);
         let active = if min <= max {
@@ -115,11 +119,14 @@ impl EdgeMove<'_> {
             part: if first { active } else { total - active },
             whole: total,
         }
-        .parts(self.scope);
+        .parts(self.scope, layout.grid.gap);
         let (front, back) = if first { (a, b) } else { (b, a) };
         let mut rects = self.cells.to_vec();
         rects[self.slot] = front;
-        for (&i, r) in rest.iter().zip(remaining.rects(vec![back])) {
+        for (&i, r) in rest
+            .iter()
+            .zip(remaining.rects(vec![back], layout.grid.gap))
+        {
             if r.w <= 0 || r.h <= 0 {
                 return false;
             }
@@ -135,11 +142,15 @@ impl EdgeMove<'_> {
         if !candidate.rebuild_cells(self.area, &rects, shares) {
             return false;
         }
-        let (needs, children) = candidate.bsp.minimums(candidate.minimums(self.area));
+        let (needs, children) = candidate
+            .bsp
+            .minimums(candidate.minimums(self.area), layout.grid.gap);
         if self.area.w < needs[0].0 || self.area.h < needs[0].1 {
             return false;
         }
-        candidate.bsp.fit(vec![self.area], &children);
+        candidate
+            .bsp
+            .fit(vec![self.area], &children, layout.grid.gap);
         candidate.settle_invalid_pairs(self.area);
         let id = layout.occupants[self.slot].id;
         let slot = candidate.slot(id).expect("edge move keeps its window");

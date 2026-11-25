@@ -133,8 +133,8 @@ fn assert_horizontal_share(before: &Frames, after: &Frames, source: Id, neighbor
     } else {
         (moved, reduced, Direction::Left)
     };
-    let combined = old.joined(host, super::Axis::X).unwrap();
-    assert_eq!(upper.joined(lower, super::Axis::Y), Some(combined));
+    let combined = old.joined(host, super::Axis::X, GAP).unwrap();
+    assert_eq!(upper.joined(lower, super::Axis::Y, GAP), Some(combined));
     assert_above(upper, lower);
     assert_progress(old, moved, direction);
 }
@@ -296,13 +296,13 @@ fn a_filler_extending_past_the_host_can_reclaim_the_vacated_junction_tile() {
         }
     );
     assert_eq!(
-        after[&moving].joined(after[&host], super::Axis::X),
+        after[&moving].joined(after[&host], super::Axis::X, GAP),
         Some(original[&host])
     );
     assert_eq!(
         after[&filler],
         original[&moving]
-            .joined(original[&filler], super::Axis::X)
+            .joined(original[&filler], super::Axis::X, GAP)
             .unwrap()
     );
     for id in [bands[0][2], bands[1][1]] {
@@ -492,7 +492,7 @@ const BROWSER: Id = 2;
 const FOLDER: Id = 3;
 const TELEGRAM: Id = 4;
 
-// IDs 1 and 2 are the wide windows. IDs 3–6 are their four narrow neighbors.
+// IDs 1 and 2 are the wide windows. IDs 3вЂ“6 are their four narrow neighbors.
 fn explorer_junction(direction: Direction, source_width: i32, host_min: i32) -> (Layout, Rect) {
     let orient = |mut r: Rect| {
         if matches!(direction, Direction::Down | Direction::Right) {
@@ -505,11 +505,11 @@ fn explorer_junction(direction: Direction, source_width: i32, host_min: i32) -> 
         }
     };
     let area = orient(DESKTOP);
-    let (top, bottom) = super::Axis::Y.split_at(DESKTOP, 564);
-    let (top_left, host) = super::Axis::X.split_at(top, 948);
-    let (left, right) = super::Axis::X.split_at(bottom, top_left.w);
-    let (third, fourth) = super::Axis::X.split_at(left, 470);
-    let (fifth, sixth) = super::Axis::X.split_at(right, source_width);
+    let (top, bottom) = super::Axis::Y.split_at(DESKTOP, 564, GAP);
+    let (top_left, host) = super::Axis::X.split_at(top, 948, GAP);
+    let (left, right) = super::Axis::X.split_at(bottom, top_left.w, GAP);
+    let (third, fourth) = super::Axis::X.split_at(left, 470, GAP);
+    let (fifth, sixth) = super::Axis::X.split_at(right, source_width, GAP);
     let cells = [top_left, host, third, fourth, fifth, sixth].map(orient);
     let mut layout = Layout::default();
     for (i, min_width) in [160, host_min, 160, 160, 430, 160].into_iter().enumerate() {
@@ -554,7 +554,7 @@ fn narrow_window_enters_its_aligned_half_before_taking_the_wide_neighbors_slot()
             let mut shared = before.clone();
             shared.insert(source, in_host(old));
             shared.insert(2, in_host(adjacent));
-            shared.insert(donor, old.joined(adjacent, across).unwrap());
+            shared.insert(donor, old.joined(adjacent, across, GAP).unwrap());
             assert_eq!(layout.neighbor(source, dir, area), Some(2));
             assert!(layout.move_window(source, dir, area));
             assert_eq!(frames(&layout, area), shared, "{dir:?} from tile {source}");
@@ -576,11 +576,13 @@ fn junction_split_can_move_its_upper_divider_to_respect_the_hosts_minimum() {
     let original = frames(&layout, area);
     assert!(layout.move_window(5, Direction::Up, area));
     let shared = frames(&layout, area);
-    let (left, right) = super::Axis::X.split_at(original[&2], original[&2].w - GAP - 480);
+    let (left, right) = super::Axis::X.split_at(original[&2], original[&2].w - GAP - 480, GAP);
     assert_eq!([shared[&5], shared[&2]], [left, right]);
     assert_eq!(
         shared[&6],
-        original[&5].joined(original[&6], super::Axis::X).unwrap()
+        original[&5]
+            .joined(original[&6], super::Axis::X, GAP)
+            .unwrap()
     );
     for id in [1, 3, 4] {
         assert_eq!(shared[&id], original[&id]);
@@ -615,7 +617,7 @@ fn adjacent_junctions_keep_their_independent_second_presses() {
         assert_eq!(both[&id], right[&id]);
     }
     assert_eq!(
-        both[&3].joined(both[&1], super::Axis::X),
+        both[&3].joined(both[&1], super::Axis::X, GAP),
         Some(original[&1])
     );
     assert!(layout.move_window(5, Direction::Up, area));
@@ -655,7 +657,7 @@ fn junction_participants_use_their_displayed_tiles_for_subsequent_commands() {
         assert!(
             [super::Axis::X, super::Axis::Y]
                 .into_iter()
-                .any(|axis| split[&7].joined(split[&id], axis) == Some(shown[&id]))
+                .any(|axis| split[&7].joined(split[&id], axis, GAP) == Some(shown[&id]))
         );
         for (&other, &prev) in &shown {
             if other != id {
@@ -726,7 +728,7 @@ fn check_desktop(layout: &Layout) -> Frames {
     }
     let cells: Vec<_> = tiles.values().copied().collect();
     assert!(
-        super::bsp::Bsp::from_rects(DESKTOP, &cells).is_some(),
+        super::bsp::Bsp::from_rects(DESKTOP, &cells, GAP).is_some(),
         "{tiles:?}"
     );
     tiles
@@ -737,7 +739,7 @@ fn assert_above(upper: Rect, lower: Rect) {
     assert!(upper.x < lower.x + lower.w && lower.x < upper.x + upper.w);
 }
 
-// A Down preview in the left half of a 2×2 grid produces the same visible
+// A Down preview in the left half of a 2Г—2 grid produces the same visible
 // desktop as an already committed pair of tall columns.
 fn chat_and_telegram_columns(pending: bool) -> Layout {
     let mut layout = Layout::default();
@@ -858,7 +860,10 @@ fn narrow_stacked_windows_move_up_or_down_immediately() {
             assert!(layout.insert_with_minimum(id, area, (260, 200)));
         }
         let before = frames(&layout, area);
-        assert_eq!(before[&1].joined(before[&2], super::Axis::Y), Some(area));
+        assert_eq!(
+            before[&1].joined(before[&2], super::Axis::Y, GAP),
+            Some(area)
+        );
         assert!(layout.move_window(moving, direction, area));
         let taken = frames(&layout, area);
         assert_eq!([taken[&2], taken[&1]], [before[&1], before[&2]]);
@@ -1245,13 +1250,13 @@ fn folder_enters_the_lower_part_of_the_left_host_before_a_minimum_constrained_ta
         }
     );
     assert_eq!(
-        split[&FOLDER].joined(split[&TALL], super::Axis::Y),
+        split[&FOLDER].joined(split[&TALL], super::Axis::Y, GAP),
         Some(original[&TALL])
     );
     assert_eq!(
         split[&BROWSER],
         original[&BROWSER]
-            .joined(original[&FOLDER], super::Axis::Y)
+            .joined(original[&FOLDER], super::Axis::Y, GAP)
             .unwrap()
     );
     assert!(layout.move_window(FOLDER, Direction::Left, DESKTOP));
@@ -1285,7 +1290,7 @@ fn a_valid_junction_split_survives_a_takeover_that_cannot_fit_the_new_owner() {
     let shown = frames(&layout, DESKTOP);
     assert_progress(before[&FOLDER], shown[&FOLDER], Direction::Left);
     assert_eq!(
-        shown[&TALL].joined(shown[&FOLDER], super::Axis::Y),
+        shown[&TALL].joined(shown[&FOLDER], super::Axis::Y, GAP),
         Some(before[&TALL])
     );
     assert!(!layout.move_window(FOLDER, Direction::Left, DESKTOP));
@@ -1298,7 +1303,7 @@ fn a_valid_junction_split_survives_a_takeover_that_cannot_fit_the_new_owner() {
     assert!(
         [super::Axis::X, super::Axis::Y]
             .into_iter()
-            .any(|axis| remaining[&TALL].joined(remaining[&FOLDER], axis) == Some(DESKTOP))
+            .any(|axis| remaining[&TALL].joined(remaining[&FOLDER], axis, GAP) == Some(DESKTOP))
     );
 }
 
@@ -1326,7 +1331,7 @@ fn changing_commands_midway_through_a_constrained_move_keeps_every_window_valid(
         // The four rectangles must fill the workspace with only normal gutters.
         let cells: Vec<_> = placed.into_values().collect();
         assert!(
-            super::bsp::Bsp::from_rects(DESKTOP, &cells).is_some(),
+            super::bsp::Bsp::from_rects(DESKTOP, &cells, GAP).is_some(),
             "{cells:?}"
         );
     };

@@ -61,14 +61,14 @@ impl Rect {
 
     // Two tiles can share a single rectangular region exactly when their
     // touching edges have the same span and only the normal gutter between.
-    fn joined(self, other: Self, axis: Axis) -> Option<Self> {
+    fn joined(self, other: Self, axis: Axis, gap: i32) -> Option<Self> {
         let across = axis.perpendicular();
         if across.bounds(self) != across.bounds(other) {
             return None;
         }
         let (a, b) = axis.bounds(self);
         let (c, d) = axis.bounds(other);
-        if a.max(c) - b.min(d) != i64::from(GAP) {
+        if a.max(c) - b.min(d) != i64::from(gap) {
             return None;
         }
         let length = i32::try_from(b.max(d) - a.min(c)).ok()?;
@@ -88,9 +88,9 @@ impl Rect {
 
     // At a T, the narrow tile enters at its aligned outer edge. Return the
     // direction of the remaining half of the host, where its filler must lie.
-    fn entry_side(self, host: Self, movement: Direction) -> Option<Direction> {
+    fn entry_side(self, host: Self, movement: Direction, gap: i32) -> Option<Direction> {
         let across = movement.axis().perpendicular();
-        if movement.distance(self, host) != i64::from(GAP)
+        if movement.distance(self, host) != i64::from(gap)
             || across.length(self) >= across.length(host)
         {
             return None;
@@ -109,8 +109,8 @@ impl Rect {
     // For an L-shaped pair the shared outer edge fixes the new divider.
     // The narrower cell extends through both bands; the wider one's arm
     // remains confined to its original band.
-    fn corner_parts(self, other: Self, direction: Direction) -> Option<(Rect, Rect)> {
-        if direction.distance(self, other) != i64::from(GAP) {
+    fn corner_parts(self, other: Self, direction: Direction, gap: i32) -> Option<(Rect, Rect)> {
+        if direction.distance(self, other) != i64::from(gap) {
             return None;
         }
         let axis = direction.axis();
@@ -123,13 +123,13 @@ impl Rect {
         let (a, b) = across.bounds(narrow);
         let (c, d) = across.bounds(wide);
         let strip_start = if a == c {
-            b + i64::from(GAP)
+            b + i64::from(gap)
         } else if b == d {
             c
         } else {
             return None;
         };
-        let strip_length = across.length(wide) - across.length(narrow) - GAP;
+        let strip_length = across.length(wide) - across.length(narrow) - gap;
         if strip_length <= 0 {
             return None;
         }
@@ -137,7 +137,7 @@ impl Rect {
         let full_start = axis.bounds(narrow).0.min(axis.bounds(wide).0) as i32;
         let full_length = axis
             .length(narrow)
-            .checked_add(GAP)?
+            .checked_add(gap)?
             .checked_add(axis.length(wide))?;
         Some(match axis {
             Axis::Y => (
@@ -237,10 +237,16 @@ impl Axis {
             Self::Y => minimum.1,
         }
     }
-    fn divider_limits(self, region: Rect, first: Window, second: Window) -> Option<(i32, i32)> {
+    fn divider_limits(
+        self,
+        region: Rect,
+        first: Window,
+        second: Window,
+        gap: i32,
+    ) -> Option<(i32, i32)> {
         let across = self.perpendicular();
         let min = self.min_dimension(first.min);
-        let max = self.length(region) - GAP - self.min_dimension(second.min);
+        let max = self.length(region) - gap - self.min_dimension(second.min);
         (min <= max
             && across.length(region)
                 >= across
@@ -248,8 +254,8 @@ impl Axis {
                     .max(across.min_dimension(second.min)))
         .then_some((min, max))
     }
-    fn split_at(self, rect: Rect, first: i32) -> (Rect, Rect) {
-        let gap = GAP.min(self.length(rect));
+    fn split_at(self, rect: Rect, first: i32, gap: i32) -> (Rect, Rect) {
+        let gap = gap.min(self.length(rect));
         let second = self.length(rect) - gap - first;
         match self {
             Self::X => (
@@ -312,14 +318,20 @@ enum Partition {
 impl SharedPair {
     // Check both the displayed layout and its independent second presses.
     // In particular, a T junction can become a pinwheel with no full gutter.
-    fn can_freeze(pairs: &[Self], area: Rect, cells: &[Rect], windows: &[Window]) -> bool {
+    fn can_freeze(
+        pairs: &[Self],
+        area: Rect,
+        cells: &[Rect],
+        windows: &[Window],
+        gap: i32,
+    ) -> bool {
         let mut displayed = cells.to_vec();
         for pair in pairs {
-            if !pair.apply(&mut displayed, windows) {
+            if !pair.apply(&mut displayed, windows, gap) {
                 return false;
             }
         }
-        if Bsp::from_rects(area, &displayed).is_none() {
+        if Bsp::from_rects(area, &displayed, gap).is_none() {
             return false;
         }
         if pairs.len() < 2 {
@@ -334,7 +346,7 @@ impl SharedPair {
             }
             regions[pair.source] = Some((bounds, true));
         }
-        Bsp::separates_pairs(&mut regions.into_iter().flatten().collect::<Vec<_>>())
+        Bsp::separates_pairs(&mut regions.into_iter().flatten().collect::<Vec<_>>(), gap)
     }
 
     fn new(
@@ -343,11 +355,12 @@ impl SharedPair {
         direction: Direction,
         cells: &[Rect],
         windows: &[Window],
+        gap: i32,
     ) -> Option<Self> {
         let a = cells[source];
         let b = cells[target];
-        let Some(joined) = a.joined(b, direction.axis()) else {
-            let (through, arm) = a.corner_parts(b, direction)?;
+        let Some(joined) = a.joined(b, direction.axis(), gap) else {
+            let (through, arm) = a.corner_parts(b, direction, gap)?;
             // The arm lies wholly in one original slot. Only the through
             // tile can be an intermediate step between the two centers.
             return (direction.advances(a, through)
@@ -364,8 +377,8 @@ impl SharedPair {
         // Turn the seam so each window enters its neighbor's former area.
         // Sliding the existing seam would leave the active window in place.
         let axis = direction.axis().perpendicular();
-        let usable = axis.length(joined) - GAP;
-        let (min, max) = axis.divider_limits(joined, windows[source], windows[target])?;
+        let usable = axis.length(joined) - gap;
+        let (min, max) = axis.divider_limits(joined, windows[source], windows[target], gap)?;
         let source_first = axis == Axis::X || direction.towards_start();
         let source_length = (usable / 2 + usable % 2).clamp(min, max);
         let part = if source_first {
@@ -386,7 +399,7 @@ impl SharedPair {
         })
     }
 
-    fn rectangles(&self, cells: &[Rect], windows: &[Window]) -> Option<(Rect, Rect)> {
+    fn rectangles(&self, cells: &[Rect], windows: &[Window], gap: i32) -> Option<(Rect, Rect)> {
         let (axis, source_first, part, whole) = match self.partition {
             Partition::Divider {
                 axis,
@@ -396,36 +409,36 @@ impl SharedPair {
             } => (axis, source_first, part, whole),
             Partition::Corner => {
                 let (through, arm) =
-                    cells[self.source].corner_parts(cells[self.target], self.direction)?;
+                    cells[self.source].corner_parts(cells[self.target], self.direction, gap)?;
                 return (windows[self.source].fits(through) && windows[self.target].fits(arm))
                     .then_some((through, arm));
             }
             Partition::Enter { .. } => {
                 let (source, host) = (cells[self.source], cells[self.target]);
-                let side = source.entry_side(host, self.direction)?;
+                let side = source.entry_side(host, self.direction, gap)?;
                 let across = side.axis();
                 let (min, max) =
-                    across.divider_limits(host, windows[self.source], windows[self.target])?;
+                    across.divider_limits(host, windows[self.source], windows[self.target], gap)?;
                 let width = across.length(source).clamp(min, max);
                 if side.towards_start() {
                     let (host_part, entering) =
-                        across.split_at(host, across.length(host) - GAP - width);
+                        across.split_at(host, across.length(host) - gap - width, gap);
                     return Some((entering, host_part));
                 }
-                return Some(across.split_at(host, width));
+                return Some(across.split_at(host, width, gap));
             }
         };
-        let region = cells[self.source].joined(cells[self.target], self.direction.axis())?;
-        let total = axis.length(region) - GAP;
+        let region = cells[self.source].joined(cells[self.target], self.direction.axis(), gap)?;
+        let total = axis.length(region) - gap;
         let (first, second) = if source_first {
             (self.source, self.target)
         } else {
             (self.target, self.source)
         };
-        let (min, max) = axis.divider_limits(region, windows[first], windows[second])?;
+        let (min, max) = axis.divider_limits(region, windows[first], windows[second], gap)?;
         let first =
             ((i64::from(part) * i64::from(total) + i64::from(whole) / 2) / i64::from(whole)) as i32;
-        let (leading, trailing) = axis.split_at(region, first.clamp(min, max));
+        let (leading, trailing) = axis.split_at(region, first.clamp(min, max), gap);
         Some(if source_first {
             (leading, trailing)
         } else {
@@ -452,19 +465,19 @@ impl SharedPair {
         }
     }
 
-    fn apply(&self, cells: &mut [Rect], windows: &[Window]) -> bool {
-        let Some((source, target)) = self.rectangles(cells, windows) else {
+    fn apply(&self, cells: &mut [Rect], windows: &[Window], gap: i32) -> bool {
+        let Some((source, target)) = self.rectangles(cells, windows, gap) else {
             return false;
         };
         if let Some(filler) = self.filler() {
             let old = cells[self.source];
-            let Some(side) = old.entry_side(cells[self.target], self.direction) else {
+            let Some(side) = old.entry_side(cells[self.target], self.direction, gap) else {
                 return false;
             };
-            let Some(expanded) = old.joined(cells[filler], side.axis()) else {
+            let Some(expanded) = old.joined(cells[filler], side.axis(), gap) else {
                 return false;
             };
-            if side.distance(old, cells[filler]) != i64::from(GAP)
+            if side.distance(old, cells[filler]) != i64::from(gap)
                 || !windows[filler].fits(expanded)
             {
                 return false;
@@ -509,15 +522,37 @@ pub struct Layout {
 }
 
 impl Layout {
+    pub fn with_gap(gap: i32) -> Self {
+        Self {
+            grid: Grid::new(gap),
+            ..Self::default()
+        }
+    }
+
+    /// Keep the existing tracks, BSP cuts and pending moves whenever their
+    /// occupants fit the new spacing. Nothing is applied on failure.
+    pub fn with_spacing(mut self, area: Rect, gap: i32) -> Option<Self> {
+        self.grid.gap = gap;
+        let minima = self.occupants.iter().map(|window| window.min).collect();
+        let (roots, children) = self.bsp.minimums(minima, gap);
+        if !self.grid.fit(area, &roots) {
+            return None;
+        }
+        self.bsp.fit(self.grid.rects(area), &children, gap);
+        self.last_area = Some(area);
+        self.settle_invalid_pairs(area);
+        Some(self)
+    }
+
     pub fn cell_rects(&self, area: Rect) -> Vec<Rect> {
-        self.bsp.rects(self.grid.rects(area))
+        self.bsp.rects(self.grid.rects(area), self.grid.gap)
     }
 
     pub fn placements(&self, area: Rect) -> Vec<(Id, Rect)> {
         let mut visible = self.cell_rects(area);
         for pair in &self.shared {
             // Pending moves have disjoint participants.
-            pair.apply(&mut visible, &self.occupants);
+            pair.apply(&mut visible, &self.occupants, self.grid.gap);
         }
         self.occupants.iter().map(|w| w.id).zip(visible).collect()
     }
@@ -565,10 +600,16 @@ impl Layout {
             return;
         }
         let cells = self.cell_rects(area);
-        if !SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants) {
+        if !SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants, self.grid.gap) {
             for pair in std::mem::take(&mut self.shared) {
                 self.shared.push(pair);
-                if !SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants) {
+                if !SharedPair::can_freeze(
+                    &self.shared,
+                    area,
+                    &cells,
+                    &self.occupants,
+                    self.grid.gap,
+                ) {
                     self.dismiss_pair(self.shared.len() - 1, &cells);
                 }
             }
@@ -582,7 +623,7 @@ impl Layout {
 
     fn grid_for(&self, windows: &[Window], area: Rect) -> Option<Grid> {
         let minima: Vec<_> = windows.iter().map(|w| w.min).collect();
-        Shape::candidates(windows.len(), area)
+        Shape::candidates(windows.len(), area, self.grid.gap)
             .into_iter()
             .find_map(|shape| {
                 let mut grid = self.grid.clone();
@@ -617,7 +658,7 @@ impl Layout {
     fn freeze_pair(&mut self, index: usize, area: Rect) -> bool {
         let pair = &self.shared[index];
         let mut cells = self.cell_rects(area);
-        if !pair.apply(&mut cells, &self.occupants) {
+        if !pair.apply(&mut cells, &self.occupants, self.grid.gap) {
             self.dismiss_pair(index, &cells);
             return false;
         }
@@ -634,7 +675,7 @@ impl Layout {
     }
 
     fn rebuild_cells(&mut self, area: Rect, cells: &[Rect], shared: Vec<SharedPair>) -> bool {
-        let Some((bsp, order)) = Bsp::from_rects(area, cells) else {
+        let Some((bsp, order)) = Bsp::from_rects(area, cells, self.grid.gap) else {
             return false;
         };
         self.shared = shared;
@@ -651,7 +692,8 @@ impl Layout {
             pair.remap(|old| slots[old]);
         }
         self.bsp = bsp;
-        self.grid.set_shape(Shape::candidates(1, area)[0]);
+        self.grid
+            .set_shape(Shape::candidates(1, area, self.grid.gap)[0]);
         true
     }
 
@@ -699,7 +741,7 @@ impl Layout {
                 let mut candidate = base.clone();
                 let across = axis.perpendicular();
                 let along_min = i64::from(axis.min_dimension(old.min))
-                    + i64::from(GAP)
+                    + i64::from(self.grid.gap)
                     + i64::from(axis.min_dimension(new.min));
                 if !allow_growth
                     && (i64::from(axis.length(rect)) < along_min
@@ -711,7 +753,9 @@ impl Layout {
                     continue;
                 }
                 candidate.bsp.0.push(Cut::half(at, axis));
-                let (root_minima, children) = candidate.bsp.minimums(candidate.minimums(area));
+                let (root_minima, children) = candidate
+                    .bsp
+                    .minimums(candidate.minimums(area), self.grid.gap);
                 if allow_growth && !candidate.grid.fit(area, &root_minima) {
                     continue;
                 }
@@ -723,7 +767,7 @@ impl Layout {
                 {
                     continue;
                 }
-                candidate.bsp.fit(root_rects, &children);
+                candidate.bsp.fit(root_rects, &children, self.grid.gap);
                 candidate.settle_invalid_pairs(area);
                 candidate.last_area = Some(area);
                 *self = candidate;
@@ -799,10 +843,11 @@ impl Layout {
             pair.remap(remap);
         }
         let area = self.last_area.expect("admitted windows have a work area");
-        let (minimums, children) = self.bsp.minimums(self.minimums(area));
+        let (minimums, children) = self.bsp.minimums(self.minimums(area), self.grid.gap);
         let fits = self.grid.fit(area, &minimums);
         debug_assert!(fits, "removing a leaf only releases space");
-        self.bsp.fit(self.grid.rects(area), &children);
+        self.bsp
+            .fit(self.grid.rects(area), &children, self.grid.gap);
         self.settle_invalid_pairs(area);
     }
 
@@ -840,10 +885,10 @@ impl Layout {
             // A narrower window can enter the facing portion of its host if
             // an adjacent tile in its old row can reclaim the vacancy.
             let filler = neighbor.and_then(|target| {
-                let side = from.entry_side(visible[target].1, direction)?;
+                let side = from.entry_side(visible[target].1, direction, self.grid.gap)?;
                 visible.iter().position(|&(_, r)| {
-                    side.distance(from, r) == i64::from(GAP)
-                        && from.joined(r, side.axis()).is_some()
+                    side.distance(from, r) == i64::from(self.grid.gap)
+                        && from.joined(r, side.axis(), self.grid.gap).is_some()
                 })
             });
             let entered = filler.is_some()
@@ -920,11 +965,18 @@ impl Layout {
                 direction,
                 partition: Partition::Enter { filler },
             }),
-            None => SharedPair::new(source, target, direction, &cells, &self.occupants),
+            None => SharedPair::new(
+                source,
+                target,
+                direction,
+                &cells,
+                &self.occupants,
+                self.grid.gap,
+            ),
         };
         if let Some(pair) = pair {
             self.shared.push(pair);
-            if SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants) {
+            if SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants, self.grid.gap) {
                 return true;
             }
             self.shared.pop();
@@ -941,12 +993,12 @@ impl Layout {
         // only as required by the windows' minimums in their new slots.
         let mut minima = self.minimums(area);
         minima.swap(source, target);
-        let (roots, children) = self.bsp.minimums(minima);
+        let (roots, children) = self.bsp.minimums(minima, self.grid.gap);
         let mut grid = self.grid.clone();
         if !grid.refit(area, &roots) {
             return false;
         }
-        self.bsp.fit(grid.rects(area), &children);
+        self.bsp.fit(grid.rects(area), &children, self.grid.gap);
         self.grid = grid;
         self.occupants.swap(source, target);
         self.settle_invalid_pairs(area);
@@ -980,7 +1032,7 @@ impl Layout {
             }
             let pair = &mut self.shared[index];
             companion = pair.other(slot);
-            let (source, target) = pair.rectangles(&cells, &self.occupants)?;
+            let (source, target) = pair.rectangles(&cells, &self.occupants, self.grid.gap)?;
             let previous = pair.partition;
             let Partition::Divider {
                 axis,
@@ -1009,20 +1061,30 @@ impl Layout {
                 let minimums = if *source_first { (a, b) } else { (b, a) };
                 *part = shifted_divider(axis.length(first), total, minimums, direction, shrink)?;
                 *whole = total;
-                if !SharedPair::can_freeze(&self.shared, area, &cells, &self.occupants) {
+                if !SharedPair::can_freeze(
+                    &self.shared,
+                    area,
+                    &cells,
+                    &self.occupants,
+                    self.grid.gap,
+                ) {
                     self.shared[index].partition = previous;
                     return None;
                 }
                 return Some(edge);
             }
         }
-        let (root_minima, children) = self.bsp.minimums(self.minimums(area));
+        let (root_minima, children) = self.bsp.minimums(self.minimums(area), self.grid.gap);
         let roots = self.grid.rects(area);
         let count = roots.len();
-        let edge = if let Some(edge) = self
-            .bsp
-            .resize(slot, direction, shrink, roots, companion, &children)
-        {
+        let edge = if let Some(edge) = self.bsp.resize(
+            slot,
+            (direction, shrink),
+            roots,
+            companion,
+            &children,
+            self.grid.gap,
+        ) {
             edge
         } else {
             self.grid.resize(
@@ -1034,7 +1096,8 @@ impl Layout {
                 &root_minima,
             )?
         };
-        self.bsp.fit(self.grid.rects(area), &children);
+        self.bsp
+            .fit(self.grid.rects(area), &children, self.grid.gap);
         self.settle_invalid_pairs(area);
         Some(edge)
     }
@@ -1086,6 +1149,63 @@ fn nearest(origin: Rect, direction: Direction, rects: impl Iterator<Item = Rect>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_swapping_and_resizing_use_the_configured_gap() {
+        let area = Rect {
+            x: -30,
+            y: 15,
+            w: 1100,
+            h: 780,
+        };
+        for gap in [0, 23] {
+            let mut layout = Layout::with_gap(gap);
+            assert!(layout.insert(1, area));
+            assert!(layout.insert_near(2, 1, area, (MIN_WIDTH, MIN_HEIGHT)));
+            let start = layout.placements(area);
+            assert!(layout.move_window(2, Direction::Left, area));
+            let shared = layout.placements(area);
+            assert_eq!(shared[0].1.joined(shared[1].1, Axis::Y, gap), Some(area));
+            assert!(layout.move_window(2, Direction::Left, area));
+            let moved = layout.placements(area);
+            assert!(moved.contains(&(2, start[0].1)));
+            assert!(moved.contains(&(1, start[1].1)));
+            assert!(layout.resize(2, Direction::Right, false, area).is_some());
+            let resized = layout.placements(area);
+            assert_eq!(resized[0].1.joined(resized[1].1, Axis::X, gap), Some(area));
+        }
+    }
+
+    #[test]
+    fn spacing_changes_preserve_bsp_order_and_enforce_native_minima() {
+        let area = Rect {
+            x: 11,
+            y: 19,
+            w: 910,
+            h: 500,
+        };
+        let mut layout = Layout::with_gap(0);
+        assert!(layout.insert_with_minimum(1, area, (450, 150)));
+        assert!(layout.insert_near(2, 1, area, (450, 150)));
+        assert!(layout.insert_near(3, 2, area, (450, 150)));
+        let frames = |layout: &Layout| {
+            let frames: std::collections::BTreeMap<_, _> =
+                layout.placements(area).into_iter().collect();
+            [frames[&1], frames[&2], frames[&3]]
+        };
+        let [left, upper, lower] = frames(&layout);
+        assert_eq!(left.x + left.w, upper.x);
+        assert_eq!(upper.y + upper.h, lower.y);
+        assert!(layout.clone().with_spacing(area, 11).is_none());
+        let adjusted = layout.with_spacing(area, 10).unwrap();
+        let [left, upper, lower] = frames(&adjusted);
+        assert_eq!(left.w, 450);
+        assert_eq!(upper.w, 450);
+        assert_eq!(left.x + left.w + 10, upper.x);
+        assert_eq!(upper.y + upper.h + 10, lower.y);
+        assert_eq!(lower.x + lower.w, area.x + area.w);
+        assert_eq!(lower.y + lower.h, area.y + area.h);
+    }
 
     #[test]
     fn moving_the_wide_tile_into_a_corner_shares_then_takes_the_exact_slot() {

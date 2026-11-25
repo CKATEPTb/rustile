@@ -8,6 +8,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::hud::{FocusOutline, ResizeHud};
 use crate::layout::{Direction, Id, Layout, Rect};
 use crate::native::{self, Original};
+use crate::settings::Settings;
 
 #[cfg(test)]
 mod desktop_test;
@@ -29,6 +30,7 @@ struct TrackedWindow {
 }
 
 pub struct Manager {
+    settings: Settings,
     layout: Layout,
     windows: HashMap<Id, TrackedWindow>,
     last_foreground: Option<Id>,
@@ -41,13 +43,19 @@ pub struct Manager {
 }
 
 impl Manager {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_settings(Settings::default())
+    }
+
+    pub fn with_settings(settings: Settings) -> Self {
         Self {
-            layout: Layout::default(),
+            settings,
+            layout: Layout::with_gap(native::spacing_px(settings.gap)),
             windows: HashMap::new(),
             last_foreground: None,
             focus_history: Vec::new(),
-            area: tiling_area(),
+            area: tiling_area(settings),
             dragging: None,
             session: None,
             hud: ResizeHud::default(),
@@ -58,14 +66,98 @@ impl Manager {
     // Subscribe before the initial inventory so windows opened during startup
     // are reconciled from the event queue.
     pub fn sync(&mut self) {
+        if !self.settings.enabled {
+            return;
+        }
         let foreground = native::foreground();
-        self.area = tiling_area();
+        let resume = !self.windows.is_empty();
+        // A paused manager may have missed a destroyed, hidden or reused HWND.
+        let tracked: Vec<_> = self.windows.keys().copied().collect();
+        for id in tracked {
+            if !self.windows[&id].original.matches(id) {
+                self.forget(id);
+            } else if !native::eligible(id) {
+                self.layout.remove(id);
+                self.focus_history.retain(|&prior| prior != id);
+            } else {
+                self.windows.get_mut(&id).unwrap().original.refresh_frame();
+            }
+        }
+        for window in self.windows.values_mut() {
+            window.requested = None;
+        }
+        self.remember_tile(foreground);
         for id in native::enumerate() {
-            self.admit(id, None);
+            if self.layout.contains(id) {
+                continue;
+            }
+            if resume {
+                if native::eligible(id) {
+                    self.admit_new(id);
+                }
+            } else {
+                self.admit(id, None);
+            }
         }
         self.last_foreground = Some(foreground);
         self.remember_tile(foreground);
         self.apply();
+    }
+
+    #[cfg(test)]
+    pub fn apply_settings(&mut self, updated: Settings) -> Result<(), String> {
+        self.apply_settings_with(updated, || Ok(()))
+    }
+
+    pub fn apply_settings_with(
+        &mut self,
+        updated: Settings,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let previous = self.settings;
+        let resuming = updated.enabled && !previous.enabled;
+        let geometry = updated.gap != previous.gap || updated.padding != previous.padding;
+        let proposed = if geometry || resuming {
+            let area = tiling_area(updated)
+                .ok_or_else(|| "Windows не сообщила размер рабочей области.".to_owned())?;
+            // Validate the whole layout before changing the live model or any HWND.
+            let mut layout = self.layout.clone();
+            if !previous.enabled {
+                for (&id, window) in &self.windows {
+                    if !window.original.matches(id) || !native::eligible(id) {
+                        layout.remove(id);
+                    }
+                }
+            }
+            let next = layout
+                .with_spacing(area, native::spacing_px(updated.gap))
+                .ok_or_else(|| {
+                    "С такими отступами окна не помещаются. Уменьшите отступ.".to_owned()
+                })?;
+            Some((area, next))
+        } else {
+            None
+        };
+        persist()?;
+        if let Some((area, layout)) = proposed {
+            self.area = Some(area);
+            self.layout = layout;
+        }
+        self.settings = updated;
+        if geometry || !updated.enabled {
+            // Keep the visible preview when the user pauses the current arrangement.
+            self.finish_mode(true);
+        }
+        if !updated.enabled {
+            self.dragging = None;
+            self.outline.hide();
+        } else if resuming {
+            self.sync();
+        } else if geometry {
+            self.apply();
+        }
+        self.refresh_focus();
+        Ok(())
     }
 
     fn forget(&mut self, id: Id) {
@@ -134,6 +226,9 @@ impl Manager {
     }
 
     pub fn event(&mut self, event: u32, id: Id) {
+        if !self.settings.enabled {
+            return;
+        }
         // Events arrive in order, but GetForegroundWindow can already describe
         // a later launch when the message loop drains several events together.
         if event == EVENT_SYSTEM_FOREGROUND {
@@ -225,9 +320,11 @@ impl Manager {
     }
 
     fn can_act_on(&self, target: Id) -> bool {
-        self.windows
-            .get(&target)
-            .is_some_and(|w| w.original.matches(target))
+        self.settings.enabled
+            && self
+                .windows
+                .get(&target)
+                .is_some_and(|w| w.original.matches(target))
             && native::eligible(target)
     }
 
@@ -262,6 +359,9 @@ impl Manager {
     // Sample foreground once so the cue and the keyboard target agree, including
     // when a modal dialog receives focus while its owner is still tiled.
     pub fn refresh_focus(&mut self) -> Option<Id> {
+        if !self.settings.enabled {
+            return None;
+        }
         let id = native::foreground();
         if self
             .session
@@ -276,7 +376,8 @@ impl Manager {
                 .get(&id)
                 .is_some_and(|w| w.original.matches(id))
         {
-            self.outline.show(id);
+            self.outline
+                .show(id, self.settings.outline, self.settings.gap == 0);
             Some(id)
         } else {
             self.outline.hide();
@@ -327,27 +428,35 @@ impl Manager {
     }
 
     pub fn focus(&mut self, direction: Direction) {
+        if !self.settings.enabled {
+            return;
+        }
         let Some(area) = self.area else { return };
         if let Some(id) = self.layout.neighbor(native::foreground(), direction, area) {
             native::focus(id);
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn restore_positions(&mut self) {
         self.session = None;
         self.outline.hide();
         self.hud.hide();
         for (id, window) in self.windows.drain() {
             native::restore(id, &window.original);
         }
-        self.layout = Layout::default();
+        self.layout = Layout::with_gap(native::spacing_px(self.settings.gap));
+        self.dragging = None;
         self.focus_history.clear();
         self.last_foreground = None;
     }
+
+    pub fn shutdown(&mut self) {
+        self.restore_positions();
+    }
 }
 
-fn tiling_area() -> Option<Rect> {
-    native::work_area().map(|area| area.inset_for_tiles(native::tile_gutter_px()))
+fn tiling_area(settings: Settings) -> Option<Rect> {
+    native::work_area().map(|area| area.inset_for_tiles(native::spacing_px(settings.padding)))
 }
 
 impl Drop for Manager {

@@ -2,6 +2,7 @@ mod shortcuts;
 
 use std::cell::RefCell;
 use std::io;
+use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -24,6 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
+use crate::settings::{Command, Modifier, Settings};
+use crate::tray::Tray;
 
 const START_RESIZE: i32 = 1;
 const QUIT: i32 = 2;
@@ -228,7 +231,58 @@ fn dispatch(manager: &mut Manager, target: isize, command: i32) {
     }
 }
 
-fn pump(manager: &mut Manager) -> Result<(), String> {
+fn show_error(detail: &str) {
+    let message: Vec<u16> = detail.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            message.as_ptr(),
+            windows_sys::w!("Rustile"),
+            MB_ICONWARNING | MB_OK,
+        )
+    };
+}
+
+struct Preferences<'a> {
+    live: Settings,
+    saved: Settings,
+    path: &'a Path,
+}
+
+impl Preferences<'_> {
+    fn apply(
+        &mut self,
+        manager: &mut Manager,
+        hook: &shortcuts::Hook,
+        tray: &mut Tray,
+        command: Command,
+    ) -> Result<(), String> {
+        let next = self.live.changed(command)?;
+        // The command-line resize shortcut applies only to this launch unless
+        // the user explicitly chooses a new resize binding in the tray.
+        let saved = self.saved.changed(command)?;
+        let write = (saved != self.saved)
+            .then(|| saved.prepare(self.path))
+            .transpose()?;
+        manager.apply_settings_with(next, || write.map_or(Ok(()), |pending| pending.commit()))?;
+        if command == Command::Restore {
+            manager.restore_positions();
+        }
+        self.live = next;
+        self.saved = saved;
+        hook.set_settings(next);
+        tray.set_settings(next);
+        refresh(manager, 0);
+        Ok(())
+    }
+}
+
+fn pump(
+    manager: &mut Manager,
+    hook: &shortcuts::Hook,
+    tray: &mut Tray,
+    preferences: &mut Preferences<'_>,
+) -> Result<(), String> {
     let mut message = MSG::default();
     let mut events = Vec::new();
     loop {
@@ -254,21 +308,29 @@ fn pump(manager: &mut Manager) -> Result<(), String> {
         }
         if message.message == OUTLINE_SETTINGS_CHANGED {
             refresh(manager, 0);
-            continue;
+        } else if message.message == KEY_COMMAND {
+            // A window can lose focus between its physical key-down and delivery.
+            let target = message.lParam;
+            let command = (message.wParam & 0xff) as i32;
+            let ticket = message.wParam >> 8;
+            if target != 0 && target == crate::native::foreground() {
+                dispatch(manager, target, command);
+            }
+            refresh(manager, ticket);
+        } else {
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
-        if message.message != KEY_COMMAND {
-            unsafe { DispatchMessageW(&message) };
-            continue;
+        while let Some(command) = tray.take_command() {
+            if command == Command::Exit {
+                return Ok(());
+            }
+            if let Err(detail) = preferences.apply(manager, hook, tray, command) {
+                show_error(&detail);
+            }
         }
-
-        // A window can lose focus between its physical key-down and delivery.
-        let target = message.lParam;
-        let command = (message.wParam & 0xff) as i32;
-        let ticket = message.wParam >> 8;
-        if target != 0 && target == crate::native::foreground() {
-            dispatch(manager, target, command);
-        }
-        refresh(manager, ticket);
     }
 }
 struct Instance(HANDLE);
@@ -334,23 +396,37 @@ const USAGE: &str = "rustile [--resize-shortcut win+enter|ctrl+alt+enter]\nПо 
 
 pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mods, label) = match args.as_slice() {
-        [] => (MOD_WIN, "Win+Enter"),
+    let resize_override = match args.as_slice() {
+        [] => None,
         [flag] if flag == "--help" || flag == "-h" => {
             println!("{USAGE}");
             return Ok(());
         }
         [flag, value] if flag == "--resize-shortcut" && value.eq_ignore_ascii_case("win+enter") => {
-            (MOD_WIN, "Win+Enter")
+            Some(Modifier::Win)
         }
         [flag, value]
             if flag == "--resize-shortcut" && value.eq_ignore_ascii_case("ctrl+alt+enter") =>
         {
-            (MOD_CONTROL | MOD_ALT, "Ctrl+Alt+Enter")
+            Some(Modifier::CtrlAlt)
         }
         _ => return Err(USAGE.to_owned()),
     };
     let _instance = Instance::acquire()?;
+    let path = Settings::path()?;
+    let (saved, load_warning) = match Settings::load(&path) {
+        Ok(value) => (value, None),
+        Err(detail) => (Settings::default(), Some(detail)),
+    };
+    let mut live = saved;
+    if let Some(modifier) = resize_override {
+        live.resize = modifier;
+    }
+    let mut preferences = Preferences {
+        live,
+        saved,
+        path: &path,
+    };
     // Establish the thread message queue before any callback can post to it.
     unsafe { PeekMessageW(&mut MSG::default(), null_mut(), 0, 0, PM_NOREMOVE) };
     let mut bindings = Hotkeys::default();
@@ -361,11 +437,6 @@ pub fn run() -> Result<(), String> {
         "Ctrl+Alt+Shift+Q",
     );
     let console = ConsoleHandler::install();
-    if let (Err(key), Err(handler)) = (&quit, &console) {
-        return Err(format!(
-            "{key}. {handler}. Для запуска необходим способ штатного выхода."
-        ));
-    }
     match &quit {
         Err(error) => eprintln!("{error}"),
         Ok(()) => println!("Ctrl+Alt+Shift+Q — выйти и восстановить окна."),
@@ -374,17 +445,16 @@ pub fn run() -> Result<(), String> {
         Err(error) => eprintln!("{error}"),
         Ok(_) => println!("Ctrl+C в консоли Rustile — выйти и восстановить окна."),
     }
-    let keyboard = shortcuts::Hook::install(mods)?;
+    let mut tray = Tray::new(live)?;
+    let keyboard = shortcuts::Hook::install(live)?;
     let hooks = EventHooks::install()?;
-    let mut manager = Manager::new();
+    let mut manager = Manager::with_settings(live);
     manager.sync();
     refresh(&mut manager, 0);
-    println!("Win+стрелки — перевести фокус между плитками.");
-    println!("Win+Shift+стрелка — переместить плитку.");
-    println!(
-        "{label} — изменить размер. Стрелки двигают разделитель в обе стороны, Shift+стрелка сужает плитку с выбранной стороны. Win можно удерживать. Enter — применить, Esc — отменить."
-    );
-    let result = pump(&mut manager);
+    if let Some(warning) = load_warning {
+        show_error(&format!("Применены настройки по умолчанию.\n\n{warning}"));
+    }
+    let result = pump(&mut manager, &keyboard, &mut tray, &mut preferences);
     drop(keyboard);
     drop(hooks);
     drop(bindings);

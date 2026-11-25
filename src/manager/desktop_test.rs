@@ -785,6 +785,48 @@ fn move_windows() {
     run(share_upper_tile_in_six_windows);
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));
+    run(|manager, windows, _| {
+        let settings = manager.settings;
+        let area = super::tiling_area(settings).unwrap();
+        manager.area = Some(area);
+        let id = windows[0];
+        assert!(manager.admit(id, None));
+        // Give the fixture a known minimum that just fits the area. Real HWND
+        // placement and persistence must both stay untouched if padding fails.
+        manager.layout = super::Layout::with_gap(native::spacing_px(settings.gap));
+        assert!(
+            manager
+                .layout
+                .insert_with_minimum(id, area, (area.w, area.h))
+        );
+        manager.apply();
+        settle(manager, 1);
+        let mut tighter = settings;
+        tighter.padding += 1;
+        assert!(
+            manager
+                .apply_settings_with(tighter, || panic!("invalid spacing reached disk"))
+                .is_err()
+        );
+        assert_eq!(manager.settings, settings);
+        assert_eq!(frame(id), area);
+
+        let mut paused = settings;
+        paused.enabled = false;
+        assert!(
+            manager
+                .apply_settings_with(paused, || Err("read-only configuration".into()))
+                .is_err()
+        );
+        assert_eq!(manager.settings, settings);
+        manager.apply_settings(paused).unwrap();
+        manager.event(EVENT_OBJECT_SHOW, windows[1]);
+        assert!(!manager.begin_resize(id));
+        assert!(manager.refresh_focus().is_none());
+        assert_eq!(manager.layout.placements(area), [(id, area)]);
+        assert_eq!(frame(id), area);
+        manager.restore_positions();
+    });
     // A stale --exact test name would otherwise let libtest exit successfully.
     unsafe {
         assert_ne!(
