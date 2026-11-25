@@ -23,14 +23,14 @@ use crate::settings::Command;
 pub(super) struct Colors {
     pub background: COLORREF,
     pub border: COLORREF,
-    text: COLORREF,
-    secondary: COLORREF,
-    disabled: COLORREF,
-    control: COLORREF,
-    hover: COLORREF,
-    hover_text: COLORREF,
-    accent: COLORREF,
-    on_accent: COLORREF,
+    pub(super) text: COLORREF,
+    pub(super) secondary: COLORREF,
+    pub(super) disabled: COLORREF,
+    pub(super) control: COLORREF,
+    pub(super) hover: COLORREF,
+    pub(super) hover_text: COLORREF,
+    pub(super) accent: COLORREF,
+    pub(super) on_accent: COLORREF,
     pub dark: bool,
 }
 
@@ -110,10 +110,10 @@ impl Colors {
 }
 
 pub(super) struct Fonts {
-    regular: HFONT,
-    small: HFONT,
-    heading: HFONT,
-    symbol: HFONT,
+    pub(super) regular: HFONT,
+    pub(super) small: HFONT,
+    pub(super) heading: HFONT,
+    pub(super) symbol: HFONT,
 }
 
 impl Fonts {
@@ -159,7 +159,7 @@ impl Drop for Fonts {
     }
 }
 
-fn fill(dc: HDC, rect: &RECT, color: COLORREF, radius: i32) {
+pub(super) fn fill(dc: HDC, rect: &RECT, color: COLORREF, radius: i32) {
     unsafe {
         let brush = GetStockObject(DC_BRUSH);
         SetDCBrushColor(dc, color);
@@ -183,7 +183,14 @@ fn fill(dc: HDC, rect: &RECT, color: COLORREF, radius: i32) {
     }
 }
 
-fn text(dc: HDC, mut rect: RECT, value: &str, font: HFONT, color: COLORREF, flags: u32) -> i32 {
+pub(super) fn text(
+    dc: HDC,
+    mut rect: RECT,
+    value: &str,
+    font: HFONT,
+    color: COLORREF,
+    flags: u32,
+) -> i32 {
     let wide: Vec<u16> = value.encode_utf16().collect();
     unsafe {
         let old = SelectObject(dc, font);
@@ -336,10 +343,7 @@ impl Painter<'_> {
         }
 
         let mid = (rc.top + rc.bottom) / 2;
-        let left_gutter = header
-            || !row.glyph.is_empty()
-            || row.checked
-            || matches!(row.action, Action::Apply(_));
+        let left_gutter = header || !row.glyph.is_empty() || matches!(row.action, Action::Apply(_));
         let mut label = RECT {
             left: p(if left_gutter { 40 } else { 12 }),
             right: rc.right - p(12),
@@ -361,7 +365,7 @@ impl Painter<'_> {
                 )
             };
         } else {
-            let icon = if row.checked { "\u{e73e}" } else { row.glyph };
+            let icon = row.glyph;
             if !icon.is_empty() {
                 text(
                     dc,
@@ -372,28 +376,12 @@ impl Painter<'_> {
                     },
                     icon,
                     self.fonts.symbol,
-                    if row.checked && !selected { accent } else { fg },
+                    fg,
                     DT_CENTER,
                 );
             }
         }
 
-        if matches!(row.action, Action::Open(_)) {
-            // The chevron uses the same native icon family as the leading glyph.
-            text(
-                dc,
-                RECT {
-                    left: rc.right - p(29),
-                    right: rc.right - p(7),
-                    ..rc
-                },
-                "\u{e76c}",
-                self.fonts.symbol,
-                sub,
-                DT_CENTER,
-            );
-            label.right -= p(20);
-        }
         if matches!(row.action, Action::Apply(Command::Toggle)) {
             let right = rc.right - p(10);
             let pill = RECT {

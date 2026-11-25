@@ -78,7 +78,7 @@ impl State {
     }
 
     pub(super) fn refresh_rows(&self, hwnd: HWND) {
-        let rows = menu::rows(self.page.get(), self.settings.get());
+        let rows = menu::rows(self.settings.get());
         for (index, row) in rows.iter().enumerate() {
             let btn = row_hwnd(hwnd, index);
             if btn.is_null() {
@@ -161,19 +161,6 @@ impl State {
             }
         }
         self.enable_arrows(hwnd, index, m);
-    }
-
-    pub(super) fn hide_arrows(&self, hwnd: HWND) {
-        for (i, row) in self.entries.borrow().iter().enumerate() {
-            if matches!(row.action, Action::Adjust(_)) {
-                for offset in 0..2 {
-                    let id = ARROW_BASE + 2 * i + offset;
-                    unsafe {
-                        ShowWindow(GetDlgItem(hwnd, id as i32), SW_HIDE);
-                    }
-                }
-            }
-        }
     }
 
     pub(super) fn arrow_click(&self, hwnd: HWND, index: usize, increasing: bool) {

@@ -24,7 +24,7 @@ use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
 use crate::native::desktops::object_name;
-use crate::settings::{Command, Modifier, Settings};
+use crate::settings::{Chord, Command, Modifier, Settings, Shortcut};
 use crate::tray::Tray;
 
 const START_RESIZE: i32 = 1;
@@ -138,27 +138,42 @@ impl Drop for EventHooks {
     }
 }
 
-#[derive(Default)]
-struct Hotkeys(Vec<i32>);
+struct QuitHotkey {
+    id: i32,
+    chord: Chord,
+}
 
-impl Hotkeys {
-    fn bind(&mut self, id: i32, mods: u32, key: u16, label: &str) -> Result<(), String> {
-        if unsafe { RegisterHotKey(null_mut(), id, mods, u32::from(key)) } == 0 {
+impl QuitHotkey {
+    fn register(id: i32, chord: Chord) -> Result<Self, String> {
+        if unsafe {
+            RegisterHotKey(
+                null_mut(),
+                id,
+                chord.mods | MOD_NOREPEAT,
+                u32::from(chord.key),
+            )
+        } == 0
+        {
             return Err(format!(
-                "Сочетание {label} недоступно: {}",
+                "Не удалось назначить {}: {}",
+                chord.label(),
                 io::Error::last_os_error()
             ));
         }
-        self.0.push(id);
-        Ok(())
+        Ok(Self { id, chord })
+    }
+
+    fn receives(&self, message: &MSG) -> bool {
+        let key_and_modifiers = message.lParam as u32 & !MOD_NOREPEAT;
+        message.message == WM_HOTKEY
+            && message.wParam == self.id as usize
+            && key_and_modifiers == ((u32::from(self.chord.key) << 16) | self.chord.mods)
     }
 }
 
-impl Drop for Hotkeys {
+impl Drop for QuitHotkey {
     fn drop(&mut self) {
-        for id in self.0.drain(..) {
-            unsafe { UnregisterHotKey(null_mut(), id) };
-        }
+        unsafe { UnregisterHotKey(null_mut(), self.id) };
     }
 }
 
@@ -250,6 +265,7 @@ struct Preferences<'a> {
     live: Settings,
     saved: Settings,
     path: &'a Path,
+    quit: Option<QuitHotkey>,
 }
 
 impl Preferences<'_> {
@@ -267,7 +283,24 @@ impl Preferences<'_> {
         let write = (saved != self.saved)
             .then(|| saved.prepare(self.path))
             .transpose()?;
+        // Keep the old registration active until both registration and
+        // persistence succeed. A failed save drops only the tentative handle.
+        let new_quit = if matches!(command, Command::Shortcut(Shortcut::Quit, _))
+            && self.quit.as_ref().map(|hotkey| hotkey.chord) != Some(next.chord(Shortcut::Quit))
+        {
+            let id = if self.quit.as_ref().is_some_and(|hotkey| hotkey.id == QUIT) {
+                QUIT + 1
+            } else {
+                QUIT
+            };
+            Some(QuitHotkey::register(id, next.chord(Shortcut::Quit))?)
+        } else {
+            None
+        };
         manager.apply_settings_with(next, || write.map_or(Ok(()), |pending| pending.commit()))?;
+        if let Some(binding) = new_quit {
+            self.quit = Some(binding);
+        }
         if command == Command::Restore {
             manager.restore_positions();
         }
@@ -379,7 +412,11 @@ fn pump(
         if has_events || reconcile {
             refresh(manager, 0);
         }
-        if message.message == WM_HOTKEY && message.wParam == QUIT as usize {
+        if preferences
+            .quit
+            .as_ref()
+            .is_some_and(|hotkey| hotkey.receives(&message))
+        {
             return Ok(());
         }
         if message.message == OUTLINE_SETTINGS_CHANGED {
@@ -393,7 +430,7 @@ fn pump(
                 dispatch(manager, target, command);
             }
             refresh(manager, ticket);
-        } else {
+        } else if !tray.pre_translate(&message) {
             unsafe {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -403,11 +440,17 @@ fn pump(
             if command == Command::Exit {
                 return Ok(());
             }
-            if let Err(detail) = preferences.apply(manager, hook, tray, command) {
+            let result = preferences.apply(manager, hook, tray, command);
+            if let Err(detail) = &result {
                 // The inline control must display the last accepted value when
                 // the layout rejects a spacing change or the save fails.
                 tray.set_settings(preferences.live);
-                show_error(&detail);
+                if !matches!(command, Command::Shortcut(..)) {
+                    show_error(detail);
+                }
+            }
+            if matches!(command, Command::Shortcut(..)) {
+                tray.shortcut_result(result.as_ref().err().map(String::as_str));
             }
         }
     }
@@ -473,29 +516,30 @@ pub fn run() -> Result<(), String> {
         Ok(value) => (value, None),
         Err(detail) => (Settings::default(), Some(detail)),
     };
-    let mut live = saved;
-    if let Some(modifier) = resize_override {
-        live.resize = modifier;
-    }
+    let live = match resize_override {
+        Some(modifier) => saved.with_resize_override(modifier)?,
+        None => saved,
+    };
+    // Establish the thread message queue before any callback can post to it.
+    unsafe { PeekMessageW(&mut MSG::default(), null_mut(), 0, 0, PM_NOREMOVE) };
+    let exit_chord = live.chord(Shortcut::Quit);
+    let quit = match QuitHotkey::register(QUIT, exit_chord) {
+        Ok(binding) => {
+            println!("{} — выйти и восстановить окна.", exit_chord.label());
+            Some(binding)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            None
+        }
+    };
     let mut preferences = Preferences {
         live,
         saved,
         path: &path,
+        quit,
     };
-    // Establish the thread message queue before any callback can post to it.
-    unsafe { PeekMessageW(&mut MSG::default(), null_mut(), 0, 0, PM_NOREMOVE) };
-    let mut bindings = Hotkeys::default();
-    let quit = bindings.bind(
-        QUIT,
-        MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
-        VK_Q,
-        "Ctrl+Alt+Shift+Q",
-    );
     let console = ConsoleHandler::install();
-    match &quit {
-        Err(error) => eprintln!("{error}"),
-        Ok(()) => println!("Ctrl+Alt+Shift+Q — выйти и восстановить окна."),
-    }
     match &console {
         Err(error) => eprintln!("{error}"),
         Ok(_) => println!("Ctrl+C в консоли Rustile — выйти и восстановить окна."),
@@ -512,7 +556,7 @@ pub fn run() -> Result<(), String> {
     let result = pump(&mut manager, &keyboard, &mut tray, &mut preferences);
     drop(keyboard);
     drop(hooks);
-    drop(bindings);
+    drop(preferences);
     manager.shutdown();
     drop(console);
     result

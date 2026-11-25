@@ -1,5 +1,6 @@
 mod menu;
 mod paint;
+mod shortcut_window;
 mod stepper;
 
 use std::{
@@ -25,8 +26,9 @@ use windows_sys::Win32::{
 use windows_sys::core::w;
 
 use crate::settings::{Command, Settings};
-use menu::{Action, Page, Row};
+use menu::{Action, Row};
 use paint::{Colors, Fonts, Painter};
+use shortcut_window::ShortcutWindow;
 use stepper::{EDIT_ID, EndEdit, Inline, arrow_info};
 
 const CALLBACK: u32 = WM_APP + 20;
@@ -63,7 +65,7 @@ struct State {
     taskbar_created: u32,
     registered: Cell<bool>,
     attempts: Cell<u8>,
-    page: Cell<Page>,
+    shortcuts: ShortcutWindow,
     anchor: Cell<POINT>,
     icon_bounds: Cell<Option<RECT>>,
     icon_pressed: Cell<bool>,
@@ -118,7 +120,7 @@ impl Tray {
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 registered: Cell::new(false),
                 attempts: Cell::new(0),
-                page: Cell::new(Page::Main),
+                shortcuts: ShortcutWindow::default(),
                 anchor: Cell::default(),
                 icon_bounds: Cell::default(),
                 icon_pressed: Cell::new(false),
@@ -159,6 +161,7 @@ impl Tray {
 
     pub fn set_settings(&self, settings: Settings) {
         self.state.applying.set(None);
+        self.state.shortcuts.set_settings(settings);
         let previous = self.state.settings.replace(settings);
         if previous.enabled != settings.enabled && self.state.registered.get() {
             let mut data = self.state.icon_data(self.hwnd);
@@ -173,8 +176,21 @@ impl Tray {
         }
     }
 
+    pub fn shortcut_result(&self, error: Option<&str>) {
+        self.state.shortcuts.result(error);
+    }
+
+    pub fn pre_translate(&self, message: &MSG) -> bool {
+        self.state.shortcuts.pre_translate(message)
+    }
+
     pub fn take_command(&self) -> Option<Command> {
-        let command = self.state.commands.borrow_mut().pop_front();
+        let command = self
+            .state
+            .commands
+            .borrow_mut()
+            .pop_front()
+            .or_else(|| self.state.shortcuts.take_command());
         self.state.applying.set(command);
         command
     }
@@ -267,7 +283,7 @@ impl State {
         self.prepare_header_icon(dpi);
         *self.fonts.borrow_mut() = Some(Fonts::new(dpi));
         self.apply_theme(hwnd, Colors::current());
-        self.layout(hwnd, Page::Main);
+        self.layout(hwnd);
         unsafe {
             // A launcher may pass STARTF_USESHOWWINDOW with SW_HIDE. The first
             // ShowWindow would then ignore its requested state. Reveal the
@@ -359,14 +375,9 @@ impl State {
         }
     }
 
-    fn layout(&self, hwnd: HWND, page: Page) {
-        if self.page.replace(page) != page {
-            self.finish_edit(hwnd, EndEdit::Blur);
-            self.inline.wheel.set(None);
-            self.hide_arrows(hwnd);
-        }
+    fn layout(&self, hwnd: HWND) {
         self.hot.set(null_mut());
-        let rows = menu::rows(page, self.settings.get());
+        let rows = menu::rows(self.settings.get());
         let count = rows.len();
         *self.entries.borrow_mut() = rows;
         let point = self.anchor.get();
@@ -506,17 +517,18 @@ impl State {
             .map(|r| r.action);
         match action {
             Some(Action::Adjust(_)) => self.start_edit(hwnd, index),
-            Some(Action::Open(page)) => {
-                self.layout(hwnd, page);
-                let selected = self
-                    .entries
-                    .borrow()
-                    .iter()
-                    .position(|row| row.checked)
-                    .unwrap_or(1);
-                self.focus(hwnd, selected);
+            Some(Action::EditShortcuts) => {
+                self.hide(hwnd, false);
+                if let Err(detail) =
+                    self.shortcuts
+                        .show(hwnd, self.anchor.get(), self.settings.get())
+                {
+                    let text: Vec<_> = detail.encode_utf16().chain([0]).collect();
+                    unsafe {
+                        MessageBoxW(hwnd, text.as_ptr(), w!("Rustile"), MB_OK | MB_ICONWARNING)
+                    };
+                }
             }
-            Some(Action::Back) => self.back(hwnd),
             Some(Action::Apply(command)) => {
                 self.commands.borrow_mut().push_back(command);
                 self.hide(hwnd, true);
@@ -525,22 +537,6 @@ impl State {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn back(&self, hwnd: HWND) {
-        let old = self.page.get();
-        if let Some(parent) = old.parent() {
-            self.layout(hwnd, parent);
-            let i = self
-                .entries
-                .borrow()
-                .iter()
-                .position(|row| matches!(row.action, Action::Open(p) if p == old))
-                .unwrap_or(1);
-            self.focus(hwnd, i);
-        } else {
-            self.hide(hwnd, true);
         }
     }
 
@@ -553,14 +549,13 @@ impl State {
             return true;
         }
         match key {
-            VK_ESCAPE => self.hide(hwnd, true),
-            VK_LEFT | VK_BACK => self.back(hwnd),
+            VK_ESCAPE | VK_LEFT | VK_BACK => self.hide(hwnd, true),
             VK_RIGHT => {
                 let opens = self
                     .entries
                     .borrow()
                     .get(index)
-                    .is_some_and(|r| matches!(r.action, Action::Open(_)));
+                    .is_some_and(|r| matches!(r.action, Action::EditShortcuts));
                 if opens {
                     self.activate(hwnd, index);
                 }

@@ -1,3 +1,8 @@
+mod bindings;
+
+use bindings::Overrides;
+pub(crate) use bindings::{Chord, Shortcut};
+
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -9,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_RETURN,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) enum Modifier {
@@ -30,28 +37,6 @@ pub(crate) enum Modifier {
 }
 
 impl Modifier {
-    pub const ALL: [Self; 7] = [
-        Self::Win,
-        Self::WinShift,
-        Self::Alt,
-        Self::AltShift,
-        Self::CtrlAlt,
-        Self::CtrlAltShift,
-        Self::CtrlShift,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Win => "Win",
-            Self::WinShift => "Win+Shift",
-            Self::Alt => "Alt",
-            Self::AltShift => "Alt+Shift",
-            Self::CtrlAlt => "Ctrl+Alt",
-            Self::CtrlAltShift => "Ctrl+Alt+Shift",
-            Self::CtrlShift => "Ctrl+Shift",
-        }
-    }
-
     pub const fn bits(self) -> u32 {
         match self {
             Self::Win => MOD_WIN,
@@ -66,19 +51,12 @@ impl Modifier {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Binding {
-    Focus,
-    Move,
-    Resize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Toggle,
     Outline(u8),
     Gap(u8),
     Padding(u8),
-    Shortcut(Binding, Modifier),
+    Shortcut(Shortcut, Chord),
     Restore,
     Exit,
 }
@@ -94,6 +72,8 @@ pub(crate) struct Settings {
     pub focus: Modifier,
     pub movement: Modifier,
     pub resize: Modifier,
+    #[serde(skip_serializing_if = "Overrides::is_empty")]
+    shortcuts: Overrides,
 }
 
 impl Default for Settings {
@@ -107,6 +87,7 @@ impl Default for Settings {
             focus: Modifier::Win,
             movement: Modifier::WinShift,
             resize: Modifier::Win,
+            shortcuts: Overrides::default(),
         }
     }
 }
@@ -129,9 +110,7 @@ impl Settings {
                 Self::MAX_OUTLINE
             ));
         }
-        if self.focus == self.movement {
-            return Err("Фокус и перемещение используют одни и те же стрелки. Выберите разные модификаторы.".into());
-        }
+        self.validate_shortcuts()?;
         Ok(self)
     }
 
@@ -142,12 +121,20 @@ impl Settings {
             Command::Outline(value) => self.outline = value,
             Command::Gap(value) => self.gap = value,
             Command::Padding(value) => self.padding = value,
-            Command::Shortcut(Binding::Focus, m) => self.focus = m,
-            Command::Shortcut(Binding::Move, m) => self.movement = m,
-            Command::Shortcut(Binding::Resize, m) => self.resize = m,
+            Command::Shortcut(action, chord) => self.assign(action, chord),
             Command::Exit => {}
         }
         self.validated()
+    }
+
+    pub fn with_resize_override(self, modifier: Modifier) -> Result<Self, String> {
+        self.changed(Command::Shortcut(
+            Shortcut::StartResize,
+            Chord {
+                mods: modifier.bits(),
+                key: VK_RETURN,
+            },
+        ))
     }
 
     pub fn path() -> Result<PathBuf, String> {
@@ -251,11 +238,129 @@ mod tests {
         );
         assert!(
             partial
-                .changed(Command::Shortcut(Binding::Move, Modifier::Win))
+                .changed(Command::Shortcut(
+                    Shortcut::MoveLeft,
+                    partial.chord(Shortcut::FocusLeft)
+                ))
                 .is_err()
         );
         assert!(partial.changed(Command::Outline(5)).is_err());
         assert!(toml::from_str::<Settings>("focus = \"invalid\"").is_err());
+    }
+
+    #[test]
+    fn individual_bindings_roundtrip_without_changing_legacy_profile_or_neighbors() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_LEFT, VK_RIGHT};
+        let profile: Settings = toml::from_str(
+            "focus = 'ctrl+alt'\nmovement = 'alt+shift'\nresize = 'ctrl+shift'\npadding = 12",
+        )
+        .unwrap();
+        let profile = profile.validated().unwrap();
+        assert_eq!(
+            profile.chord(Shortcut::MoveLeft),
+            Chord {
+                mods: MOD_ALT | MOD_SHIFT,
+                key: VK_LEFT
+            }
+        );
+        let custom = Chord {
+            mods: MOD_CONTROL,
+            key: VK_H,
+        };
+        let next = profile
+            .changed(Command::Shortcut(Shortcut::MoveLeft, custom))
+            .unwrap();
+        let text = toml::to_string_pretty(&next).unwrap();
+        assert!(text.contains("shortcuts.move_left"));
+        let loaded = toml::from_str::<Settings>(&text)
+            .unwrap()
+            .validated()
+            .unwrap();
+        assert_eq!(loaded, next);
+        assert_eq!(loaded.chord(Shortcut::MoveLeft), custom);
+        assert_eq!(
+            loaded.chord(Shortcut::MoveRight),
+            Chord {
+                mods: MOD_ALT | MOD_SHIFT,
+                key: VK_RIGHT
+            }
+        );
+        assert_eq!(
+            loaded.chord(Shortcut::StartResize),
+            Chord {
+                mods: MOD_CONTROL | MOD_SHIFT,
+                key: VK_RETURN
+            }
+        );
+        assert_eq!(loaded.padding, 12);
+        assert_eq!(
+            next.changed(Command::Shortcut(
+                Shortcut::MoveLeft,
+                profile.chord(Shortcut::MoveLeft)
+            ))
+            .unwrap(),
+            profile
+        );
+    }
+
+    #[test]
+    fn binding_collisions_follow_modes_and_global_quit() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_H, VK_X};
+        let settings = Settings::default();
+        let assign =
+            |action, mods, key| settings.changed(Command::Shortcut(action, Chord { mods, key }));
+        assert!(
+            settings
+                .changed(Command::Shortcut(
+                    Shortcut::GrowUp,
+                    settings.chord(Shortcut::FocusLeft)
+                ))
+                .is_ok()
+        );
+        assert!(
+            settings
+                .changed(Command::Shortcut(
+                    Shortcut::GrowUp,
+                    settings.chord(Shortcut::GrowRight)
+                ))
+                .is_err()
+        );
+        for action in [Shortcut::GrowUp, Shortcut::MoveRight] {
+            assert!(
+                settings
+                    .changed(Command::Shortcut(action, settings.chord(Shortcut::Quit)))
+                    .is_err()
+            );
+        }
+        assert!(assign(Shortcut::MoveLeft, MOD_WIN, VK_X).is_err());
+        assert!(assign(Shortcut::MoveLeft, 0, VK_H).is_err());
+        assert!(assign(Shortcut::MoveLeft, MOD_SHIFT, VK_H).is_err());
+        assert!(assign(Shortcut::MoveLeft, 0, VK_F8).is_ok());
+        assert!(assign(Shortcut::GrowUp, 0, VK_H).is_ok());
+    }
+
+    #[test]
+    fn resize_override_and_remap_preserve_only_unmodified_modal_aliases() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_UP};
+        let settings = Settings::default()
+            .with_resize_override(Modifier::CtrlAlt)
+            .unwrap();
+        let held = Chord {
+            mods: MOD_CONTROL | MOD_ALT,
+            key: VK_UP,
+        };
+        assert!(settings.resize_alias(Shortcut::GrowUp, held));
+        assert_eq!(
+            settings.chord(Shortcut::StartResize).mods,
+            MOD_CONTROL | MOD_ALT
+        );
+        let settings = settings
+            .changed(Command::Shortcut(
+                Shortcut::GrowUp,
+                Chord { mods: 0, key: VK_H },
+            ))
+            .unwrap();
+        assert!(!settings.resize_alias(Shortcut::GrowUp, held));
     }
 
     #[test]

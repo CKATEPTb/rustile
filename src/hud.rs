@@ -10,6 +10,7 @@ use windows_sys::core::w;
 
 use crate::layout::{Direction, Id, Rect};
 use crate::native;
+use crate::settings::{Settings, Shortcut};
 
 mod outline;
 pub use outline::FocusOutline;
@@ -23,7 +24,7 @@ pub struct ResizeHud {
 }
 
 impl ResizeHud {
-    pub fn show(&mut self, target: Id, tile: Rect, edge: Option<Direction>) {
+    pub fn show(&mut self, target: Id, tile: Rect, edge: Option<Direction>, settings: &Settings) {
         unsafe {
             if self.label.is_null() {
                 let class = WNDCLASSW {
@@ -42,12 +43,36 @@ impl ResizeHud {
             let dpi = GetDpiForWindow(self.label).max(96) as i32;
             let scale = |n: i32| (n * dpi + 48) / 96;
             let mut label = format!("Размер   {} × {}", tile.w, tile.h);
+            let mut width = scale(390).min(tile.w);
             if tile.w >= scale(390) {
-                label.push_str("    ·    Enter — готово    Esc — отмена");
+                let full = format!(
+                    "{label}    ·    {} — готово    {} — отмена",
+                    settings.chord(Shortcut::Confirm).label(),
+                    settings.chord(Shortcut::Cancel).label()
+                );
+                let text: Vec<_> = full.encode_utf16().collect();
+                let dc = GetDC(self.label);
+                let font = hint_font(self.label);
+                let previous = SelectObject(dc, font);
+                let mut bounds = RECT::default();
+                DrawTextW(
+                    dc,
+                    text.as_ptr(),
+                    text.len() as i32,
+                    &mut bounds,
+                    DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                SelectObject(dc, previous);
+                DeleteObject(font);
+                ReleaseDC(self.label, dc);
+                let needed = bounds.right + scale(20);
+                if needed <= tile.w {
+                    label = full;
+                    width = width.max(needed);
+                }
             }
             let wide: Vec<_> = label.encode_utf16().chain([0]).collect();
             SetWindowTextW(self.label, wide.as_ptr());
-            let width = scale(390).min(tile.w);
             let height = scale(32).min(tile.h);
             position(
                 self.label,
@@ -136,6 +161,20 @@ fn position(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
+fn hint_font(hwnd: HWND) -> HFONT {
+    unsafe {
+        let mut font = LOGFONTW::default();
+        SystemParametersInfoForDpi(
+            SPI_GETICONTITLELOGFONT,
+            size_of::<LOGFONTW>() as u32,
+            (&raw mut font).cast(),
+            0,
+            GetDpiForWindow(hwnd),
+        );
+        CreateFontIndirectW(&font)
+    }
+}
+
 unsafe extern "system" fn paint_hint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -156,15 +195,7 @@ unsafe extern "system" fn paint_hint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 };
                 FillRect(dc, &bounds, brush);
                 if len != 0 {
-                    let mut system_font = LOGFONTW::default();
-                    SystemParametersInfoForDpi(
-                        SPI_GETICONTITLELOGFONT,
-                        size_of::<LOGFONTW>() as u32,
-                        (&raw mut system_font).cast(),
-                        0,
-                        GetDpiForWindow(hwnd),
-                    );
-                    let font = CreateFontIndirectW(&system_font);
+                    let font = hint_font(hwnd);
                     let previous = SelectObject(dc, font);
                     SetTextColor(dc, GetSysColor(COLOR_MENUTEXT));
                     SetBkMode(dc, TRANSPARENT as i32);

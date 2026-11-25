@@ -12,13 +12,107 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::{CANCEL, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, SHRINK, START_RESIZE};
 use crate::manager::Mode;
-use crate::settings::Settings;
+use crate::settings::{Chord, Settings, Shortcut};
 
-// Only potential shortcuts have a slot. Modifiers themselves always pass
-// through, so tapping Win still opens Start.
-const KEYS: [u16; 6] = [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_RETURN, VK_ESCAPE];
-const ENTER: usize = 4;
-const ESC: usize = 5;
+// The table is rebuilt only on a settings change. The hook inspects virtual
+// key codes and current modifiers; it never translates or records typed text.
+#[derive(Clone, Copy, Default)]
+struct KeyRoutes {
+    normal: [u8; 16],
+    resize: [u8; 16],
+}
+
+impl KeyRoutes {
+    fn for_mode(&mut self, action: Shortcut) -> &mut [u8; 16] {
+        if action.is_resize() {
+            &mut self.resize
+        } else {
+            &mut self.normal
+        }
+    }
+
+    fn command(self, mode: Mode, mods: u32) -> Option<i32> {
+        let commands = match mode {
+            Mode::Normal => self.normal,
+            Mode::Resize => self.resize,
+        };
+        commands
+            .get(mods as usize)
+            .copied()
+            .filter(|&id| id != 0)
+            .map(i32::from)
+    }
+}
+
+struct Routes([Option<KeyRoutes>; 256]);
+
+impl Routes {
+    fn new(settings: Settings) -> Self {
+        let mut keys = [None; 256];
+        for action in Shortcut::ALL {
+            let Some(id) = command_id(action) else {
+                continue;
+            };
+            let chord = settings.chord(action);
+            let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
+            if action.is_resize() {
+                for mods in 0..16 {
+                    if settings.resize_alias(
+                        action,
+                        Chord {
+                            mods,
+                            key: chord.key,
+                        },
+                    ) {
+                        row.resize[mods as usize] = id;
+                    }
+                }
+            }
+        }
+        // An explicitly assigned modal chord wins over the implicit variants
+        // that let a user keep the opener's modifiers held in resize mode.
+        for action in Shortcut::ALL {
+            if let Some(id) = command_id(action) {
+                let chord = settings.chord(action);
+                let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
+                row.for_mode(action)[chord.mods as usize] = id;
+            }
+        }
+        // RegisterHotKey also owns Quit while a managed tile is being resized.
+        let quit = settings.chord(Shortcut::Quit);
+        if let Some(row) = &mut keys[usize::from(quit.key)] {
+            row.resize[quit.mods as usize] = 0;
+        }
+        Self(keys)
+    }
+}
+
+fn command_id(action: Shortcut) -> Option<u8> {
+    use Shortcut::*;
+    let id = match action {
+        FocusLeft => FOCUS,
+        FocusRight => FOCUS + 1,
+        FocusUp => FOCUS + 2,
+        FocusDown => FOCUS + 3,
+        MoveLeft => MOVE,
+        MoveRight => MOVE + 1,
+        MoveUp => MOVE + 2,
+        MoveDown => MOVE + 3,
+        StartResize => START_RESIZE,
+        GrowLeft => EXPAND,
+        GrowRight => EXPAND + 1,
+        GrowUp => EXPAND + 2,
+        GrowDown => EXPAND + 3,
+        ShrinkLeft => SHRINK,
+        ShrinkRight => SHRINK + 1,
+        ShrinkUp => SHRINK + 2,
+        ShrinkDown => SHRINK + 3,
+        Confirm => CONFIRM,
+        Cancel => CANCEL,
+        Quit => return None, // Registered independently, including on unmanaged windows.
+    };
+    Some(id as u8)
+}
 
 #[derive(Debug, PartialEq)]
 enum Action {
@@ -33,97 +127,72 @@ enum Press {
     Up,
     Passed,
     Consumed,
-    ResizeArrow,
+    ResizeStep,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Held([Press; KEYS.len()]);
-
-impl Held {
-    fn route(
-        &mut self,
-        slot: usize,
-        down: bool,
-        mods: u32,
-        mode: Option<Mode>,
-        settings: Settings,
-    ) -> Action {
-        let press = &mut self.0[slot];
-        let consumed = matches!(press, Press::Consumed | Press::ResizeArrow);
+impl Press {
+    fn route(&mut self, down: bool, command: Option<i32>) -> Action {
+        let consumed = matches!(*self, Self::Consumed | Self::ResizeStep);
         if !down {
-            *press = Press::Up;
+            *self = Self::Up;
             return if consumed {
                 Action::Consume
             } else {
                 Action::Pass
             };
         }
-        if *press == Press::Passed {
+        if *self == Self::Passed {
             return Action::Pass;
         }
-        let opener = settings.resize.bits();
-        let resize_base = mods & !MOD_SHIFT;
-        let resize_arrow =
-            resize_base == 0 || resize_base == MOD_WIN || resize_base == (opener & !MOD_SHIFT);
-        let id = match (mode, slot, mods) {
-            (Some(Mode::Normal), ENTER, m) if m == opener => Some(START_RESIZE),
-            (Some(Mode::Normal), 0..=3, m) if m == settings.focus.bits() => {
-                Some(FOCUS + slot as i32)
+        if let Some(id) = command {
+            let repeatable =
+                (EXPAND..EXPAND + 4).contains(&id) || (SHRINK..SHRINK + 4).contains(&id);
+            if !consumed || (*self == Self::ResizeStep && repeatable) {
+                *self = if repeatable {
+                    Self::ResizeStep
+                } else {
+                    Self::Consumed
+                };
+                return Action::Command(id);
             }
-            (Some(Mode::Normal), 0..=3, m) if m == settings.movement.bits() => {
-                Some(MOVE + slot as i32)
-            }
-            (Some(Mode::Resize), 0..=3, m) if resize_arrow => {
-                let base = if m & MOD_SHIFT == 0 { EXPAND } else { SHRINK };
-                Some(base + slot as i32)
-            }
-            (Some(Mode::Resize), ENTER, m) if m == 0 || m == opener => Some(CONFIRM),
-            (Some(Mode::Resize), ESC, m) if m == 0 || m == MOD_WIN || m == opener => Some(CANCEL),
-            _ => None,
-        };
-        let repeatable = slot < ENTER && mode == Some(Mode::Resize);
-        if let Some(id) = id
-            && (!consumed || (*press == Press::ResizeArrow && repeatable))
-        {
-            *press = if repeatable {
-                Press::ResizeArrow
-            } else {
-                Press::Consumed
-            };
-            return Action::Command(id);
         }
         if consumed {
             Action::Consume
         } else {
-            *press = Press::Passed;
+            *self = Self::Passed;
             Action::Pass
         }
     }
 }
 
-// The manager publishes only after foreground and layout validation. The lock
-// protects a handful of scalar values and is never held across a Win32 call.
 #[derive(Clone, Copy)]
 struct Snapshot {
     target: isize,
     mode: Mode,
     focus_epoch: usize,
     handled: usize,
-    settings: Settings,
 }
 
-static SNAPSHOT: LazyLock<Mutex<Snapshot>> = LazyLock::new(|| {
-    Mutex::new(Snapshot {
-        target: 0,
-        mode: Mode::Normal,
-        focus_epoch: 0,
-        handled: 0,
-        settings: Settings::default(),
+struct Routing {
+    focus: Snapshot,
+    keys: Routes,
+}
+
+static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
+    Mutex::new(Routing {
+        focus: Snapshot {
+            target: 0,
+            mode: Mode::Normal,
+            focus_epoch: 0,
+            handled: 0,
+        },
+        keys: Routes::new(Settings::default()),
     })
 });
 
 pub(super) fn update(target: Option<isize>, mode: Mode, handled: usize) {
-    let mut state = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+    let state = &mut routing.focus;
     let target = target.unwrap_or(0);
     if state.target != target {
         state.focus_epoch = state.focus_epoch.wrapping_add(1);
@@ -180,13 +249,12 @@ impl Pending {
 
 thread_local! {
     static OWNER: Cell<u32> = const { Cell::new(0) };
-    static HELD: Cell<Held> = const { Cell::new(Held([Press::Up; KEYS.len()])) };
+    static HELD: [Cell<Press>; 256] = const { [const { Cell::new(Press::Up) }; 256] };
     static PENDING: Cell<Pending> = const { Cell::new(Pending::NEW) };
 }
 
 fn modifiers() -> u32 {
-    // These are modifier states preceding an arrow/Enter/Esc event. Do not
-    // query the state of the key whose down/up transition is being delivered.
+    // Read only modifier states preceding the chord's main key transition.
     let down = |vk: u16| unsafe { GetAsyncKeyState(vk.into()) } < 0;
     let mut mods = if down(VK_LWIN) || down(VK_RWIN) {
         MOD_WIN
@@ -222,32 +290,47 @@ fn mark_modifier_used() {
     unsafe { SendInput(2, marker.as_ptr(), size_of::<INPUT>() as i32) };
 }
 
+fn bound_command(slot: usize, pending: Pending) -> Option<(i32, Snapshot, u32)> {
+    let (state, key) = {
+        let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+        (routing.focus, routing.keys.0[slot]?)
+    };
+    if state.target == 0 || state.target != unsafe { GetForegroundWindow() } as isize {
+        return None;
+    }
+    let mods = modifiers();
+    key.command(pending.mode(state), mods)
+        .map(|id| (id, state, mods))
+}
+
 unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isize {
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
         let vk = unsafe { (*(data as *const KBDLLHOOKSTRUCT)).vkCode };
-        if let Some(slot) = KEYS.iter().position(|&k| u32::from(k) == vk) {
+        if let Ok(vk) = u8::try_from(vk) {
             let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            let state = *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
-            let target = state.target;
-            let active = target != 0 && target == unsafe { GetForegroundWindow() } as isize;
+            let slot = usize::from(vk);
+            let previous = HELD.with(|held| held[slot].get());
+            let mut press = previous;
             let pending = PENDING.get();
-            let mode = active.then(|| pending.mode(state));
-            let mods = if down && active { modifiers() } else { 0 };
-            let mut held = HELD.get();
-            let previous = held.0[slot];
-            match held.route(slot, down, mods, mode, state.settings) {
-                Action::Consume => {
-                    HELD.set(held);
+            let binding = if down && previous != Press::Passed {
+                bound_command(slot, pending)
+            } else {
+                None
+            };
+            match (press.route(down, binding.map(|(id, _, _)| id)), binding) {
+                (Action::Consume, _) => {
+                    HELD.with(|held| held[slot].set(press));
                     return 1;
                 }
-                Action::Command(id) => {
+                (Action::Command(id), Some((_, state, mods))) => {
+                    let target = state.target;
                     let transition = pending.transition(id, state.focus_epoch);
                     let ticket = transition.map_or(0, |next| next.ticket);
                     let command = (ticket << 8) | id as usize;
                     if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
                     {
-                        HELD.set(held);
+                        HELD.with(|held| held[slot].set(press));
                         if let Some(next) = transition {
                             PENDING.set(next);
                         }
@@ -256,14 +339,12 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
                         }
                         return 1;
                     }
-                    // Balance a consumed press even if the queue fills up.
                     if previous != Press::Up {
                         return 1;
                     }
-                    held.0[slot] = Press::Passed;
-                    HELD.set(held);
+                    HELD.with(|held| held[slot].set(Press::Passed));
                 }
-                Action::Pass => HELD.set(held),
+                _ => HELD.with(|held| held[slot].set(press)),
             }
         }
     }
@@ -325,7 +406,8 @@ impl Hook {
     }
 
     pub(super) fn set_settings(&self, settings: Settings) {
-        SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).settings = settings;
+        let keys = Routes::new(settings);
+        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = keys;
     }
 }
 
@@ -342,14 +424,15 @@ impl Drop for Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Modifier;
+    use crate::settings::{Command, Modifier};
 
     const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
     // Exercise the hook's prediction and repeat handling before/after arbitrary
     // manager acknowledgements, without sending keyboard events to Windows.
     struct Keyboard {
-        held: Held,
+        held: [Press; 256],
+        settings: Settings,
         state: Snapshot,
         pending: Pending,
     }
@@ -357,21 +440,34 @@ mod tests {
     impl Keyboard {
         fn new() -> Self {
             Self {
-                held: Held::default(),
+                held: [Press::Up; 256],
+                settings: Settings::default(),
                 state: Snapshot {
                     target: 100,
                     mode: Mode::Normal,
                     focus_epoch: 1,
                     handled: 0,
-                    settings: Settings::default(),
                 },
                 pending: Pending::NEW,
             }
         }
 
-        fn key(&mut self, slot: usize, down: bool, mods: u32) -> Action {
-            let mode = (self.state.target != 0).then(|| self.pending.mode(self.state));
-            let action = self.held.route(slot, down, mods, mode, self.state.settings);
+        fn assign(&mut self, shortcut: Shortcut, mods: u32, key: u16) {
+            self.settings = self
+                .settings
+                .changed(Command::Shortcut(shortcut, Chord { mods, key }))
+                .unwrap();
+        }
+
+        fn key(&mut self, key: u16, down: bool, mods: u32) -> Action {
+            let slot = usize::from(key);
+            let routes = Routes::new(self.settings);
+            let command = routes.0[slot].and_then(|route| {
+                (self.state.target != 0)
+                    .then(|| self.pending.mode(self.state))
+                    .and_then(|mode| route.command(mode, mods))
+            });
+            let action = self.held[slot].route(down, command);
             if let Action::Command(id) = action
                 && let Some(next) = self.pending.transition(id, self.state.focus_epoch)
             {
@@ -384,19 +480,19 @@ mod tests {
     #[test]
     fn move_and_focus_are_distinct_and_do_not_autorepeat() {
         let mut keyboard = Keyboard::new();
-        for slot in 0..4 {
+        for (slot, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
             assert_eq!(
-                keyboard.key(slot, true, WIN_SHIFT),
+                keyboard.key(key, true, WIN_SHIFT),
                 Action::Command(MOVE + slot as i32)
             );
-            assert_eq!(keyboard.key(slot, true, MOD_WIN), Action::Consume);
-            assert_eq!(keyboard.key(slot, false, 0), Action::Consume);
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
             assert_eq!(
-                keyboard.key(slot, true, MOD_WIN),
+                keyboard.key(key, true, MOD_WIN),
                 Action::Command(FOCUS + slot as i32)
             );
-            assert_eq!(keyboard.key(slot, true, MOD_WIN), Action::Consume);
-            assert_eq!(keyboard.key(slot, false, 0), Action::Consume);
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
         }
     }
 
@@ -405,86 +501,102 @@ mod tests {
         for mods in [0, MOD_WIN] {
             let mut keyboard = Keyboard::new();
             assert_eq!(
-                keyboard.key(ENTER, true, MOD_WIN),
+                keyboard.key(VK_RETURN, true, MOD_WIN),
                 Action::Command(START_RESIZE)
             );
             let opener_ticket = keyboard.pending.ticket;
-            assert_eq!(keyboard.key(ESC, true, mods), Action::Command(CANCEL));
+            assert_eq!(keyboard.key(VK_ESCAPE, true, mods), Action::Command(CANCEL));
             // Only the opener has been handled on the manager thread so far.
             keyboard.state.handled = opener_ticket;
             keyboard.state.mode = Mode::Resize;
-            assert_eq!(keyboard.key(ESC, true, 0), Action::Consume);
-            assert_eq!(keyboard.key(0, true, 0), Action::Pass);
-            assert_eq!(keyboard.key(0, false, 0), Action::Pass);
-            assert_eq!(keyboard.key(ESC, false, 0), Action::Consume);
-            assert_eq!(keyboard.key(0, true, MOD_WIN), Action::Command(FOCUS));
+            assert_eq!(keyboard.key(VK_ESCAPE, true, 0), Action::Consume);
+            assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
+            assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+            assert_eq!(keyboard.key(VK_ESCAPE, false, 0), Action::Consume);
+            assert_eq!(keyboard.key(VK_LEFT, true, MOD_WIN), Action::Command(FOCUS));
         }
     }
 
     #[test]
     fn windows_x_bypasses_the_shortcut_filter() {
-        // on_key forwards keys outside this list before consulting modifiers or mode.
-        assert!(!KEYS.contains(&VK_X));
+        let mut k = Keyboard::new();
+        assert_eq!(k.key(VK_X, true, MOD_WIN), Action::Pass);
+        assert_eq!(k.key(VK_X, false, 0), Action::Pass);
     }
 
     #[test]
     fn opening_enter_cannot_confirm_until_released_and_resize_arrows_repeat() {
         let mut keyboard = Keyboard::new();
         assert_eq!(
-            keyboard.key(ENTER, true, MOD_WIN),
+            keyboard.key(VK_RETURN, true, MOD_WIN),
             Action::Command(START_RESIZE)
         );
-        assert_eq!(keyboard.key(ENTER, true, 0), Action::Consume);
-        assert_eq!(keyboard.key(0, true, MOD_WIN), Action::Command(EXPAND));
-        assert_eq!(keyboard.key(0, true, 0), Action::Command(EXPAND));
-        assert_eq!(keyboard.key(0, true, WIN_SHIFT), Action::Command(SHRINK));
-        assert_eq!(keyboard.key(0, true, MOD_SHIFT), Action::Command(SHRINK));
-        assert_eq!(keyboard.key(0, false, 0), Action::Consume);
-        assert_eq!(keyboard.key(ENTER, false, 0), Action::Consume);
-        assert_eq!(keyboard.key(ENTER, true, 0), Action::Command(CONFIRM));
-        assert_eq!(keyboard.key(0, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, true, 0), Action::Consume);
+        assert_eq!(
+            keyboard.key(VK_LEFT, true, MOD_WIN),
+            Action::Command(EXPAND)
+        );
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Command(EXPAND));
+        assert_eq!(
+            keyboard.key(VK_LEFT, true, WIN_SHIFT),
+            Action::Command(SHRINK)
+        );
+        assert_eq!(
+            keyboard.key(VK_LEFT, true, MOD_SHIFT),
+            Action::Command(SHRINK)
+        );
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Consume);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
+        assert_eq!(keyboard.key(VK_RETURN, true, 0), Action::Command(CONFIRM));
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
     }
 
     #[test]
     fn focus_change_and_rejected_opener_restore_normal_routing() {
         let mut keyboard = Keyboard::new();
         assert_eq!(
-            keyboard.key(ENTER, true, MOD_WIN),
+            keyboard.key(VK_RETURN, true, MOD_WIN),
             Action::Command(START_RESIZE)
         );
         keyboard.state.handled = keyboard.pending.ticket;
-        assert_eq!(keyboard.key(0, true, 0), Action::Pass);
-        assert_eq!(keyboard.key(ENTER, false, 0), Action::Consume);
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
         assert_eq!(
-            keyboard.key(ENTER, true, MOD_WIN),
+            keyboard.key(VK_RETURN, true, MOD_WIN),
             Action::Command(START_RESIZE)
         );
         keyboard.state.target = 0;
         keyboard.state.focus_epoch += 1;
-        assert_eq!(keyboard.key(ENTER, false, 0), Action::Consume);
-        assert_eq!(keyboard.key(ENTER, true, MOD_WIN), Action::Pass);
-        assert_eq!(keyboard.key(ENTER, false, 0), Action::Pass);
-        assert_eq!(keyboard.key(1, true, WIN_SHIFT), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
+        assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_RIGHT, true, WIN_SHIFT), Action::Pass);
         keyboard.state.target = 100;
         keyboard.state.focus_epoch += 1;
-        assert_eq!(keyboard.key(2, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_UP, true, 0), Action::Pass);
     }
 
     #[test]
     fn native_keypresses_keep_their_repeats_and_up_even_if_modifiers_change() {
         let mut keyboard = Keyboard::new();
         for mods in [0, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_CONTROL | MOD_WIN] {
-            assert_eq!(keyboard.key(1, true, mods), Action::Pass);
-            assert_eq!(keyboard.key(1, true, MOD_WIN), Action::Pass);
-            assert_eq!(keyboard.key(1, false, MOD_WIN), Action::Pass);
+            assert_eq!(keyboard.key(VK_RIGHT, true, mods), Action::Pass);
+            assert_eq!(keyboard.key(VK_RIGHT, true, MOD_WIN), Action::Pass);
+            assert_eq!(keyboard.key(VK_RIGHT, false, MOD_WIN), Action::Pass);
         }
-        assert_eq!(keyboard.key(0, true, MOD_CONTROL | WIN_SHIFT), Action::Pass);
-        assert_eq!(keyboard.key(0, false, 0), Action::Pass);
-        keyboard.state.settings.resize = Modifier::CtrlAlt;
-        assert_eq!(keyboard.key(ENTER, true, MOD_WIN), Action::Pass);
-        assert_eq!(keyboard.key(ENTER, false, 0), Action::Pass);
         assert_eq!(
-            keyboard.key(ENTER, true, MOD_CONTROL | MOD_ALT),
+            keyboard.key(VK_LEFT, true, MOD_CONTROL | WIN_SHIFT),
+            Action::Pass
+        );
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+        keyboard.settings = keyboard
+            .settings
+            .with_resize_override(Modifier::CtrlAlt)
+            .unwrap();
+        assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Pass);
+        assert_eq!(
+            keyboard.key(VK_RETURN, true, MOD_CONTROL | MOD_ALT),
             Action::Command(START_RESIZE)
         );
     }
@@ -492,51 +604,84 @@ mod tests {
     #[test]
     fn editing_shortcuts_takes_effect_on_the_next_physical_press() {
         let mut k = Keyboard::new();
-        assert_eq!(k.key(0, true, MOD_WIN), Action::Command(FOCUS));
-        assert_eq!(k.key(1, true, MOD_ALT), Action::Pass);
-        k.state.settings.focus = Modifier::Alt;
-        k.state.settings.movement = Modifier::CtrlAltShift;
+        assert_eq!(k.key(VK_LEFT, true, MOD_WIN), Action::Command(FOCUS));
+        assert_eq!(k.key(VK_RIGHT, true, MOD_ALT), Action::Pass);
+        k.assign(Shortcut::FocusLeft, MOD_ALT, VK_H);
+        k.assign(Shortcut::FocusRight, MOD_ALT, VK_RIGHT);
+        k.assign(Shortcut::MoveUp, MOD_CONTROL | MOD_ALT, VK_K);
 
         // Neither a consumed nor a passed key switches owners mid-press.
-        assert_eq!(k.key(0, true, MOD_ALT), Action::Consume);
-        assert_eq!(k.key(0, false, 0), Action::Consume);
-        assert_eq!(k.key(1, true, MOD_ALT), Action::Pass);
-        assert_eq!(k.key(1, false, 0), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, true, MOD_WIN), Action::Consume);
+        assert_eq!(k.key(VK_LEFT, false, 0), Action::Consume);
+        assert_eq!(k.key(VK_RIGHT, true, MOD_ALT), Action::Pass);
+        assert_eq!(k.key(VK_RIGHT, false, 0), Action::Pass);
+        assert_eq!(k.key(VK_RIGHT, true, MOD_ALT), Action::Command(FOCUS + 1));
+        assert_eq!(k.key(VK_RIGHT, false, 0), Action::Consume);
 
-        for mods in [MOD_WIN, WIN_SHIFT] {
-            assert_eq!(k.key(2, true, mods), Action::Pass);
-            assert_eq!(k.key(2, false, 0), Action::Pass);
-        }
-        assert_eq!(k.key(1, true, MOD_ALT), Action::Command(FOCUS + 1));
-        assert_eq!(k.key(1, false, MOD_ALT), Action::Consume);
+        assert_eq!(k.key(VK_UP, true, WIN_SHIFT), Action::Pass);
+        assert_eq!(k.key(VK_UP, false, 0), Action::Pass);
+        assert_eq!(k.key(VK_UP, true, MOD_WIN), Action::Command(FOCUS + 2));
         assert_eq!(
-            k.key(2, true, MOD_CONTROL | MOD_ALT | MOD_SHIFT),
+            k.key(VK_K, true, MOD_CONTROL | MOD_ALT),
             Action::Command(MOVE + 2)
         );
         k.state.target = 0;
-        assert_eq!(k.key(2, false, 0), Action::Consume);
-        assert_eq!(k.key(0, true, MOD_ALT), Action::Pass);
+        assert_eq!(k.key(VK_K, false, 0), Action::Consume);
+        assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Pass);
+    }
+
+    #[test]
+    fn modal_rebinds_change_only_the_requested_step_and_leave_no_stale_aliases() {
+        let mut k = Keyboard::new();
+        k.assign(Shortcut::StartResize, MOD_ALT, VK_F8);
+        k.assign(Shortcut::GrowUp, 0, VK_K);
+        k.assign(Shortcut::Confirm, 0, VK_SPACE);
+        k.assign(Shortcut::Cancel, 0, VK_BACK);
+        assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
+        assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
+        assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
+        assert_eq!(k.key(VK_UP, true, MOD_WIN), Action::Pass);
+        assert_eq!(k.key(VK_ESCAPE, true, 0), Action::Pass);
+        assert_eq!(k.key(VK_RETURN, true, 0), Action::Pass);
+        assert_eq!(k.key(VK_SPACE, true, 0), Action::Command(CONFIRM));
+        assert_eq!(k.key(VK_F8, false, 0), Action::Consume);
+        assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
+        assert_eq!(k.key(VK_BACK, true, 0), Action::Command(CANCEL));
+    }
+
+    #[test]
+    fn global_quit_takes_precedence_over_an_inherited_resize_alias() {
+        let mut k = Keyboard::new();
+        k.assign(Shortcut::StartResize, MOD_ALT, VK_F8);
+        k.assign(Shortcut::Quit, MOD_ALT, VK_LEFT);
+        assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
+        assert_eq!(k.key(VK_LEFT, true, MOD_ALT), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, false, 0), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, true, 0), Action::Command(EXPAND));
     }
 
     #[test]
     fn custom_resize_opener_supports_held_modifiers_and_shift_for_shrink() {
         for opener in [Modifier::CtrlAlt, Modifier::CtrlAltShift] {
             let mut k = Keyboard::new();
-            k.state.settings.resize = opener;
+            k.settings = k.settings.with_resize_override(opener).unwrap();
             assert_eq!(
-                k.key(ENTER, true, opener.bits()),
+                k.key(VK_RETURN, true, opener.bits()),
                 Action::Command(START_RESIZE)
             );
-            assert_eq!(k.key(ENTER, false, 0), Action::Consume);
+            assert_eq!(k.key(VK_RETURN, false, 0), Action::Consume);
             for mods in [0, MOD_WIN, MOD_CONTROL | MOD_ALT] {
-                assert_eq!(k.key(2, true, mods), Action::Command(EXPAND + 2));
+                assert_eq!(k.key(VK_UP, true, mods), Action::Command(EXPAND + 2));
                 assert_eq!(
-                    k.key(2, true, mods | MOD_SHIFT),
+                    k.key(VK_UP, true, mods | MOD_SHIFT),
                     Action::Command(SHRINK + 2)
                 );
-                assert_eq!(k.key(2, false, 0), Action::Consume);
+                assert_eq!(k.key(VK_UP, false, 0), Action::Consume);
             }
-            assert_eq!(k.key(ESC, true, opener.bits()), Action::Command(CANCEL));
+            assert_eq!(
+                k.key(VK_ESCAPE, true, opener.bits()),
+                Action::Command(CANCEL)
+            );
         }
     }
 }

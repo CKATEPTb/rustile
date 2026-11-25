@@ -575,7 +575,7 @@ impl Manager {
             target,
             before: self.workspace.layout.clone(),
         });
-        self.hud.show(target, rect, None);
+        self.hud.show(target, rect, None, &self.settings);
         true
     }
 
@@ -629,7 +629,7 @@ impl Manager {
                 .into_iter()
                 .find(|(id, _)| *id == target)
             {
-                self.hud.show(target, rect, Some(edge));
+                self.hud.show(target, rect, Some(edge), &self.settings);
             }
         }
     }

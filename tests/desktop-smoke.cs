@@ -68,6 +68,8 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern IntPtr ChildWindowFromPointEx(IntPtr hwnd, Point point, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, UIntPtr wp, StringBuilder text, uint flags,
         uint timeout, out UIntPtr result);
@@ -220,23 +222,87 @@ internal static class DesktopSmoke {
         Require(DwmGetWindowAttribute(hwnd, ExtendedFrameBounds, out frame, Marshal.SizeOf(typeof(Rect))) == 0, "Cannot read DWM frame");
         return Rectangle.FromLTRB(frame.Left, frame.Top, frame.Right, frame.Bottom);
     }
-    static IntPtr TrayWindow(Child manager) {
+    static IntPtr TrayWindow(Child manager, string className = "Rustile.Tray") {
         IntPtr tray = IntPtr.Zero;
-        Until("Rustile should create its tray callback window", () => {
-            Require(!manager.Exited(0), "Rustile exited before its tray window appeared");
+        Until("Rustile should create " + className, () => {
+            Require(!manager.Exited(0), "Rustile exited before " + className + " appeared");
             EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
                 int pid;
                 GetWindowThreadProcessId(hwnd, out pid);
                 if (pid != manager.Pid) return true;
                 var cls = new StringBuilder(80);
                 GetClassName(hwnd, cls, cls.Capacity);
-                if (cls.ToString() != "Rustile.Tray") return true;
+                if (cls.ToString() != className) return true;
                 tray = hwnd;
                 return false;
             }, IntPtr.Zero);
             return tray != IntPtr.Zero;
         });
         return tray;
+    }
+    static IntPtr EditorControl(IntPtr editor, int id) {
+        IntPtr result = IntPtr.Zero;
+        EnumChildWindows(editor, delegate(IntPtr hwnd, IntPtr unused) {
+            if (GetDlgCtrlID(hwnd) != id) return true;
+            result = hwnd;
+            return false;
+        }, IntPtr.Zero);
+        Require(result != IntPtr.Zero, "Missing shortcut editor control " + id);
+        return result;
+    }
+    static string ControlText(IntPtr hwnd) {
+        var text = new StringBuilder(256);
+        UIntPtr result;
+        if (SendMessageTimeout(hwnd, 0x000d, (UIntPtr)text.Capacity, text, 2, 1000, out result) == IntPtr.Zero)
+            throw new Win32Exception();
+        return text.ToString();
+    }
+    static IntPtr OpenShortcutEditor(Child manager, IntPtr tray, Rectangle area) {
+        TrayClick(tray, "Горячие клавиши");
+        var editor = TrayWindow(manager, "Rustile.Shortcuts");
+        Until("The editor should open and the tray flyout should close", () =>
+            IsWindowVisible(editor) && !IsWindowVisible(tray));
+        var bounds = Bounds(editor);
+        Require(Math.Abs((bounds.Left + bounds.Right) - (area.Left + area.Right)) < 8
+            && Math.Abs((bounds.Top + bounds.Bottom) - (area.Top + area.Bottom)) < 8,
+            "Shortcut editor did not open in the center of the monitor");
+        return editor;
+    }
+    static void ClickControl(IntPtr window, int id) {
+        SendTrayMessage(EditorControl(window, id), 0x00f5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
+    }
+    static void PickKey(IntPtr editor, string key) {
+        const int id = 504;
+        var keys = EditorControl(editor, id);
+        UIntPtr index;
+        var value = new StringBuilder(key);
+        if (SendMessageTimeout(keys, 0x0158 /* CB_FINDSTRINGEXACT */, UIntPtr.Zero, value, 2, 1000, out index) == IntPtr.Zero)
+            throw new Win32Exception();
+        Require(index.ToUInt64() < 256, "Missing key choice " + key);
+        SendTrayMessage(keys, 0x014e /* CB_SETCURSEL */, (IntPtr)(int)index.ToUInt32(), IntPtr.Zero);
+        SendTrayMessage(GetParent(keys), 0x0111 /* WM_COMMAND */, (IntPtr)((1 << 16) | id), keys);
+    }
+    static void ExerciseQuitConflict(IntPtr editor) {
+        const int registration = 0x5120;
+        const uint modifiers = 7; // Ctrl+Alt+Shift
+        if (!RegisterHotKey(IntPtr.Zero, registration, modifiers, (uint)Keys.F14)) throw new Win32Exception();
+        var quit = EditorControl(editor, 1019);
+        var original = ControlText(quit);
+        try {
+            ClickControl(editor, 1019);
+            PickKey(editor, "F14");
+            ClickControl(editor, 505);
+            Until("RegisterHotKey conflicts should be displayed in the editor", () =>
+                ControlText(EditorControl(editor, 506)).Contains("F14"));
+            Require(ControlText(quit) == original, "Rustile lost the previous quit shortcut on registration failure");
+        } finally {
+            UnregisterHotKey(IntPtr.Zero, registration);
+        }
+        ClickControl(editor, 505);
+        Until("A released global shortcut should be available immediately", () => ControlText(quit).Contains("F14"));
+        bool available = RegisterHotKey(IntPtr.Zero, registration, modifiers, (uint)Keys.F14);
+        if (available) UnregisterHotKey(IntPtr.Zero, registration);
+        Require(!available, "The editor saved the quit shortcut without registering it with Windows");
     }
     static IntPtr TrayButton(IntPtr tray, string label) {
         IntPtr button = IntPtr.Zero;
@@ -373,8 +439,6 @@ internal static class DesktopSmoke {
         TrayNotify(tray, TraySelect, area);
         Until("A second left click on the tray icon should close the popup", () => !IsWindowVisible(tray));
         TrayOpen(tray, TraySelect, area);
-        TrayClick(tray, "Горячие клавиши");
-        TrayButton(tray, "Перевести фокус");
         TrayClickWithDeactivation(tray, TrayContext, area);
         TrayOpen(tray, TrayContext, area);
         TrayNotify(tray, TrayContext, area);
@@ -429,11 +493,37 @@ internal static class DesktopSmoke {
         Require(!IsWindowEnabled(TrayButton(tray, "Увеличить: Толщина обводки")), "Maximum thickness should disable increase");
         ClickArrow(tray, "Уменьшить: Толщина обводки");
         TrayButton(tray, "Толщина обводки, 3 px");
-        TrayClick(tray, "Горячие клавиши");
-        TrayClick(tray, "Перевести фокус");
-        Require(!IsWindowEnabled(TrayButton(tray, "Win+Shift+стрелки")), "A duplicate move binding was offered");
-        TrayClick(tray, "Alt+стрелки");
-        Until("Choosing a shortcut should dismiss the flyout", () => !IsWindowVisible(tray));
+        var beforeEditor = pair.Select(VisibleFrame).ToArray();
+        var editor = OpenShortcutEditor(manager, tray, area);
+        Require(GetWindow(editor, 4 /* GW_OWNER */) == IntPtr.Zero, "Shortcut editor should be an independent window");
+        var initial = Enumerable.Range(1000, 20).Select(i => ControlText(EditorControl(editor, i))).ToArray();
+        Require(initial.All(t => t.Length > 0), "All 20 shortcuts should be present on one page");
+        var view = Bounds(EditorControl(editor, 510));
+        if (view.Width * 96 >= 810 * GetDpiForSystem() && view.Height * 96 >= 450 * GetDpiForSystem())
+            Require(Enumerable.Range(1000, 20).All(i => view.Contains(Bounds(EditorControl(editor, i)))),
+                "Every shortcut should fit on the default-sized editor page");
+        TrayOpen(tray, TraySelect, area);
+        Require(OpenShortcutEditor(manager, tray, area) == editor, "Opening settings twice created another editor");
+        ClickControl(editor, 1004); // Move left, initially Win+Shift+Left.
+        ClickControl(editor, 503); // Removing Shift would duplicate Focus left.
+        if (IsWindowEnabled(EditorControl(editor, 505))) ClickControl(editor, 505);
+        Until("A duplicate chord should be rejected in the editor", () =>
+            ControlText(EditorControl(editor, 506)).Length != 0 || !IsWindowEnabled(EditorControl(editor, 505)));
+        Require(ControlText(EditorControl(editor, 1004)) == initial[4], "A duplicate replaced the old shortcut");
+        ClickControl(editor, 500); // Win off
+        ClickControl(editor, 502); // Alt on
+        PickKey(editor, "H");
+        ClickControl(editor, 505);
+        Until("Move left should accept Alt+H", () => ControlText(EditorControl(editor, 1004)).Contains("Alt")
+            && ControlText(EditorControl(editor, 1004)).Contains("H"));
+        var changed = ControlText(EditorControl(editor, 1004));
+        for (int i = 0; i < initial.Length; ++i)
+            if (i != 4) Require(ControlText(EditorControl(editor, 1000 + i)) == initial[i],
+                "Rebinding one direction changed shortcut " + i);
+        ExerciseQuitConflict(editor);
+        Require(pair.Select(VisibleFrame).SequenceEqual(beforeEditor), "Shortcut editor changed the tiled layout");
+        Message(editor, WmClose);
+        Until("Closing the editor should leave Rustile running", () => !IsWindowVisible(editor) && !manager.Exited(0));
         Console.WriteLine("PASS  Inline tray controls stay open through clicks, arrow keys, fractional wheel input, typed values and cancellation");
 
         var tiled = pair.Select(VisibleFrame).ToArray();
@@ -454,11 +544,13 @@ internal static class DesktopSmoke {
         TrayButton(tray, "Мозаика, Выключена");
         TrayButton(tray, "Толщина обводки, 3 px");
         Require(pair.Select(Bounds).SequenceEqual(originals), "Disabled startup tiled the windows");
-        TrayClick(tray, "Горячие клавиши");
-        TrayButton(tray, "Перевести фокус, Alt+стрелки");
-        TrayKey(tray, "Перевести фокус, Alt+стрелки", Keys.Left);
-        TrayButton(tray, "Мозаика, Выключена");
-        TrayFocus(restarted, tray, "Горячие клавиши");
+        editor = OpenShortcutEditor(restarted, tray, area);
+        Require(ControlText(EditorControl(editor, 1004)) == changed, "The shortcut was lost after restart");
+        Require(ControlText(EditorControl(editor, 1000)) == initial[0], "Restart changed the original focus shortcut");
+        Message(editor, WmClose);
+        Until("The shortcut editor should close", () => !IsWindowVisible(editor));
+        Console.WriteLine("PASS  Centered single shortcut editor, per-direction assignment, conflict rejection and saved binding after restart");
+        TrayOpen(tray, TraySelect, area);
         TrayClick(tray, "Мозаика");
         Until("Resume should use the stored inner and outer gaps", () => HasSpacing(pair, area));
         TrayOpen(tray, TraySelect, area);
