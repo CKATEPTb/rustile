@@ -1,3 +1,5 @@
+mod toggle;
+
 use std::ptr::null_mut;
 
 use windows_sys::Win32::{
@@ -304,8 +306,6 @@ impl Painter<'_> {
             disabled,
             hover: hot,
             hover_text,
-            accent,
-            on_accent,
             ..
         } = self.colors;
         let p = |n| scale(n, self.dpi);
@@ -383,36 +383,9 @@ impl Painter<'_> {
         }
 
         if matches!(row.action, Action::Apply(Command::Toggle)) {
-            let right = rc.right - p(10);
-            let pill = RECT {
-                left: right - p(34),
-                right,
-                top: mid - p(9),
-                bottom: mid + p(9),
-            };
-            fill(
-                dc,
-                &pill,
-                if self.enabled { accent } else { secondary },
-                p(9),
-            );
-            let x = if self.enabled {
-                right - p(9)
-            } else {
-                pill.left + p(9)
-            };
-            fill(
-                dc,
-                &RECT {
-                    left: x - p(5),
-                    right: x + p(5),
-                    top: mid - p(5),
-                    bottom: mid + p(5),
-                },
-                on_accent,
-                p(5),
-            );
-            label.right = pill.left - p(8);
+            let left = rc.right - p(10) - p(34);
+            self.draw_toggle(dc, left, mid, selected);
+            label.right = left - p(8);
         } else if matches!(row.action, Action::Adjust(_)) {
             let [left, value, right] = stepper_rects(item.rcItem, self.dpi, row.separator);
             self.control(
@@ -464,3 +437,6 @@ impl Painter<'_> {
 pub(super) fn background(dc: HDC, rect: &RECT, colors: Colors) {
     fill(dc, rect, colors.background, 0);
 }
+
+#[cfg(test)]
+mod switch_test;
