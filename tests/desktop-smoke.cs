@@ -71,6 +71,9 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, UIntPtr wp, StringBuilder text, uint flags,
         uint timeout, out UIntPtr result);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp, uint flags,
+        uint timeout, out UIntPtr result);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetProp(IntPtr hwnd, string name);
     [DllImport("user32.dll")] static extern uint GetDpiForSystem();
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
@@ -318,12 +321,28 @@ internal static class DesktopSmoke {
             return info.focus == button;
         });
     }
-    static void TrayOpen(IntPtr tray, int activation, Rectangle screen) {
+    static void SendTrayMessage(IntPtr tray, uint message, IntPtr w, IntPtr l) {
+        UIntPtr result;
+        if (SendMessageTimeout(tray, message, w, l, 2 /* SMTO_ABORTIFHUNG */, 3000, out result) == IntPtr.Zero)
+            throw new Win32Exception();
+    }
+    static void TrayNotify(IntPtr tray, int activation, Rectangle screen) {
         // Version 4 shell callbacks carry the screen coordinates in wParam
         // and the icon ID (high word) plus activation event in lParam.
         int point = ((screen.Bottom - 12) << 16) | ((screen.Right - 12) & 0xffff);
-        if (!PostMessage(tray, TrayCallback, (IntPtr)point, (IntPtr)((1 << 16) | activation)))
-            throw new Win32Exception();
+        SendTrayMessage(tray, TrayCallback, (IntPtr)point, (IntPtr)((1 << 16) | activation));
+    }
+    static void TrayClickWithDeactivation(IntPtr tray, int activation, Rectangle area) {
+        bool right = activation == TrayContext;
+        TrayNotify(tray, right ? 0x0204 : 0x0201 /* WM_*BUTTONDOWN */, area);
+        SendTrayMessage(tray, 0x0006 /* WM_ACTIVATE, WA_INACTIVE */, IntPtr.Zero, IntPtr.Zero);
+        Require(IsWindowVisible(tray), "The popup should stay visible until the icon click completes");
+        TrayNotify(tray, right ? 0x0205 : 0x0202 /* WM_*BUTTONUP */, area);
+        TrayNotify(tray, activation, area);
+        Until("An icon click that takes activation should dismiss the popup once", () => !IsWindowVisible(tray));
+    }
+    static void TrayOpen(IntPtr tray, int activation, Rectangle screen) {
+        TrayNotify(tray, activation, screen);
         TrayButton(tray, "Мозаика");
         Require(Screen.FromHandle(tray).WorkingArea.Contains(Bounds(tray)), "The tray popup extends outside its monitor's work area");
     }
@@ -351,6 +370,22 @@ internal static class DesktopSmoke {
         TrayKey(tray, "Горячие клавиши", Keys.Escape);
         Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
         TrayOpen(tray, TraySelect, area);
+        TrayNotify(tray, TraySelect, area);
+        Until("A second left click on the tray icon should close the popup", () => !IsWindowVisible(tray));
+        TrayOpen(tray, TraySelect, area);
+        TrayClick(tray, "Горячие клавиши");
+        TrayButton(tray, "Перевести фокус");
+        TrayClickWithDeactivation(tray, TrayContext, area);
+        TrayOpen(tray, TrayContext, area);
+        TrayNotify(tray, TrayContext, area);
+        Until("A second right click on the tray icon should close the popup", () => !IsWindowVisible(tray));
+        TrayOpen(tray, TraySelect, area);
+        TrayClickWithDeactivation(tray, TraySelect, area);
+        TrayOpen(tray, TrayKeyboard, area);
+        SendTrayMessage(tray, 0x0006 /* WM_ACTIVATE, WA_INACTIVE */, IntPtr.Zero, pair[0]);
+        Until("Losing activation to another application should close the popup", () => !IsWindowVisible(tray));
+        TrayOpen(tray, TraySelect, area);
+        Console.WriteLine("PASS  Left, right and mixed tray activations toggle the flyout and reopen after outside dismissal");
         ClickArrow(tray, "Увеличить: Толщина обводки");
         TrayButton(tray, "Толщина обводки, 2 px");
         ClickArrow(tray, "Уменьшить: Толщина обводки");

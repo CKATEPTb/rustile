@@ -33,6 +33,7 @@ const CALLBACK: u32 = WM_APP + 20;
 const ICON_ID: u32 = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const RETRY: usize = 1;
+const DISMISS_AFTER_ICON_PRESS: usize = 2;
 const CLASS: *const u16 = w!("Rustile.Tray");
 
 fn scale(dip: i32, dpi: u32) -> i32 {
@@ -49,6 +50,9 @@ struct State {
     attempts: Cell<u8>,
     page: Cell<Page>,
     anchor: Cell<POINT>,
+    icon_bounds: Cell<Option<RECT>>,
+    icon_pressed: Cell<bool>,
+    dismiss_pending: Cell<bool>,
     dpi: Cell<u32>,
     colors: Cell<Colors>,
     fonts: RefCell<Option<Fonts>>,
@@ -104,6 +108,9 @@ impl Tray {
                 attempts: Cell::new(0),
                 page: Cell::new(Page::Main),
                 anchor: Cell::default(),
+                icon_bounds: Cell::default(),
+                icon_pressed: Cell::new(false),
+                dismiss_pending: Cell::new(false),
                 dpi: Cell::new(dpi),
                 colors: Cell::new(Colors::current()),
                 fonts: RefCell::default(),
@@ -260,6 +267,43 @@ impl State {
         self.focus(hwnd, 1);
     }
 
+    fn update_icon_bounds(&self, hwnd: HWND) -> Option<RECT> {
+        let id = NOTIFYICONIDENTIFIER {
+            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: hwnd,
+            uID: ICON_ID,
+            ..Default::default()
+        };
+        let mut rect = RECT::default();
+        let bounds = (self.registered.get()
+            && unsafe { Shell_NotifyIconGetRect(&id, &mut rect) } >= 0)
+            .then_some(rect);
+        self.icon_bounds.set(bounds);
+        bounds
+    }
+
+    fn deactivate(&self, hwnd: HWND) {
+        // Explorer can take focus on button-down and send the icon selection
+        // on button-up. Keep the flyout visible so that selection closes it.
+        let mut cursor = POINT::default();
+        let over_icon = self.icon_bounds.get().is_some_and(|rect| unsafe {
+            GetCursorPos(&mut cursor) != 0 && PtInRect(&rect, cursor) != 0
+        });
+        if (self.icon_pressed.get() || over_icon)
+            && unsafe { SetTimer(hwnd, DISMISS_AFTER_ICON_PRESS, GetDoubleClickTime(), None) } != 0
+        {
+            self.dismiss_pending.set(true);
+        } else {
+            self.hide(hwnd, false);
+        }
+    }
+
+    fn cancel_deferred_dismissal(&self, hwnd: HWND) {
+        if self.dismiss_pending.replace(false) {
+            unsafe { KillTimer(hwnd, DISMISS_AFTER_ICON_PRESS) };
+        }
+    }
+
     fn apply_theme(&self, hwnd: HWND, colors: Colors) {
         self.colors.set(colors);
         unsafe {
@@ -394,6 +438,7 @@ impl State {
     }
 
     fn hide(&self, hwnd: HWND, return_to_tray: bool) {
+        self.icon_pressed.set(false);
         self.finish_edit(hwnd, EndEdit::Blur);
         self.inline.wheel.set(None);
         unsafe {
@@ -402,6 +447,7 @@ impl State {
                 Shell_NotifyIconW(NIM_SETFOCUS, &self.icon_data(hwnd));
             }
         }
+        self.cancel_deferred_dismissal(hwnd);
         self.hot.set(null_mut());
     }
 
@@ -606,21 +652,26 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         match msg {
             CALLBACK if (lp as u32 >> 16) == ICON_ID => {
                 let event = (lp as u32) & 0xffff;
-                if matches!(event, NIN_SELECT | NIN_KEYSELECT | WM_CONTEXTMENU) {
+                if matches!(
+                    event,
+                    WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK
+                ) {
+                    state.icon_pressed.set(IsWindowVisible(hwnd) != 0);
+                } else if matches!(event, WM_LBUTTONUP | WM_RBUTTONUP) {
+                    state.icon_pressed.set(false);
+                } else if matches!(event, NIN_SELECT | NIN_KEYSELECT | WM_CONTEXTMENU) {
+                    if IsWindowVisible(hwnd) != 0 {
+                        state.hide(hwnd, true);
+                        return 0;
+                    }
+                    let bounds = state.update_icon_bounds(hwnd);
                     let mut point = POINT {
                         x: wp as i16 as i32,
                         y: (wp >> 16) as i16 as i32,
                     };
                     let keyboard = event == NIN_KEYSELECT || (point.x == -1 && point.y == -1);
                     if keyboard {
-                        let id = NOTIFYICONIDENTIFIER {
-                            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
-                            hWnd: hwnd,
-                            uID: ICON_ID,
-                            ..Default::default()
-                        };
-                        let mut rect = RECT::default();
-                        if Shell_NotifyIconGetRect(&id, &mut rect) >= 0 {
+                        if let Some(rect) = bounds {
                             point = POINT {
                                 x: (rect.left + rect.right) / 2,
                                 y: rect.top,
@@ -643,9 +694,23 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 state.register_icon(hwnd);
                 0
             }
-            WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize && IsWindowVisible(hwnd) != 0 => {
-                state.hide(hwnd, false);
+            WM_TIMER if wp == DISMISS_AFTER_ICON_PRESS => {
+                // A drag away or a cancelled click can end without a selection.
+                if state.dismiss_pending.get()
+                    && GetAsyncKeyState(VK_LBUTTON as i32) >= 0
+                    && GetAsyncKeyState(VK_RBUTTON as i32) >= 0
+                {
+                    state.hide(hwnd, false);
+                }
                 0
+            }
+            WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize && IsWindowVisible(hwnd) != 0 => {
+                state.deactivate(hwnd);
+                0
+            }
+            WM_ACTIVATE if wp & 0xffff != WA_INACTIVE as usize => {
+                state.cancel_deferred_dismissal(hwnd);
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_MOUSEWHEEL => {
                 state.wheel(hwnd, wp, lp);
