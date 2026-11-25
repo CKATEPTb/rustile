@@ -38,6 +38,7 @@ pub(crate) const QUICK_REVERSE: i32 = 70;
 const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
+pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
 const DESKTOP_SETTLE_MS: u32 = 160;
 
 // GetMessage dispatches out-of-context WinEvents on the hook's installing thread.
@@ -382,6 +383,8 @@ fn pump(
         }
         if message.message == OUTLINE_SETTINGS_CHANGED {
             refresh(manager, 0);
+        } else if message.message == RESIZE_HINT_CHANGED {
+            manager.refresh_resize_hint(message.lParam);
         } else if message.message == KEY_COMMAND {
             // A window can lose focus between its physical key-down and delivery.
             let target = message.lParam;

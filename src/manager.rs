@@ -830,6 +830,10 @@ impl Manager {
         self.session.as_ref().map_or(Mode::Normal, |s| s.mode)
     }
 
+    pub fn refresh_resize_hint(&mut self, window: Id) {
+        self.hud.refresh_appearance(window);
+    }
+
     // Sample foreground once so the cue and the keyboard target agree, including
     // when a modal dialog receives focus while its owner is still tiled.
     pub fn refresh_focus(&mut self) -> Option<Id> {

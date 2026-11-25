@@ -12,8 +12,10 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-        FindWindowExW, GetDesktopWindow, GetWindowRect, GetWindowTextW, IsWindowVisible, SW_HIDE,
-        SW_SHOWNOACTIVATE, SetPropW, ShowWindowAsync,
+        FindWindowExW, GWL_EXSTYLE, GetDesktopWindow, GetWindowLongW, GetWindowRect,
+        GetWindowTextW, HTTRANSPARENT, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SendMessageW,
+        SetPropW, ShowWindowAsync, WM_NCHITTEST, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT,
     },
 };
 use windows_sys::core::w;
@@ -103,6 +105,13 @@ fn resize_hint() -> Option<String> {
             return None;
         }
         if unsafe { IsWindowVisible(window) } != 0 {
+            let styles = unsafe { GetWindowLongW(window, GWL_EXSTYLE) } as u32;
+            let required = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+            assert_eq!(styles & required, required);
+            assert_eq!(
+                unsafe { SendMessageW(window, WM_NCHITTEST, 0, 0) },
+                HTTRANSPARENT as isize
+            );
             let mut text = [0u16; 512];
             let len = unsafe { GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32) };
             if len > 0 {

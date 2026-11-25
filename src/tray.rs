@@ -28,7 +28,8 @@ use windows_sys::core::w;
 use crate::settings::{Command, Settings};
 use crate::startup::Startup;
 use menu::{Action, Row};
-use paint::{Colors, Fonts, Painter};
+use paint::Painter;
+pub(crate) use paint::{Colors, Fonts};
 use shortcut_window::ShortcutWindow;
 use stepper::{EDIT_ID, EndEdit, Inline, arrow_info};
 
@@ -44,7 +45,7 @@ fn scale(dip: i32, dpi: u32) -> i32 {
     (dip * dpi as i32 + 48) / 96
 }
 
-fn load_app_icon(width: i32, height: i32) -> HICON {
+pub(crate) fn load_app_icon(width: i32, height: i32) -> HICON {
     unsafe {
         LoadImageW(
             GetModuleHandleW(null()),

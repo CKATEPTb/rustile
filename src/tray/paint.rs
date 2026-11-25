@@ -12,7 +12,7 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use windows_sys::core::w;
+use windows_sys::core::{PCWSTR, w};
 
 use super::{
     HEADER_ICON_DIP,
@@ -21,22 +21,40 @@ use super::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Colors {
+pub(crate) struct Colors {
     pub background: COLORREF,
     pub border: COLORREF,
-    pub(super) text: COLORREF,
-    pub(super) secondary: COLORREF,
+    pub(crate) text: COLORREF,
+    pub(crate) secondary: COLORREF,
     pub(super) disabled: COLORREF,
-    pub(super) control: COLORREF,
+    pub(crate) control: COLORREF,
     pub(super) hover: COLORREF,
     pub(super) hover_text: COLORREF,
     pub(super) accent: COLORREF,
     pub(super) on_accent: COLORREF,
     pub dark: bool,
+    pub(crate) high_contrast: bool,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     u32::from_le_bytes([r, g, b, 0])
+}
+
+fn personalization_enabled(name: PCWSTR) -> bool {
+    let mut value = 1u32;
+    let mut bytes = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            name,
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&raw mut value).cast(),
+            &mut bytes,
+        )
+    };
+    status != 0 || value != 0
 }
 
 impl Colors {
@@ -60,47 +78,43 @@ impl Colors {
                     accent: GetSysColor(COLOR_HIGHLIGHT),
                     on_accent: GetSysColor(COLOR_HIGHLIGHTTEXT),
                     dark: false,
+                    high_contrast: true,
                 };
             }
-            let mut light = 1u32;
-            let mut bytes = size_of::<u32>() as u32;
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                w!("AppsUseLightTheme"),
-                RRF_RT_REG_DWORD,
-                null_mut(),
-                (&raw mut light).cast(),
-                &mut bytes,
-            );
-            if light == 0 {
-                Self {
-                    background: rgb(43, 45, 49),
-                    border: rgb(69, 72, 78),
-                    text: rgb(246, 247, 249),
-                    secondary: rgb(199, 201, 207),
-                    disabled: rgb(147, 150, 156),
-                    control: rgb(53, 55, 59),
-                    hover: rgb(60, 63, 68),
-                    hover_text: rgb(255, 255, 255),
-                    accent: rgb(108, 199, 255),
-                    on_accent: rgb(18, 41, 57),
-                    dark: true,
-                }
-            } else {
-                Self {
-                    background: rgb(249, 249, 250),
-                    border: rgb(212, 214, 218),
-                    text: rgb(29, 31, 35),
-                    secondary: rgb(86, 90, 97),
-                    disabled: rgb(112, 115, 119),
-                    control: rgb(255, 255, 255),
-                    hover: rgb(235, 237, 240),
-                    hover_text: rgb(19, 22, 25),
-                    accent: rgb(0, 100, 172),
-                    on_accent: rgb(255, 255, 255),
-                    dark: false,
-                }
+        }
+        Self::themed(!personalization_enabled(w!("AppsUseLightTheme")))
+    }
+
+    pub(crate) fn themed(dark: bool) -> Self {
+        if dark {
+            Self {
+                background: rgb(43, 45, 49),
+                border: rgb(69, 72, 78),
+                text: rgb(246, 247, 249),
+                secondary: rgb(199, 201, 207),
+                disabled: rgb(147, 150, 156),
+                control: rgb(53, 55, 59),
+                hover: rgb(60, 63, 68),
+                hover_text: rgb(255, 255, 255),
+                accent: rgb(108, 199, 255),
+                on_accent: rgb(18, 41, 57),
+                dark: true,
+                high_contrast: false,
+            }
+        } else {
+            Self {
+                background: rgb(249, 249, 250),
+                border: rgb(212, 214, 218),
+                text: rgb(29, 31, 35),
+                secondary: rgb(86, 90, 97),
+                disabled: rgb(112, 115, 119),
+                control: rgb(255, 255, 255),
+                hover: rgb(235, 237, 240),
+                hover_text: rgb(19, 22, 25),
+                accent: rgb(0, 100, 172),
+                on_accent: rgb(255, 255, 255),
+                dark: false,
+                high_contrast: false,
             }
         }
     }
@@ -108,12 +122,16 @@ impl Colors {
     pub fn edit_colors(self) -> (COLORREF, COLORREF) {
         (self.text, self.control)
     }
+
+    pub(crate) fn allows_transparency(self) -> bool {
+        !self.high_contrast && personalization_enabled(w!("EnableTransparency"))
+    }
 }
 
-pub(super) struct Fonts {
-    pub(super) regular: HFONT,
-    pub(super) small: HFONT,
-    pub(super) heading: HFONT,
+pub(crate) struct Fonts {
+    pub(crate) regular: HFONT,
+    pub(crate) small: HFONT,
+    pub(crate) heading: HFONT,
     pub(super) symbol: HFONT,
 }
 
