@@ -9,6 +9,8 @@ mod drop_tests;
 #[cfg(test)]
 mod focused_insert_tests;
 #[cfg(test)]
+mod keyboard_resize_tests;
+#[cfg(test)]
 mod mouse_resize_tests;
 #[cfg(test)]
 mod move_sequence_tests;
@@ -202,6 +204,10 @@ pub enum Direction {
 }
 
 impl Direction {
+    fn opposite(self) -> Self {
+        self.axis().direction(!self.towards_start())
+    }
+
     fn coordinate(self, rect: Rect) -> i64 {
         let (first, last) = self.axis().bounds(rect);
         if self.towards_start() { first } else { last }
@@ -502,16 +508,6 @@ impl SharedPair {
         cells[self.source] = source;
         cells[self.target] = target;
         true
-    }
-
-    fn other(&self, slot: usize) -> Option<usize> {
-        if self.source == slot {
-            Some(self.target)
-        } else if self.target == slot {
-            Some(self.source)
-        } else {
-            None
-        }
     }
 }
 
@@ -1341,116 +1337,33 @@ impl Layout {
         area: Rect,
     ) -> Option<Direction> {
         let slot = self.slot(id)?;
-        let cells = self.cell_rects(area);
-        let mut companion = None;
-        if let Some(index) = self
-            .shared
-            .iter()
-            .position(|p| p.slots().any(|s| s == slot))
-        {
-            if self.shared[index].vacancy().is_some() {
-                // Every participant starts a resize from its displayed frame.
-                let mut displayed = self.clone();
-                if !displayed.freeze_pair(index, area) {
-                    return None;
-                }
-                let edge = displayed.resize(id, direction, shrink, area)?;
-                *self = displayed;
-                return Some(edge);
-            }
-            let pair = &mut self.shared[index];
-            companion = pair.other(slot);
-            let (source, target) = pair.rectangles(&cells, &self.occupants, self.grid.gap)?;
-            let previous = pair.partition.clone();
-            let Partition::Divider {
-                axis,
-                source_first,
-                part,
-                whole,
-            } = &mut pair.partition
-            else {
-                // An L's corner is fixed by the surrounding cells. Resize
-                // from the settled pair, keeping a failed resize a no-op.
-                let mut settled = self.clone();
-                let pair = settled.shared.swap_remove(index);
-                settled.exchange(pair.source, pair.target, area, &cells);
-                let edge = settled.resize(id, direction, shrink, area)?;
-                *self = settled;
-                return Some(edge);
-            };
-            let first = if *source_first { source } else { target };
-            let edge = axis.direction((slot == pair.source) != *source_first);
-            if direction.axis() == *axis && (!shrink || direction == edge) {
-                let total = axis.length(source) + axis.length(target);
-                let (a, b) = (
-                    axis.min_dimension(self.occupants[pair.source].min),
-                    axis.min_dimension(self.occupants[pair.target].min),
-                );
-                let minimums = if *source_first { (a, b) } else { (b, a) };
-                *part = shifted_divider(axis.length(first), total, minimums, direction, shrink)?;
-                *whole = total;
-                if !SharedPair::can_freeze(
-                    &self.shared,
-                    area,
-                    &cells,
-                    &self.occupants,
-                    self.grid.gap,
-                ) {
-                    self.shared[index].partition = previous;
-                    return None;
-                }
-                return Some(edge);
-            }
-        }
-        let (root_minima, children) = self.bsp.minimums(self.minimums(area), self.grid.gap);
-        let roots = self.grid.rects(area);
-        let count = roots.len();
-        let edge = if let Some(edge) = self.bsp.resize(
-            slot,
-            (direction, shrink),
-            roots,
-            companion,
-            &children,
-            self.grid.gap,
-        ) {
-            edge
+        let tiles = self.visible_rects(area);
+        let active = tiles[slot];
+        let edge = if shrink || direction.coordinate(active) == direction.coordinate(area) {
+            direction.opposite()
         } else {
-            self.grid.resize(
-                self.bsp.root(slot, count),
-                direction,
-                shrink,
-                area,
-                companion.map(|s| self.bsp.root(s, count)),
-                &root_minima,
-            )?
+            direction
         };
-        self.bsp
-            .fit(self.grid.rects(area), &children, self.grid.gap);
-        self.settle_invalid_pairs(area);
-        Some(edge)
-    }
-}
+        let peer = tiles[nearest(active, edge, tiles.iter().copied())?];
+        if edge.distance(active, peer) != i64::from(self.grid.gap) {
+            return None;
+        }
 
-fn shifted_divider(
-    current: i32,
-    total: i32,
-    minimums: (i32, i32),
-    direction: Direction,
-    shrink: bool,
-) -> Option<i32> {
-    let (min, max) = (minimums.0, total - minimums.1);
-    if min > max {
-        return None;
+        // Put keyboard stops at 5% intervals around the midpoint of these two
+        // tiles. Reversing from a clamped minimum returns to the previous stop.
+        let axis = edge.axis();
+        let total = i64::from(axis.length(active)) + i64::from(axis.length(peer));
+        let first = if edge.towards_start() { peer } else { active };
+        let step = (total / 20).max(1);
+        let offset = i64::from(axis.length(first)) - (total + 1) / 2;
+        let delta = if direction.towards_start() {
+            -(step - (-offset).rem_euclid(step))
+        } else {
+            step - offset.rem_euclid(step)
+        };
+        let target = i32::try_from(edge.coordinate(active) + delta).ok()?;
+        self.resize_edge_to(id, edge, target, area).then_some(edge)
     }
-    let step = (total / 20).max(1);
-    let offset = current - (total / 2 + total % 2);
-    let next = if direction.towards_start() == shrink {
-        current.saturating_add(step - offset.rem_euclid(step))
-    } else {
-        current.saturating_sub(step - (-offset).rem_euclid(step))
-    }
-    .clamp(min, max);
-    (next != current).then_some(next)
 }
 
 fn nearest(origin: Rect, direction: Direction, rects: impl Iterator<Item = Rect>) -> Option<usize> {

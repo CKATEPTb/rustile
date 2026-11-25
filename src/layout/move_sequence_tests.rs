@@ -978,7 +978,10 @@ fn resizing_a_portrait_move_uses_the_horizontal_seam_for_either_occupant() {
             layout = preview.clone();
         }
         let previous = check_desktop(&layout);
-        assert_eq!(layout.resize(active, seam, true, DESKTOP), Some(seam));
+        assert_eq!(
+            layout.resize(active, seam.opposite(), true, DESKTOP),
+            Some(seam)
+        );
         let shrunk = check_desktop(&layout);
         assert!(shrunk[&active].h < previous[&active].h);
         stationary(&previous, &shrunk, TALL, TELEGRAM);

@@ -252,62 +252,6 @@ impl Grid {
             self.bands = heights;
         }
     }
-
-    pub fn resize(
-        &mut self,
-        cell: usize,
-        direction: Direction,
-        shrink: bool,
-        area: Rect,
-        companion: Option<usize>,
-        minima: &[(i32, i32)],
-    ) -> Option<Direction> {
-        let (band, segment) = self.tracks(cell)?;
-        let axis = direction.axis();
-        let other = companion.and_then(|slot| self.tracks(slot));
-        let (weights, active, other, mins) = if axis == self.flow {
-            let start: usize = self.segments[..band].iter().map(Vec::len).sum();
-            let mins = minima[start..start + self.segments[band].len()]
-                .iter()
-                .map(|&m| axis.min_dimension(m))
-                .collect();
-            (
-                &mut self.segments[band],
-                segment,
-                other.filter(|&(b, _)| b == band).map(|(_, s)| s),
-                mins,
-            )
-        } else {
-            let mins = self.band_minima(minima);
-            (&mut self.bands, band, other.map(|(b, _)| b), mins)
-        };
-        let lo = active.min(other.unwrap_or(active));
-        let hi = active.max(other.unwrap_or(active));
-        let leading = lo.checked_sub(1);
-        let trailing = (hi + 1 < weights.len()).then_some(hi);
-        let divider = if shrink {
-            if direction.towards_start() {
-                leading
-            } else {
-                trailing
-            }
-        } else {
-            trailing.or(leading)
-        }?;
-        let mut sizes = lengths(weights, axis.length(area), &mins, self.gap)?;
-        let total = sizes[divider] + sizes[divider + 1];
-        let next = super::shifted_divider(
-            sizes[divider],
-            total,
-            (mins[divider], mins[divider + 1]),
-            direction,
-            shrink,
-        )?;
-        sizes[divider] = next;
-        sizes[divider + 1] = total - next;
-        *weights = sizes;
-        Some(axis.direction(active > divider))
-    }
 }
 
 // Clamp existing divider positions to the space needed on either side. A

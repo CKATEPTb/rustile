@@ -1,4 +1,4 @@
-use super::{Axis, Direction, Rect, shifted_divider};
+use super::{Axis, Direction, Rect};
 
 type Size = (i32, i32);
 
@@ -256,53 +256,5 @@ impl Bsp {
             cells[cut.at] = first;
             cells.push(second);
         }
-    }
-
-    pub fn resize(
-        &mut self,
-        slot: usize,
-        motion: (Direction, bool),
-        cells: Vec<Rect>,
-        companion: Option<usize>,
-        minimums: &[(Size, Size)],
-        gap: i32,
-    ) -> Option<Direction> {
-        let (direction, shrink) = motion;
-        let roots = cells.len();
-        let (cells, parents) = self.leaves_and_parents(cells, gap);
-        let axis = direction.axis();
-        let (mut lo, mut hi) = axis.bounds(cells[slot]);
-        if let Some(other) = companion {
-            let (a, b) = axis.bounds(cells[other]);
-            lo = lo.min(a);
-            hi = hi.max(b);
-        }
-        let mut active = slot;
-        for (i, cut) in self.0.iter_mut().enumerate().rev() {
-            let trailing = active == roots + i;
-            if !trailing && active != cut.at {
-                continue;
-            }
-            active = cut.at;
-            if cut.axis != axis || shrink && direction.towards_start() != trailing {
-                continue;
-            }
-            let (a, b) = cut.parts(parents[i], gap);
-            if trailing && axis.bounds(b).0 != lo || !trailing && axis.bounds(a).1 != hi {
-                continue;
-            }
-            let total = axis.length(a) + axis.length(b);
-            let (m, n) = minimums[i];
-            cut.part = shifted_divider(
-                axis.length(a),
-                total,
-                (axis.min_dimension(m), axis.min_dimension(n)),
-                direction,
-                shrink,
-            )?;
-            cut.whole = total;
-            return Some(axis.direction(trailing));
-        }
-        None
     }
 }

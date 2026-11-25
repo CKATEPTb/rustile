@@ -45,10 +45,10 @@ shortcuts! {
     GrowRight,   "Расширить вправо",   Grow, VK_RIGHT;
     GrowUp,      "Расширить вверх",    Grow, VK_UP;
     GrowDown,    "Расширить вниз",     Grow, VK_DOWN;
-    ShrinkLeft,  "Сузить слева",       Shrink, VK_LEFT;
-    ShrinkRight, "Сузить справа",      Shrink, VK_RIGHT;
-    ShrinkUp,    "Сузить сверху",      Shrink, VK_UP;
-    ShrinkDown,  "Сузить снизу",       Shrink, VK_DOWN;
+    ShrinkLeft,  "Правый край влево",  Shrink, VK_LEFT;
+    ShrinkRight, "Левый край вправо",  Shrink, VK_RIGHT;
+    ShrinkUp,    "Нижний край вверх",  Shrink, VK_UP;
+    ShrinkDown,  "Верхний край вниз",  Shrink, VK_DOWN;
     Confirm,     "Применить размер",   Finish, VK_RETURN;
     Cancel,      "Отменить изменение", Finish, VK_ESCAPE;
 }

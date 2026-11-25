@@ -237,6 +237,21 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
 
     let initial: Vec<_> = windows.iter().map(|&id| (id, frame(id))).collect();
     let (left, center, right) = (frame(active), frame(middle), frame(end));
+    assert!(manager.begin_resize(middle));
+    manager.resize(middle, Direction::Left, false);
+    settle(manager, 5);
+    let grown = frame(middle);
+    assert!(grown.x < center.x);
+    assert_eq!(grown.x + grown.w, center.x + center.w);
+    manager.resize(middle, Direction::Left, true);
+    settle(manager, 5);
+    let shrunk = frame(middle);
+    assert_eq!(shrunk.x, grown.x);
+    assert!(shrunk.w < grown.w);
+    manager.finish_mode(false);
+    settle(manager, 5);
+    assert!(initial.iter().all(|&(id, rect)| frame(id) == rect));
+
     move_and_settle(manager, active, Direction::Right, windows);
     assert_split(join_frames(left, center).unwrap(), middle, active, false);
     for &(id, rect) in &initial {
@@ -649,9 +664,12 @@ fn move_left_in_three_columns(
     settle(manager, 3);
     // Match the reported layout: the browser and Explorer are both wider
     // than the chat between them, and the browser/chat union is landscape.
-    for (id, direction) in [(chat, Direction::Left), (browser, Direction::Right)] {
+    for (id, direction, shrink) in [
+        (chat, Direction::Left, true),
+        (browser, Direction::Right, false),
+    ] {
         assert!(manager.begin_resize(id));
-        manager.resize(id, direction, false);
+        manager.resize(id, direction, shrink);
         manager.finish_mode(true);
         settle(manager, 3);
     }

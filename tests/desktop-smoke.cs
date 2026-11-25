@@ -1196,16 +1196,25 @@ internal static class DesktopSmoke {
         Thread.Sleep(60);
         // At least one of each opposite pair points at an internal divider.
         int moved = -1;
+        int index = Array.IndexOf(handles, active);
+        var initialFrame = VisibleFrame(active);
+        var work = handles.Select(VisibleFrame).Aggregate(Rectangle.Union);
         foreach (int direction in new[] { 20, 21, 22, 23 }) {
+            if ((direction == 20 && initialFrame.Left == work.Left)
+                || (direction == 21 && initialFrame.Right == work.Right)
+                || (direction == 22 && initialFrame.Top == work.Top)
+                || (direction == 23 && initialFrame.Bottom == work.Bottom)) continue;
             manager.Send(RustileShortcut, direction, active);
             Thread.Sleep(60);
             if (!handles.Select(Bounds).SequenceEqual(before)) { moved = direction; break; }
         }
         Require(moved >= 0, "Resize command did not move a divider");
-        manager.Send(RustileShortcut, moved ^ 1, active);
-        Until("Opposite plain arrow should return the divider", () => handles.Select(Bounds).SequenceEqual(before));
-        manager.Send(RustileShortcut, moved, active);
-        Until("Resize should move the divider again", () => !handles.Select(Bounds).SequenceEqual(before));
+        bool horizontal = moved < 22;
+        Func<Rectangle, int> extent = r => horizontal ? r.Width : r.Height;
+        int expanded = extent(Bounds(active));
+        Require(expanded > extent(before[index]), "Plain arrow toward a neighbor should grow the active tile");
+        manager.Send(RustileShortcut, 30 + ((moved - 20) ^ 1), active);
+        Until("Shift with the opposite arrow should shrink the grown edge", () => extent(Bounds(active)) < expanded);
         manager.Send(RustileShortcut, 41, active);
         Until("Escape should restore the initial split", () => handles.Select(Bounds).SequenceEqual(before));
         manager.Send(RustileShortcut, 1, active);
