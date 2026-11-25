@@ -11,6 +11,13 @@ struct Inventory {
 }
 
 impl Inventory {
+    fn empty_spare(&self, preferred: Option<DesktopId>) -> Option<DesktopId> {
+        let empty = |id: &DesktopId| !self.occupied.contains(id);
+        preferred
+            .filter(|id| self.order.contains(id) && empty(id))
+            .or_else(|| self.order.iter().rev().find(|id| empty(id)).copied())
+    }
+
     fn read(shell: &DesktopShell) -> Option<Self> {
         let current = shell.current()?;
         let order = shell.list()?;
@@ -30,10 +37,21 @@ impl Inventory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Change {
     Create,
+    MoveToEnd(DesktopId),
     Remove {
         desktop: DesktopId,
         fallback: DesktopId,
     },
+}
+
+impl Change {
+    fn position_spare(order: &[DesktopId], spare: Option<DesktopId>) -> Option<Self> {
+        match spare {
+            None => Some(Self::Create),
+            Some(id) if order.last() != Some(&id) => Some(Self::MoveToEnd(id)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,6 +74,24 @@ struct Policy {
 }
 
 impl Policy {
+    fn apply(&mut self, shell: &DesktopShell, change: Change) -> bool {
+        let applied = match change {
+            Change::Create => {
+                self.spare = shell.create();
+                self.spare.is_some()
+            }
+            Change::MoveToEnd(spare) => {
+                self.spare = Some(spare);
+                shell.move_to_end(spare)
+            }
+            Change::Remove { desktop, fallback } => shell.remove(desktop, fallback),
+        };
+        if !applied {
+            self.failed();
+        }
+        applied
+    }
+
     fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
         let seconds = match self.failures {
@@ -82,13 +118,13 @@ impl Policy {
             // one the user selected and retire the old spare in the background.
             Some(current)
         } else {
-            self.spare
-                .filter(|id| inventory.order.contains(id) && empty(id))
-                .or_else(|| inventory.order.iter().rev().find(|id| empty(id)).copied())
+            inventory.empty_spare(self.spare)
         };
-        let change = match self.spare {
-            None => Some(Change::Create),
-            Some(spare) => inventory
+        // Establish the trailing spare first, even if an active, recently
+        // emptied desktop must remain in place until the user leaves it.
+        let change = Change::position_spare(&inventory.order, self.spare).or_else(|| {
+            let spare = self.spare?;
+            inventory
                 .order
                 .iter()
                 .copied()
@@ -96,8 +132,8 @@ impl Policy {
                 .map(|desktop| Change::Remove {
                     desktop,
                     fallback: spare,
-                }),
-        };
+                })
+        });
         let Some(change) = change else {
             self.pending = None;
             self.issued = None;
@@ -210,16 +246,7 @@ impl Workspaces {
             Decision::Verify => Some(SETTLE_MS),
             Decision::RetryAfter(delay) => Some(delay),
             Decision::Apply(change) => {
-                let applied = match change {
-                    Change::Create => {
-                        self.policy.spare = shell.create();
-                        self.policy.spare.is_some()
-                    }
-                    Change::Remove { desktop, fallback } => shell.remove(desktop, fallback),
-                };
-                if !applied {
-                    self.policy.failed();
-                }
+                self.policy.apply(shell, change);
                 // Even after an RPC error, the Shell may have committed the change.
                 // Observe the result before considering another mutation.
                 Some(SETTLE_MS)
@@ -237,26 +264,28 @@ impl Workspaces {
         if let Some(target) = neighbor(&order, current, next) {
             return shell.switch(target);
         }
-        // A user can open the first window on the spare and immediately press Next,
-        // before the normal two event-driven observations have created its successor.
+        // Next at the occupied right edge can arrive before Explorer's change
+        // notification settles. Put the spare there before switching to it.
         if next
             && order.last() == Some(&current)
             && let Some(inventory) = Inventory::read(shell)
             && inventory.order == order
             && inventory.current == current
-            && order.iter().all(|id| inventory.occupied.contains(id))
+            && inventory.occupied.contains(&current)
+            && let Some(change) =
+                Change::position_spare(&order, inventory.empty_spare(self.policy.spare))
         {
-            let proposal = (inventory, Change::Create);
+            let proposal = (inventory, change);
             if self.policy.issued.as_ref() != Some(&proposal) {
                 self.policy.issued = Some(proposal);
                 self.policy.pending = None;
                 self.policy.retry_at = None;
                 self.policy.failures = 0;
-                self.policy.spare = shell.create();
-                if let Some(spare) = self.policy.spare {
+                if self.policy.apply(shell, change)
+                    && let Some(spare) = self.policy.spare
+                {
                     return shell.switch(spare);
                 }
-                self.policy.failed();
             }
         }
         false
@@ -327,15 +356,81 @@ mod tests {
             Decision::Idle
         );
         assert_eq!(policy.observe(empty.clone()), Decision::Verify);
-        // Desktop 2 became current. It can now replace 3 as the spare, but
-        // the pending request to remove 2 must never be issued.
+        // Returning to desktop 2 keeps its identity as the new trailing spare.
         let returned = inventory(&[1, 2, 3], 2, &[1]);
         assert_eq!(policy.observe(returned.clone()), Decision::Verify);
         assert_eq!(
             policy.observe(returned),
+            Decision::Apply(Change::MoveToEnd(DesktopId(2)))
+        );
+        let reordered = inventory(&[1, 3, 2], 2, &[1]);
+        assert_eq!(policy.observe(reordered.clone()), Decision::Verify);
+        assert_eq!(
+            policy.observe(reordered),
             Decision::Apply(Change::Remove {
                 desktop: DesktopId(3),
                 fallback: DesktopId(2),
+            })
+        );
+    }
+
+    #[test]
+    fn manually_reordered_spare_returns_to_the_end_even_when_selected() {
+        for current in [1, 2, 3] {
+            for displaced in [[2, 3, 1], [3, 2, 1]] {
+                let mut policy = Policy::default();
+                let original = inventory(&[3, 1, 2], current, &[1, 3]);
+                assert_eq!(policy.observe(original.clone()), Decision::Idle);
+                let moved = inventory(&displaced, current, &[1, 3]);
+                assert_eq!(policy.observe(moved.clone()), Decision::Verify);
+                assert_eq!(
+                    policy.observe(moved),
+                    Decision::Apply(Change::MoveToEnd(DesktopId(2)))
+                );
+                assert_eq!(policy.observe(original), Decision::Idle);
+            }
+        }
+    }
+
+    #[test]
+    fn window_opened_during_move_confirmation_keeps_its_desktop_in_place() {
+        let mut policy = Policy::default();
+        assert_eq!(
+            policy.observe(inventory(&[1, 2], 2, &[2])),
+            Decision::Verify
+        );
+        let full = inventory(&[1, 2], 2, &[1, 2]);
+        assert_eq!(policy.observe(full.clone()), Decision::Verify);
+        assert_eq!(policy.observe(full), Decision::Apply(Change::Create));
+    }
+
+    #[test]
+    fn the_spare_stays_last_while_the_vacated_current_waits_for_departure() {
+        let mut policy = Policy::default();
+        assert_eq!(
+            policy.observe(inventory(&[1, 2, 3], 2, &[1, 2])),
+            Decision::Idle
+        );
+        let closed_and_reordered = inventory(&[3, 1, 2], 2, &[1]);
+        assert_eq!(
+            policy.observe(closed_and_reordered.clone()),
+            Decision::Verify
+        );
+        assert_eq!(
+            policy.observe(closed_and_reordered),
+            Decision::Apply(Change::MoveToEnd(DesktopId(3)))
+        );
+        assert_eq!(
+            policy.observe(inventory(&[1, 2, 3], 2, &[1])),
+            Decision::Idle
+        );
+        let left = inventory(&[1, 2, 3], 1, &[1]);
+        assert_eq!(policy.observe(left.clone()), Decision::Verify);
+        assert_eq!(
+            policy.observe(left),
+            Decision::Apply(Change::Remove {
+                desktop: DesktopId(2),
+                fallback: DesktopId(3)
             })
         );
     }

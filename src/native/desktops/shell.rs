@@ -71,7 +71,7 @@ struct ManagerVtable {
     switch: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     switch_and_move_foreground: usize,
     create: Out<ShellDesktop>,
-    move_desktop: usize,
+    move_desktop: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> HRESULT,
     remove: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
     find: unsafe extern "system" fn(*mut c_void, *const GUID, *mut Option<ShellDesktop>) -> HRESULT,
 }
@@ -101,6 +101,12 @@ impl ShellManager {
 
     fn current(&self) -> Option<DesktopId> {
         self.object(self.vtable().current)?.id()
+    }
+
+    fn move_desktop(&self, desktop: &ShellDesktop, index: u32) -> Option<()> {
+        unsafe { (self.vtable().move_desktop)(self.as_raw(), desktop.as_raw(), index) }
+            .ok()
+            .ok()
     }
 }
 
@@ -235,6 +241,19 @@ impl DesktopShell {
         self.with_manager(|manager| manager.object(manager.vtable().create)?.id())
     }
 
+    pub(crate) fn move_to_end(&self, id: DesktopId) -> bool {
+        self.with_manager(|manager| {
+            let desktop = manager.find(id)?;
+            let order = manager.object(manager.vtable().list)?;
+            let last = unsafe { order.GetCount() }.ok()?.checked_sub(1)?;
+            if unsafe { order.GetAt::<ShellDesktop>(last) }.ok()?.id()? == id {
+                return Some(());
+            }
+            manager.move_desktop(&desktop, last)
+        })
+        .is_some()
+    }
+
     pub(crate) fn switch(&self, id: DesktopId) -> bool {
         self.with_manager(|manager| {
             let desktop = manager.find(id)?;
@@ -267,7 +286,14 @@ impl DesktopShell {
 
 #[cfg(test)]
 mod tests {
+    use super::super::occupancy::occupied;
     use super::*;
+
+    fn move_for_test(shell: &DesktopShell, id: DesktopId, index: u32) -> bool {
+        shell
+            .with_manager(|manager| manager.move_desktop(&manager.find(id)?, index))
+            .is_some()
+    }
 
     #[test]
     fn private_abi_is_limited_to_known_builds() {
@@ -290,8 +316,6 @@ mod tests {
     #[test]
     #[ignore = "creates and removes its own background desktop on a supported Explorer session"]
     fn desktop_shell_background_round_trip() {
-        use super::super::occupancy::occupied;
-
         let shell = DesktopShell::connect().expect("supported Explorer on the interactive desktop");
         let original = shell.current().expect("initial desktop");
         let before = shell.list().expect("initial desktop list");
@@ -309,6 +333,11 @@ mod tests {
             !occupied.contains(&created),
             "new desktop acquired a window"
         );
+        assert!(move_for_test(&shell, created, 0));
+        assert_eq!(shell.list().expect("moved desktop").first(), Some(&created));
+        assert!(shell.move_to_end(created));
+        assert_eq!(shell.list().expect("original order restored"), after);
+        assert_eq!(shell.current(), Some(original));
         assert!(shell.remove(created, original));
         assert!(
             !shell
@@ -317,5 +346,62 @@ mod tests {
                 .contains(&created)
         );
         assert_eq!(shell.current(), Some(original));
+    }
+
+    #[test]
+    #[ignore = "requires running Rustile; temporarily reorders the verified empty background spare"]
+    fn running_rustile_returns_displaced_spare_to_end() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+        let tray = unsafe { FindWindowW(w!("Rustile.Tray"), w!("Rustile")) };
+        assert!(!tray.is_null(), "start the updated Rustile first");
+        let shell = DesktopShell::connect().expect("supported interactive Explorer");
+        let before = shell.list().expect("initial order");
+        let current = shell.current().expect("initial current desktop");
+        let spare = *before.last().expect("trailing spare");
+        let used = occupied(&before).expect("complete occupancy inventory");
+        assert!(before.len() >= 2 && used.contains(&current));
+        assert!(!used.contains(&spare));
+        assert!(
+            before[..before.len() - 1]
+                .iter()
+                .all(|id| used.contains(id))
+        );
+        assert_eq!(shell.list().as_ref(), Some(&before));
+        assert_eq!(shell.current(), Some(current));
+        let index = before.len() - 2;
+        let mut displaced = before.clone();
+        displaced.swap(index, index + 1);
+        assert!(move_for_test(&shell, spare, u32::try_from(index).unwrap()));
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut saw_displacement = false;
+        loop {
+            let order = shell.list();
+            if shell.current() != Some(current) {
+                break;
+            }
+            if order.as_ref() == Some(&before) && saw_displacement {
+                return;
+            }
+            if order.as_ref() != Some(&displaced) || Instant::now() >= deadline {
+                break;
+            }
+            saw_displacement = true;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A stopped build may leave the test's reorder in place. Undo only
+        // that exact reorder if nobody switched, opened a window or edited it.
+        if shell.list().as_ref() == Some(&displaced)
+            && shell.current() == Some(current)
+            && occupied(&displaced).is_some_and(|ids| !ids.contains(&spare))
+        {
+            assert!(
+                shell.move_to_end(spare),
+                "failed to restore the verified spare"
+            );
+        }
+        panic!("running Rustile did not restore the observed displaced spare");
     }
 }
