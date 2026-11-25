@@ -1,5 +1,7 @@
 use super::*;
+use crate::native::desktops::object_name;
 use windows_sys::Win32::System::Registry::*;
+use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::core::w;
 
 #[test]

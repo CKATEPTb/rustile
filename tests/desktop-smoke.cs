@@ -56,6 +56,9 @@ internal static class DesktopSmoke {
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr handle, uint code);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token,
+        int infoClass, out int value, int size, out int written);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern bool CreateProcess(string file, StringBuilder args, IntPtr processSecurity, IntPtr threadSecurity,
         bool inherit, uint flags, IntPtr env, string workingDir, ref StartupInfo startup, out ProcessInfo process);
@@ -203,6 +206,16 @@ internal static class DesktopSmoke {
             CloseHandle(info.thread);
         }
         public bool Exited(uint timeout) { return WaitForSingleObject(process, timeout) == 0; }
+        public bool IsElevated() {
+            IntPtr token;
+            if (!OpenProcessToken(process, 8 /* TOKEN_QUERY */, out token)) throw new Win32Exception();
+            try {
+                int elevated, written;
+                if (!GetTokenInformation(token, 20 /* TokenElevation */, out elevated, sizeof(int), out written))
+                    throw new Win32Exception();
+                return elevated != 0;
+            } finally { CloseHandle(token); }
+        }
         public uint ExitCode {
             get { uint code; if (!GetExitCodeProcess(process, out code)) throw new Win32Exception(); return code; }
         }
@@ -1247,12 +1260,16 @@ internal static class DesktopSmoke {
             bool quitWasAvailable = QuitChordAvailable();
             var manager = new Child(rustile, "", desktopName, true);
             children.Add(manager);
+            bool elevated = manager.IsElevated();
+            Require(fixtures.Take(2).All(fixture => fixture.IsElevated() == elevated),
+                "This scenario requires both windows to run at the same elevation as Rustile");
             var area = Screen.PrimaryScreen.WorkingArea;
             Until("Existing windows should tile on launch", () => {
                 Require(!manager.Exited(0), "Rustile stopped before the initial layout");
                 return Tiled(area, windows.Take(2).ToArray());
             });
             Console.WriteLine("PASS  Default Windows-key profile starts and tiles with Win+Enter already registered");
+            Console.WriteLine("PASS  Rustile tiles two same-elevation processes ({0})", elevated ? "elevated" : "standard");
             bool quitAvailable = QuitChordAvailable();
             Require(!quitWasAvailable || quitAvailable, "Rustile claimed Ctrl+Alt+Shift+Q on startup");
             Console.WriteLine(quitAvailable ? "PASS  The former global quit chord stays available"

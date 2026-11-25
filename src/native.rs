@@ -1,3 +1,4 @@
+pub(crate) mod access;
 pub(crate) mod desktops;
 
 use crate::layout::{Id, Rect};
@@ -14,11 +15,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, GetWindowRgnBox, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
     MONITORINFO, MonitorFromPoint, MonitorFromWindow, SIMPLEREGION,
 };
-use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
@@ -170,26 +168,16 @@ fn ordinary_process(owner: u32) -> bool {
         if process.is_null() {
             return false;
         }
-        let mut token = null_mut();
         let mut path = [0u16; 1024];
         let mut len = path.len() as u32;
         let has_image = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len) != 0;
-        let has_token = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0;
+        let allowed = has_image
+            && access::ProcessAccess::current().is_some_and(|manager| {
+                access::ProcessAccess::query(process)
+                    .is_some_and(|target| manager.can_tile(&target))
+            });
         CloseHandle(process);
-        if !has_token {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut bytes = 0;
-        let queried = GetTokenInformation(
-            token,
-            TokenElevation,
-            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut bytes,
-        );
-        CloseHandle(token);
-        if queried == 0 || elevation.TokenIsElevated != 0 || !has_image {
+        if !allowed {
             return false;
         }
         let image = String::from_utf16_lossy(&path[..len as usize]);

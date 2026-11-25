@@ -1,3 +1,4 @@
+mod instance;
 mod shortcuts;
 #[cfg(test)]
 mod tests;
@@ -10,21 +11,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
-};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
 };
-use windows_sys::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
-use crate::native::desktops::object_name;
 use crate::settings::{Command, Modifier, Settings};
 use crate::startup;
 use crate::tray::Tray;
@@ -450,40 +447,6 @@ fn pump(
     }
 }
 
-struct Instance(HANDLE);
-
-impl Instance {
-    fn acquire() -> Result<Self, String> {
-        let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) })?;
-        let name = if desktop.eq_ignore_ascii_case("Default") {
-            "Local\\RustileWM".to_owned()
-        } else {
-            let station = object_name(unsafe { GetProcessWindowStation() })?;
-            format!("Local\\RustileWM.{}.{station}.{desktop}", station.len())
-        };
-        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
-        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(format!(
-                "Проверка экземпляра Rustile: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-        let instance = Self(handle);
-        if exists {
-            return Err("Rustile уже работает в этом сеансе Windows.".to_owned());
-        }
-        Ok(instance)
-    }
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
 const USAGE: &str = "rustile [--resize-shortcut win+enter|ctrl+alt+enter]\nПо умолчанию размер изменяется через Win+Enter.";
 
 pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
@@ -514,7 +477,7 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
         }
         _ => return Err(USAGE.to_owned()),
     };
-    let _instance = Instance::acquire()?;
+    let _instance = instance::Instance::acquire()?;
     let path = Settings::path()?;
     let (saved, load_warning) = match Settings::load(&path) {
         Ok(value) => (value, None),
