@@ -31,6 +31,7 @@ use stepper::{EDIT_ID, EndEdit, Inline, arrow_info};
 
 const CALLBACK: u32 = WM_APP + 20;
 const ICON_ID: u32 = 1;
+const HEADER_ICON_DIP: i32 = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const RETRY: usize = 1;
 const DISMISS_AFTER_ICON_PRESS: usize = 2;
@@ -40,11 +41,25 @@ fn scale(dip: i32, dpi: u32) -> i32 {
     (dip * dpi as i32 + 48) / 96
 }
 
+fn load_app_icon(width: i32, height: i32) -> HICON {
+    unsafe {
+        LoadImageW(
+            GetModuleHandleW(null()),
+            101usize as _,
+            IMAGE_ICON,
+            width,
+            height,
+            0,
+        )
+    }
+}
+
 struct State {
     settings: Cell<Settings>,
     commands: RefCell<VecDeque<Command>>,
     applying: Cell<Option<Command>>,
-    icon: HICON,
+    tray_icon: HICON,
+    header_icon: Cell<Option<(i32, HICON)>>,
     taskbar_created: u32,
     registered: Cell<bool>,
     attempts: Cell<u8>,
@@ -87,13 +102,9 @@ impl Tray {
                 ));
             }
             let dpi = GetDpiForSystem().max(96);
-            let icon = LoadImageW(
-                instance,
-                101usize as _,
-                IMAGE_ICON,
+            let icon = load_app_icon(
                 GetSystemMetricsForDpi(SM_CXSMICON, dpi),
                 GetSystemMetricsForDpi(SM_CYSMICON, dpi),
-                0,
             );
             if icon.is_null() {
                 return Err(format!("Значок Rustile: {}", io::Error::last_os_error()));
@@ -102,7 +113,8 @@ impl Tray {
                 settings: Cell::new(settings),
                 commands: RefCell::default(),
                 applying: Cell::new(None),
-                icon,
+                tray_icon: icon,
+                header_icon: Cell::default(),
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 registered: Cell::new(false),
                 attempts: Cell::new(0),
@@ -182,7 +194,12 @@ impl Drop for Tray {
 
 impl Drop for State {
     fn drop(&mut self) {
-        unsafe { DestroyIcon(self.icon) };
+        unsafe {
+            if let Some((_, icon)) = self.header_icon.get() {
+                DestroyIcon(icon);
+            }
+            DestroyIcon(self.tray_icon);
+        }
     }
 }
 
@@ -193,7 +210,7 @@ impl State {
             hWnd: hwnd,
             uID: ICON_ID,
             uFlags: NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE,
-            hIcon: self.icon,
+            hIcon: self.tray_icon,
             uCallbackMessage: CALLBACK,
             ..Default::default()
         };
@@ -245,8 +262,10 @@ impl State {
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
         let (mut x, mut y) = (96, 96);
         unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
-        self.dpi.set(x.max(96));
-        *self.fonts.borrow_mut() = Some(Fonts::new(x.max(96)));
+        let dpi = x.max(96);
+        self.dpi.set(dpi);
+        self.prepare_header_icon(dpi);
+        *self.fonts.borrow_mut() = Some(Fonts::new(dpi));
         self.apply_theme(hwnd, Colors::current());
         self.layout(hwnd, Page::Main);
         unsafe {
@@ -265,6 +284,24 @@ impl State {
             SetForegroundWindow(hwnd);
         }
         self.focus(hwnd, 1);
+    }
+
+    fn prepare_header_icon(&self, dpi: u32) {
+        let size = scale(HEADER_ICON_DIP, dpi);
+        if self
+            .header_icon
+            .get()
+            .is_some_and(|(cached, _)| cached == size)
+        {
+            return;
+        }
+        // The resource contains a separate SVG export for each menu size.
+        let icon = load_app_icon(size, size);
+        if !icon.is_null()
+            && let Some((_, previous)) = self.header_icon.replace(Some((size, icon)))
+        {
+            unsafe { DestroyIcon(previous) };
+        }
     }
 
     fn update_icon_bounds(&self, hwnd: HWND) -> Option<RECT> {
@@ -762,7 +799,10 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         dpi: state.dpi.get(),
                         colors: state.colors.get(),
                         fonts,
-                        icon: state.icon,
+                        header_icon: state
+                            .header_icon
+                            .get()
+                            .map_or(state.tray_icon, |(_, icon)| icon),
                         keyboard: state.keyboard.get(),
                         enabled: state.settings.get().enabled,
                     };

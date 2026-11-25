@@ -13,6 +13,7 @@ use windows_sys::Win32::{
 use windows_sys::core::w;
 
 use super::{
+    HEADER_ICON_DIP,
     menu::{Action, Row},
     scale,
 };
@@ -203,7 +204,7 @@ pub(super) struct Painter<'a> {
     pub dpi: u32,
     pub colors: Colors,
     pub fonts: &'a Fonts,
-    pub icon: HICON,
+    pub header_icon: HICON,
     pub keyboard: bool,
     pub enabled: bool,
 }
@@ -345,14 +346,15 @@ impl Painter<'_> {
             ..rc
         };
         if header && matches!(row.action, Action::None) {
+            let size = p(HEADER_ICON_DIP);
             unsafe {
                 DrawIconEx(
                     dc,
                     p(10),
-                    mid - p(10),
-                    self.icon,
-                    p(20),
-                    p(20),
+                    mid - size / 2,
+                    self.header_icon,
+                    size,
+                    size,
                     0,
                     null_mut(),
                     DI_NORMAL,
