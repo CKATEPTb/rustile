@@ -57,7 +57,6 @@ pub(crate) enum Command {
     Gap(u8),
     Padding(u8),
     Shortcut(Shortcut, Chord),
-    Restore,
     Exit,
 }
 
@@ -117,7 +116,6 @@ impl Settings {
     pub fn changed(mut self, command: Command) -> Result<Self, String> {
         match command {
             Command::Toggle => self.enabled = !self.enabled,
-            Command::Restore => self.enabled = false,
             Command::Outline(value) => self.outline = value,
             Command::Gap(value) => self.gap = value,
             Command::Padding(value) => self.padding = value,

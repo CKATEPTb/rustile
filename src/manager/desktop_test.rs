@@ -831,7 +831,7 @@ fn move_windows() {
         assert!(manager.refresh_focus().is_none());
         assert_eq!(manager.workspace.layout.placements(area), [(id, area)]);
         assert_eq!(frame(id), area);
-        manager.restore_positions();
+        manager.shutdown();
     });
     // A stale --exact test name would otherwise let libtest exit successfully.
     unsafe {

@@ -301,9 +301,6 @@ impl Preferences<'_> {
         if let Some(binding) = new_quit {
             self.quit = Some(binding);
         }
-        if command == Command::Restore {
-            manager.restore_positions();
-        }
         self.live = next;
         self.saved = saved;
         hook.set_settings(next);

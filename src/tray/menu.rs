@@ -114,18 +114,6 @@ pub(super) fn rows(s: Settings) -> Vec<Row> {
         row.separator = measure == Measure::Outline;
         rows.push(row);
     }
-    rows.push(
-        Row::new(
-            "Вернуть исходные позиции",
-            "\u{e7a7}",
-            Action::Apply(Command::Restore),
-        )
-        .group(),
-    );
-    rows.push(Row::new(
-        "Выйти из Rustile",
-        "\u{e7e8}",
-        Action::Apply(Command::Exit),
-    ));
+    rows.push(Row::new("Выйти из Rustile", "\u{e7e8}", Action::Apply(Command::Exit)).group());
     rows
 }

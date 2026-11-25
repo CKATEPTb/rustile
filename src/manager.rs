@@ -678,7 +678,7 @@ impl Manager {
         }
     }
 
-    pub fn restore_positions(&mut self) {
+    pub fn shutdown(&mut self) {
         self.session = None;
         self.outline.hide();
         self.hud.hide();
@@ -692,10 +692,6 @@ impl Manager {
         self.current = None;
         self.needs_desktop_retry = false;
         self.dragging = None;
-    }
-
-    pub fn shutdown(&mut self) {
-        self.restore_positions();
     }
 }
 

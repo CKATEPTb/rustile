@@ -559,11 +559,11 @@ internal static class DesktopSmoke {
         TrayOpen(tray, TraySelect, area);
         TrayButton(tray, "Мозаика, Выключена");
         Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Pause moved a tiled window");
-        TrayClick(tray, "Вернуть исходные позиции");
-        Until("Explicit tray restore should recover both originals", () => pair.Select(Bounds).SequenceEqual(originals));
-        TrayOpen(tray, TrayKeyboard, area);
+        TrayKey(tray, "По краям экрана", Keys.Down);
+        TrayFocus(manager, tray, "Выйти из Rustile");
         TrayClick(tray, "Выйти из Rustile");
-        Require(manager.Exited(5000) && manager.ExitCode == 0, "Tray exit failed");
+        Require(manager.Exited(5000) && manager.ExitCode == 0, "Tray exit while paused failed");
+        Until("Exit while paused should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
 
         var restarted = new Child(rustile, "", desktop, true);
         children.Add(restarted);
@@ -585,7 +585,7 @@ internal static class DesktopSmoke {
         TrayClick(tray, "Выйти из Rustile");
         Require(restarted.Exited(5000) && restarted.ExitCode == 0, "Second tray exit failed");
         Until("Exit after resume should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
-        Console.WriteLine("PASS  Tray pause, explicit restore, paused restart, restored shortcut/outline/spacing, resume and tray exit");
+        Console.WriteLine("PASS  Tray pause, exit while paused, saved shortcut/outline/spacing, paused restart and resume");
     }
     // Direction encodings match the WM_APP command sent by the shortcut hook.
     static int NeighborDirection(Rectangle origin, Rectangle other) {
