@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="a-title">
+  <title id="a-title">Rustile — Раскладка</title>
+  <defs>
+    <linearGradient id="a-main" gradientUnits="userSpaceOnUse" x1="14" y1="18" x2="46" y2="82">
+      <stop stop-color="#4BD4FE"/>
+      <stop offset="0.46" stop-color="#1B95F1"/>
+      <stop offset="1" stop-color="#2343BC"/>
+    </linearGradient>
+    <linearGradient id="a-light" gradientUnits="userSpaceOnUse" x1="60" y1="12" x2="85" y2="42">
+      <stop stop-color="#B3F5FF"/>
+      <stop offset="1" stop-color="#53B9F7"/>
+    </linearGradient>
+    <linearGradient id="a-blue" gradientUnits="userSpaceOnUse" x1="55" y1="49" x2="87" y2="82">
+      <stop stop-color="#6488FF"/>
+      <stop offset="1" stop-color="#383CA6"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#a-main)" d="M20 19H44Q48 19 48 23V79Q48 83 44 83H20Q8 83 8 71V31Q8 19 20 19Z"/>
+  <path fill="url(#a-light)" d="M58 12H78Q88 12 88 22V38Q88 42 84 42H58Q54 42 54 38V16Q54 12 58 12Z"/>
+  <path fill="url(#a-blue)" d="M58 48H84Q88 48 88 52V71Q88 83 76 83H58Q54 83 54 79V52Q54 48 58 48Z"/>
+</svg>
