@@ -445,6 +445,72 @@ internal static class DesktopSmoke {
     static string[] ShortcutLabels(IntPtr editor) {
         return Enumerable.Range(1000, 19).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
+    static void EmptyIdleHeader(IntPtr editor) {
+        var status = GetDlgItem(editor, 506);
+        Require(status == IntPtr.Zero || !IsWindowVisible(status) || ControlText(status).Length == 0,
+            "Idle editor still shows a permanent hint or save message");
+        var oldHeading = GetDlgItem(editor, 511);
+        Require(oldHeading == IntPtr.Zero || !IsWindowVisible(oldHeading) || ControlText(oldHeading) != "Горячие клавиши",
+            "The editor repeats its native window title");
+    }
+    enum ConflictChoice { DefaultEnter, TabEnter, Escape, ClickAssign }
+    static void ChooseConflict(Child manager, IntPtr editor, ConflictChoice choice) {
+        IntPtr dialog = IntPtr.Zero;
+        Until("The assignment conflict should appear over its editor", () => {
+            Require(!manager.Exited(0), "Rustile exited before showing the conflict");
+            EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
+                int pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (pid != manager.Pid || GetWindow(hwnd, 4 /* GW_OWNER */) != editor || !IsWindowVisible(hwnd))
+                    return true;
+                var cls = new StringBuilder(48);
+                GetClassName(hwnd, cls, cls.Capacity);
+                if (cls.ToString() != "#32770") return true;
+                dialog = hwnd;
+                return false;
+            }, IntPtr.Zero);
+            return dialog != IntPtr.Zero;
+        });
+        var copy = new StringBuilder(ControlText(dialog));
+        EnumChildWindows(dialog, delegate(IntPtr child, IntPtr unused) {
+            if (IsWindowVisible(child)) copy.Append(' ').Append(ControlText(child));
+            return true;
+        }, IntPtr.Zero);
+        string message = copy.ToString();
+        Require(new[] { "Фокус влево", "Переместить влево", "Win+←" }
+            .All(label => message.IndexOf(label, StringComparison.OrdinalIgnoreCase) >= 0),
+            "Conflict prompt must identify the chord and both actions: " + message);
+        var cancel = EditorControl(dialog, 2 /* IDCANCEL */);
+        var assign = EditorControl(dialog, 1 /* IDOK */);
+        Require(ControlText(cancel) == "Отмена" && ControlText(assign) == "Переназначить",
+            "The conflict dialog should offer cancel and reassign");
+        int owner;
+        int dialogThread = (int)GetWindowThreadProcessId(dialog, out owner);
+        Func<IntPtr> focused = delegate {
+            var info = new GuiThreadInfo { size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
+            if (!GetGUIThreadInfo(dialogThread, ref info)) throw new Win32Exception();
+            return info.focus;
+        };
+        Until("Cancel must have the initial keyboard focus", () => focused() == cancel);
+        if (choice == ConflictChoice.ClickAssign) {
+            SendTrayMessage(assign, 0x00f5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
+        } else if (choice == ConflictChoice.Escape) {
+            CaptureKey(cancel, Keys.Escape, true);
+        } else {
+            var button = cancel;
+            if (choice == ConflictChoice.TabEnter) {
+                CaptureKey(cancel, Keys.Tab, true);
+                Until("Tab should focus the reassign button", () => focused() == assign);
+                CaptureKey(assign, Keys.Tab, false);
+                button = assign;
+            }
+            CaptureKey(button, Keys.Enter, true);
+            Thread.Sleep(60);
+            Require(IsWindowVisible(dialog) && !IsWindowEnabled(editor), "Enter must wait for key release");
+            CaptureKey(button, Keys.Enter, false);
+        }
+        Until("The conflict prompt should dismiss", () => !IsWindowVisible(dialog) && IsWindowEnabled(editor));
+    }
     static bool QuitChordAvailable() {
         const int probe = 0x5120;
         if (!RegisterHotKey(IntPtr.Zero, probe, 7 /* Ctrl+Alt+Shift */, (uint)Keys.Q)) {
@@ -670,55 +736,77 @@ internal static class DesktopSmoke {
         var editor = OpenShortcutEditor(manager, tray, area);
         Require(GetWindow(editor, 4 /* GW_OWNER */) == IntPtr.Zero, "Shortcut editor should be an independent window");
         var initial = ShortcutLabels(editor);
+        EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
         Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1019) == IntPtr.Zero,
             "The page should expose 19 editable shortcuts and no quit command");
         var view = Bounds(viewHwnd);
-        if (view.Width * 96 >= 810 * GetDpiForSystem() && view.Height * 96 >= 450 * GetDpiForSystem())
+        if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 660 * GetDpiForWindow(editor))
             Require(Enumerable.Range(1000, initial.Length).All(i => view.Contains(Bounds(EditorControl(editor, i)))),
                 "Every shortcut should fit on the default-sized editor page");
         TrayOpen(tray, TraySelect, area);
         Require(OpenShortcutEditor(manager, tray, area) == editor, "Opening settings twice created another editor");
         var left = EditorControl(editor, 1004);
         var right = EditorControl(editor, 1005);
-        var status = EditorControl(editor, 506);
+        var up = EditorControl(editor, 1006);
+        var focusLeft = EditorControl(editor, 1000);
+        var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
+        var beforeCapture = File.ReadAllText(file);
         ClickControl(editor, 1005);
         Require(ControlText(right) == initial[5], "A single click started recording a shortcut");
         BeginRecording(left);
         EnterChord(left, Keys.LWin, Keys.Left); // Conflicts with Focus left.
-        Until("The editor should explain the duplicate", () => ControlText(status).Contains("уже"));
-        Require(ControlText(left) == initial[4], "A duplicate replaced the old shortcut");
+        ChooseConflict(manager, editor, ConflictChoice.DefaultEnter);
+        Require(ShortcutLabels(editor).SequenceEqual(initial) && File.ReadAllText(file) == beforeCapture,
+            "Cancelling the conflict changed bindings");
+        BeginRecording(focusLeft);
+        EnterChord(focusLeft, Keys.LWin, Keys.Left); // same action's current binding
+        Until("Recording the existing chord should finish normally", () => ControlText(focusLeft) == initial[0]);
+        Require(File.ReadAllText(file) == beforeCapture, "A no-op capture changed the stored configuration");
 
-        BeginRecording(left);
-        var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
-        var beforeCapture = File.ReadAllText(file);
-        CaptureKey(left, Keys.Menu, true, true);
-        CaptureKey(left, Keys.H, true, true);
-        CaptureKey(left, Keys.H, false, true);
-        Until("The row should preview Alt+H while Alt is held", () => ControlText(left).Contains("Alt+H"));
+        BeginRecording(up);
+        CaptureKey(up, Keys.Menu, true, true);
+        CaptureKey(up, Keys.Oemcomma, true, true);
+        CaptureKey(up, Keys.Oemcomma, false, true);
+        Until("The row should preview Alt plus the OEM key while Alt is held", () => ControlText(up).Contains("Alt+"));
         Require(File.ReadAllText(file) == beforeCapture, "The chord was saved before the last key was released");
-        CaptureKey(left, Keys.Menu, false, true);
-        Until("Releasing Alt should save Alt+H", () =>
-            File.ReadAllText(file) != beforeCapture && ControlText(left).Contains("Alt+H"));
-        var changed = ControlText(left);
-        BeginRecording(left);
-        CaptureKey(left, Keys.Escape, true);
-        CaptureKey(left, Keys.Escape, false);
-        Until("Escape should cancel recording", () => ControlText(left) == changed);
+        CaptureKey(up, Keys.Menu, false, true);
+        Until("Releasing Alt must persist VK_OEM_COMMA", () =>
+            System.Text.RegularExpressions.Regex.IsMatch(File.ReadAllText(file), @"\bkey\s*=\s*188\b")
+            && ControlText(up).Contains("Alt+"));
+        var punctuation = ControlText(up);
+        BeginRecording(up);
+        CaptureKey(up, Keys.Escape, true);
+        CaptureKey(up, Keys.Escape, false);
+        Until("Escape should cancel recording", () => ControlText(up) == punctuation);
         Require(IsWindowVisible(editor), "Cancelling recording closed the editor");
+        BeginRecording(left);
+        EnterChord(left, Keys.LWin, Keys.Left);
+        ChooseConflict(manager, editor, ConflictChoice.TabEnter);
+        Until("Reassignment must transfer the chord and unbind its former action", () =>
+            ControlText(focusLeft).EndsWith("Не назначено") && ControlText(left).EndsWith("Win+←"));
+        EmptyIdleHeader(editor);
         var oneOverride = File.ReadAllText(file);
         BeginRecording(right);
-        EnterChord(right, Keys.ControlKey, Keys.J);
+        EnterChord(right, Keys.ControlKey, Keys.F9);
         Until("Rebinding a second row should allow resetting it independently", () =>
-            File.ReadAllText(file) != oneOverride && ControlText(right).Contains("Ctrl+J"));
+            File.ReadAllText(file) != oneOverride && ControlText(right).Contains("Ctrl+F9"));
         ClickControl(editor, 1105);
         Until("Resetting Move right should recover its original binding", () => ControlText(right) == initial[5]);
         var expected = (string[])initial.Clone();
-        expected[4] = changed;
+        expected[0] = ControlText(focusLeft);
+        expected[4] = ControlText(left);
+        expected[6] = punctuation;
         Require(ShortcutLabels(editor).SequenceEqual(expected), "A row reset changed a neighboring shortcut");
         Require(pair.Select(VisibleFrame).SequenceEqual(beforeEditor), "Shortcut editor changed the tiled layout");
         Message(editor, WmClose);
         Until("Closing the editor should leave Rustile running", () => !IsWindowVisible(editor) && !manager.Exited(0));
+        TrayOpen(tray, TraySelect, area);
+        editor = OpenShortcutEditor(manager, tray, area);
+        Require(ShortcutLabels(editor).SequenceEqual(expected), "Reopening lost the transferred chord, disabled action or OEM key");
+        EmptyIdleHeader(editor);
+        Message(editor, WmClose);
+        Until("Reopened editor should close", () => !IsWindowVisible(editor));
         Console.WriteLine("PASS  Inline tray controls stay open through clicks, arrow keys, fractional wheel input, typed values and cancellation");
 
         var tiled = pair.Select(VisibleFrame).ToArray();
@@ -742,11 +830,21 @@ internal static class DesktopSmoke {
         editor = OpenShortcutEditor(restarted, tray, area);
         Require(ShortcutLabels(editor).SequenceEqual(expected), "The row reset and its neighbor should survive restart");
         oneOverride = File.ReadAllText(file);
+        ClickControl(editor, 1100); // Focus left's factory chord now belongs to Move left.
+        ChooseConflict(restarted, editor, ConflictChoice.Escape);
+        Require(ShortcutLabels(editor).SequenceEqual(expected) && File.ReadAllText(file) == oneOverride,
+            "Cancelling a conflicting reset silently took the other action's chord");
+        ClickControl(editor, 1100);
+        ChooseConflict(restarted, editor, ConflictChoice.ClickAssign);
+        Until("Confirming the reset should return the factory chord and unbind the former owner", () =>
+            ControlText(EditorControl(editor, 1000)) == initial[0]
+            && ControlText(EditorControl(editor, 1004)).EndsWith("Не назначено"));
+        oneOverride = File.ReadAllText(file);
         right = EditorControl(editor, 1005);
         BeginRecording(right);
-        EnterChord(right, Keys.ControlKey, Keys.J);
-        Until("Move right should save Ctrl+J", () => File.ReadAllText(file) != oneOverride
-            && ControlText(right).Contains("Ctrl+J"));
+        EnterChord(right, Keys.ControlKey, Keys.F9);
+        Until("Move right should save Ctrl+F9", () => File.ReadAllText(file) != oneOverride
+            && ControlText(right).Contains("Ctrl+F9"));
         ClickControl(editor, 505);
         Until("Reset all should restore the original 19 chords", () => ShortcutLabels(editor).SequenceEqual(initial));
         Message(editor, WmClose);
@@ -770,7 +868,7 @@ internal static class DesktopSmoke {
         Require(defaults.Exited(5000) && defaults.ExitCode == 0, "Tray exit after resetting shortcuts failed");
         Until("Exit after resetting shortcuts should restore fixture frames", () =>
             pair.Select(Bounds).SequenceEqual(originals));
-        Console.WriteLine("PASS  Inline shortcut recording, last-key release, Escape, duplicate rejection and persistent row/all resets");
+        Console.WriteLine("PASS  Compact shortcut editor: OEM key on last release, conflict cancel/transfer, persisted disabled action and resets");
         Console.WriteLine("PASS  Tray pause, exit while paused, saved shortcut/outline/spacing, paused restart and resume");
     }
     // Direction encodings match the WM_APP command sent by the shortcut hook.

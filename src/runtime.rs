@@ -242,7 +242,7 @@ impl Preferences<'_> {
         let next = self.live.changed(command)?;
         // The command-line resize shortcut applies only to this launch unless
         // the user explicitly chooses a new resize binding in the tray.
-        let saved = self.saved.changed(command)?;
+        let saved = self.saved.changed_for_save(command, self.live)?;
         let write = (saved != self.saved)
             .then(|| saved.prepare(self.path))
             .transpose()?;

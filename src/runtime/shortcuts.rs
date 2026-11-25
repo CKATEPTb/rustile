@@ -51,7 +51,9 @@ impl Routes {
         let mut keys = [None; 256];
         for action in Shortcut::ALL {
             let id = command_id(action);
-            let chord = settings.chord(action);
+            let Some(chord) = settings.binding(action) else {
+                continue;
+            };
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
             if action.is_resize() {
                 for mods in 0..16 {
@@ -70,7 +72,9 @@ impl Routes {
         // An explicitly assigned modal chord wins over the implicit variants
         // that let a user keep the opener's modifiers held in resize mode.
         for action in Shortcut::ALL {
-            let chord = settings.chord(action);
+            let Some(chord) = settings.binding(action) else {
+                continue;
+            };
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
             row.for_mode(action)[chord.mods as usize] = command_id(action);
         }
@@ -297,7 +301,9 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
         let vk = unsafe { (*(data as *const KBDLLHOOKSTRUCT)).vkCode };
-        if let Ok(vk) = u8::try_from(vk) {
+        if let Ok(vk) = u8::try_from(vk)
+            && Chord::supports_key(u16::from(vk))
+        {
             let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let slot = usize::from(vk);
             let previous = HELD.with(|held| held[slot].get());
@@ -657,6 +663,48 @@ mod tests {
             .unwrap();
         assert_eq!(k.key(VK_Q, true, mods), Action::Pass);
         assert_eq!(k.key(VK_LEFT, true, WIN_SHIFT), Action::Command(MOVE));
+    }
+
+    #[test]
+    fn transferred_resize_action_leaves_no_implicit_shortcuts_in_the_hook() {
+        let mut keyboard = Keyboard::new();
+        let chord = Chord {
+            mods: MOD_WIN,
+            key: VK_LEFT,
+        };
+        keyboard.settings = keyboard
+            .settings
+            .changed(Command::ReassignShortcut(
+                Shortcut::ShrinkUp,
+                chord,
+                Shortcut::GrowLeft,
+            ))
+            .unwrap();
+        keyboard.state.mode = Mode::Resize;
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+        assert_eq!(
+            keyboard.key(VK_LEFT, true, MOD_WIN),
+            Action::Command(SHRINK + 2)
+        );
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Consume);
+        keyboard.state.mode = Mode::Normal;
+        assert_eq!(keyboard.key(VK_LEFT, true, MOD_WIN), Action::Command(FOCUS));
+    }
+
+    #[test]
+    fn layout_and_media_keys_dispatch_on_their_own_virtual_key() {
+        let mut keyboard = Keyboard::new();
+        for key in [VK_OEM_3, VK_OEM_PLUS, VK_OEM_102, VK_MEDIA_PLAY_PAUSE] {
+            keyboard.assign(Shortcut::MoveDown, MOD_CONTROL, key);
+            assert_eq!(
+                keyboard.key(key, true, MOD_CONTROL),
+                Action::Command(MOVE + 3)
+            );
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+            assert_eq!(keyboard.key(key, true, MOD_ALT), Action::Pass);
+            assert_eq!(keyboard.key(key, false, 0), Action::Pass);
+        }
     }
 
     #[test]

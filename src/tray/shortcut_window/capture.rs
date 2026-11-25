@@ -16,6 +16,20 @@ pub(super) struct Capture {
 
 impl Capture {
     pub(super) fn start(hwnd: HWND) -> Result<Self, String> {
+        // A modifier can already be held when the row is double-clicked.
+        let held = [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LMENU,
+            VK_RMENU,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LWIN,
+            VK_RWIN,
+        ]
+        .into_iter()
+        .filter(|&key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0)
+        .collect();
         let hook =
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), GetModuleHandleW(null()), 0) };
         if hook.is_null() {
@@ -32,7 +46,10 @@ impl Capture {
         Ok(Self {
             hook,
             generation,
-            keys: Keys::default(),
+            keys: Keys {
+                held,
+                ..Default::default()
+            },
         })
     }
 }
@@ -115,6 +132,11 @@ impl Keys {
     }
 
     pub(super) fn key(&mut self, key: u16, down: bool) -> Event {
+        // Shell/menu-mask events (including Rustile's VK 0xff) and Unicode
+        // packets do not identify a physical shortcut key.
+        if modifier(key) == 0 && !Chord::supports_key(key) {
+            return Event::Unchanged;
+        }
         if key == VK_ESCAPE && down {
             return Event::Cancel;
         }
@@ -186,5 +208,26 @@ mod tests {
         keys.key(VK_A, false);
         assert_eq!(keys.key(VK_B, false), Event::Ambiguous);
         assert_eq!(keys.key(VK_ESCAPE, true), Event::Cancel);
+    }
+
+    #[test]
+    fn punctuation_with_a_held_modifier_ignores_non_key_notifications() {
+        let mut keys = Keys {
+            held: vec![VK_LWIN],
+            ..Default::default()
+        };
+        for key in [0xff, VK_PACKET] {
+            assert_eq!(keys.key(key, true), Event::Unchanged);
+            assert_eq!(keys.key(key, false), Event::Unchanged);
+        }
+        assert_eq!(keys.key(VK_OEM_PLUS, true), Event::Changed);
+        assert_eq!(keys.key(VK_LWIN, false), Event::Changed);
+        assert_eq!(
+            keys.key(VK_OEM_PLUS, false),
+            Event::Complete(Chord {
+                key: VK_OEM_PLUS,
+                mods: MOD_WIN,
+            })
+        );
     }
 }

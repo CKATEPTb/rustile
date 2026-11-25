@@ -66,6 +66,10 @@ impl Shortcut {
         matches!(self.spec().1, Group::Grow | Group::Shrink | Group::Finish)
     }
 
+    pub fn default_chord(self) -> Chord {
+        self.inherited(&Settings::default())
+    }
+
     fn shares_context(self, other: Self) -> bool {
         self.is_resize() == other.is_resize()
     }
@@ -91,104 +95,23 @@ pub(crate) struct Chord {
 }
 
 impl Chord {
-    pub fn keys() -> &'static [u16] {
-        &[
-            VK_LEFT,
-            VK_RIGHT,
-            VK_UP,
-            VK_DOWN,
-            VK_RETURN,
-            VK_ESCAPE,
-            VK_SPACE,
-            VK_TAB,
-            VK_BACK,
-            VK_DELETE,
-            VK_INSERT,
-            VK_HOME,
-            VK_END,
-            VK_PRIOR,
-            VK_NEXT,
-            VK_A,
-            VK_B,
-            VK_C,
-            VK_D,
-            VK_E,
-            VK_F,
-            VK_G,
-            VK_H,
-            VK_I,
-            VK_J,
-            VK_K,
-            VK_L,
-            VK_M,
-            VK_N,
-            VK_O,
-            VK_P,
-            VK_Q,
-            VK_R,
-            VK_S,
-            VK_T,
-            VK_U,
-            VK_V,
-            VK_W,
-            VK_X,
-            VK_Y,
-            VK_Z,
-            VK_0,
-            VK_1,
-            VK_2,
-            VK_3,
-            VK_4,
-            VK_5,
-            VK_6,
-            VK_7,
-            VK_8,
-            VK_9,
-            VK_F1,
-            VK_F2,
-            VK_F3,
-            VK_F4,
-            VK_F5,
-            VK_F6,
-            VK_F7,
-            VK_F8,
-            VK_F9,
-            VK_F10,
-            VK_F11,
-            VK_F12,
-            VK_F13,
-            VK_F14,
-            VK_F15,
-            VK_F16,
-            VK_F17,
-            VK_F18,
-            VK_F19,
-            VK_F20,
-            VK_F21,
-            VK_F22,
-            VK_F23,
-            VK_F24,
-            VK_NUMPAD0,
-            VK_NUMPAD1,
-            VK_NUMPAD2,
-            VK_NUMPAD3,
-            VK_NUMPAD4,
-            VK_NUMPAD5,
-            VK_NUMPAD6,
-            VK_NUMPAD7,
-            VK_NUMPAD8,
-            VK_NUMPAD9,
-            VK_ADD,
-            VK_SUBTRACT,
-            VK_MULTIPLY,
-            VK_DIVIDE,
-            VK_DECIMAL,
-        ]
+    pub fn supports_key(key: u16) -> bool {
+        // Keyboard virtual keys only: mouse, controller, modifier, Unicode packet,
+        // IME processing markers and unassigned virtual keys never form a chord.
+        matches!(key,
+            VK_CANCEL | VK_BACK | VK_TAB | VK_CLEAR | VK_RETURN | VK_PAUSE..=VK_9
+            | VK_A..=VK_Z | VK_APPS | VK_SLEEP..=VK_F24 | VK_NUMLOCK..=VK_OEM_FJ_ROYA
+            | VK_BROWSER_BACK..=VK_LAUNCH_APP2 | VK_OEM_1..=VK_ABNT_C2
+            | VK_OEM_4..=VK_OEM_8 | VK_OEM_AX..=VK_ICO_00 | VK_ICO_CLEAR
+            | VK_OEM_RESET..=VK_OEM_CLEAR
+        )
     }
 
     pub fn key_label(key: u16) -> String {
         match key {
-            VK_A..=VK_Z | VK_0..=VK_9 => return char::from(key as u8).to_string(),
+            VK_A..=VK_Z | VK_0..=VK_9 => {
+                return layout_key_name(key).unwrap_or_else(|| char::from(key as u8).to_string());
+            }
             VK_F1..=VK_F24 => return format!("F{}", key - VK_F1 + 1),
             VK_NUMPAD0..=VK_NUMPAD9 => return format!("Num {}", key - VK_NUMPAD0),
             VK_LEFT => "←",
@@ -211,7 +134,32 @@ impl Chord {
             VK_MULTIPLY => "Num *",
             VK_DIVIDE => "Num /",
             VK_DECIMAL => "Num .",
-            _ => return format!("VK {key:02X}"),
+            VK_SEPARATOR => "Num Separator",
+            VK_APPS => "Меню",
+            VK_SNAPSHOT => "Print Screen",
+            VK_PAUSE => "Pause",
+            VK_SCROLL => "Scroll Lock",
+            VK_CAPITAL => "Caps Lock",
+            VK_NUMLOCK => "Num Lock",
+            VK_BROWSER_BACK => "Браузер назад",
+            VK_BROWSER_FORWARD => "Браузер вперёд",
+            VK_BROWSER_REFRESH => "Обновить страницу",
+            VK_BROWSER_STOP => "Остановить загрузку",
+            VK_BROWSER_SEARCH => "Поиск в браузере",
+            VK_BROWSER_FAVORITES => "Избранное",
+            VK_BROWSER_HOME => "Домашняя страница",
+            VK_VOLUME_MUTE => "Без звука",
+            VK_VOLUME_DOWN => "Тише",
+            VK_VOLUME_UP => "Громче",
+            VK_MEDIA_NEXT_TRACK => "Следующий трек",
+            VK_MEDIA_PREV_TRACK => "Предыдущий трек",
+            VK_MEDIA_STOP => "Стоп",
+            VK_MEDIA_PLAY_PAUSE => "Пуск / пауза",
+            VK_LAUNCH_MAIL => "Почта",
+            VK_LAUNCH_MEDIA_SELECT => "Медиаплеер",
+            VK_LAUNCH_APP1 => "Приложение 1",
+            VK_LAUNCH_APP2 => "Приложение 2",
+            _ => return layout_key_name(key).unwrap_or_else(|| format!("VK {key:02X}")),
         }
         .into()
     }
@@ -237,8 +185,8 @@ impl Chord {
         text
     }
 
-    fn validate(self, action: Shortcut) -> Result<(), String> {
-        if !Self::keys().contains(&self.key)
+    pub(crate) fn validate(self, action: Shortcut) -> Result<(), String> {
+        if !Self::supports_key(self.key)
             || self.mods & !(MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN) != 0
         {
             return Err("Сочетание содержит неподдерживаемую клавишу или модификатор.".into());
@@ -246,8 +194,9 @@ impl Chord {
         if !action.is_resize()
             && self.mods & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0
             && !(VK_F1..=VK_F24).contains(&self.key)
+            && !(VK_BROWSER_BACK..=VK_LAUNCH_APP2).contains(&self.key)
         {
-            return Err("Добавьте Win, Ctrl или Alt либо выберите функциональную клавишу.".into());
+            return Err("Добавьте Win, Ctrl или Alt либо выберите функциональную или мультимедийную клавишу.".into());
         }
         let reserved = match self.key {
             VK_X | VK_L => self.mods == MOD_WIN,
@@ -265,11 +214,67 @@ impl Chord {
     }
 }
 
+// Called by the settings UI for a key legend. Use a neutral synthetic state
+// and the editor's active layout, without consuming or setting any dead key.
+fn layout_key_name(key: u16) -> Option<String> {
+    let layout = unsafe { GetKeyboardLayout(0) };
+    let scan = unsafe { MapVirtualKeyExW(key.into(), MAPVK_VK_TO_VSC_EX, layout) };
+    let mut buf = [0u16; 64];
+    if matches!(key, VK_A..=VK_Z | VK_0..=VK_9 | VK_OEM_1..=VK_ABNT_C2 | VK_OEM_4..=VK_OEM_8 | VK_OEM_102)
+    {
+        let len = unsafe {
+            ToUnicodeEx(
+                key.into(),
+                scan,
+                [0u8; 256].as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                4,
+                layout,
+            )
+        };
+        if len != 0 {
+            // For dead keys Windows returns a negative value of unspecified
+            // magnitude and places the spacing form in the first UTF-16 unit.
+            let used = if len < 0 { 1 } else { len as usize };
+            let text = String::from_utf16_lossy(&buf[..used]);
+            if let Some(c) = text.chars().next()
+                && !c.is_control()
+                && !c.is_whitespace()
+            {
+                let mut upper = c.to_uppercase();
+                let first = upper.next()?;
+                return Some(if upper.next().is_none() {
+                    first.to_string()
+                } else {
+                    c.to_string()
+                });
+            }
+        }
+    }
+    if scan == 0 {
+        return None;
+    }
+    let extended = i32::from(scan >> 8 == 0xe0) << 24;
+    let param = ((scan as i32 & 0xff) << 16) | extended;
+    let len = unsafe { GetKeyNameTextW(param, buf.as_mut_ptr(), buf.len() as i32) };
+    (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+}
+
 // In memory, a fixed table keeps the hook allocation-free. The file contains
 // only overrides, keyed by action name so adding an action preserves old files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(from = "StoredOverrides", into = "BTreeMap<Shortcut, Chord>")]
-pub(super) struct Overrides([Option<Chord>; Shortcut::ALL.len()]);
+#[serde(from = "StoredOverrides", into = "BTreeMap<Shortcut, Binding>")]
+pub(super) struct Overrides([Option<Binding>; Shortcut::ALL.len()]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+enum Binding {
+    #[serde(rename = "disabled")]
+    Disabled,
+    // Keep the existing { mods, key } representation for assigned chords.
+    #[serde(untagged)]
+    Assigned(Chord),
+}
 
 // Accept the retired setting independently, even if its chord is malformed.
 // Keep normal validation for every other key and omit it when writing the file.
@@ -278,7 +283,7 @@ struct StoredOverrides {
     #[serde(rename = "quit")]
     _legacy_quit: Option<serde::de::IgnoredAny>,
     #[serde(flatten)]
-    bindings: BTreeMap<Shortcut, Chord>,
+    bindings: BTreeMap<Shortcut, Binding>,
 }
 
 impl Overrides {
@@ -297,7 +302,7 @@ impl From<StoredOverrides> for Overrides {
     }
 }
 
-impl From<Overrides> for BTreeMap<Shortcut, Chord> {
+impl From<Overrides> for BTreeMap<Shortcut, Binding> {
     fn from(overrides: Overrides) -> Self {
         Shortcut::ALL
             .into_iter()
@@ -307,12 +312,58 @@ impl From<Overrides> for BTreeMap<Shortcut, Chord> {
 }
 
 impl Settings {
-    pub fn chord(&self, action: Shortcut) -> Chord {
-        self.shortcuts.0[action.index()].unwrap_or_else(|| action.inherited(self))
+    pub fn binding(&self, action: Shortcut) -> Option<Chord> {
+        match self.shortcuts.0[action.index()] {
+            None => Some(action.inherited(self)),
+            Some(Binding::Assigned(chord)) => Some(chord),
+            Some(Binding::Disabled) => None,
+        }
     }
 
-    pub(super) fn assign(&mut self, action: Shortcut, chord: Chord) {
-        self.shortcuts.0[action.index()] = (chord != action.inherited(self)).then_some(chord);
+    pub fn conflict(&self, action: Shortcut, chord: Chord) -> Option<Shortcut> {
+        let context = Shortcut::ALL
+            .into_iter()
+            .filter(|&other| action.shares_context(other));
+        // Explicit bindings win over the variants that keep the resize opener held.
+        let owner = context
+            .clone()
+            .find(|&other| self.binding(other) == Some(chord))
+            .or_else(|| {
+                context
+                    .into_iter()
+                    .find(|&other| self.resize_alias(other, chord))
+            });
+        owner.filter(|&other| action != other)
+    }
+
+    pub(super) fn assign(&mut self, action: Shortcut, chord: Chord) -> Result<(), String> {
+        chord.validate(action)?;
+        if let Some(other) = self.conflict(action, chord) {
+            return Err(format!(
+                "{} уже назначено на «{}».",
+                chord.label(),
+                other.label()
+            ));
+        }
+        self.set_assigned(action, chord);
+        Ok(())
+    }
+
+    pub(super) fn transfer_confirmed(
+        &mut self,
+        action: Shortcut,
+        chord: Chord,
+        owner: Shortcut,
+    ) -> Result<(), String> {
+        chord.validate(action)?;
+        self.shortcuts.0[owner.index()] = Some(Binding::Disabled);
+        self.set_assigned(action, chord);
+        Ok(())
+    }
+
+    fn set_assigned(&mut self, action: Shortcut, chord: Chord) {
+        self.shortcuts.0[action.index()] =
+            (chord != action.inherited(self)).then_some(Binding::Assigned(chord));
     }
 
     // The original resize mode also accepts its default keys while the opener's
@@ -322,14 +373,15 @@ impl Settings {
         if key != input.key || self.shortcuts.0[action.index()].is_some() {
             return false;
         }
-        let opener = self.chord(Shortcut::StartResize).mods;
+        let opener = self.binding(Shortcut::StartResize).map(|chord| chord.mods);
         match group {
             Group::Grow | Group::Shrink => {
                 let shift = if group == Group::Shrink { MOD_SHIFT } else { 0 };
-                input.mods == MOD_WIN | shift || input.mods == (opener & !MOD_SHIFT) | shift
+                input.mods == MOD_WIN | shift
+                    || opener.is_some_and(|mods| input.mods == (mods & !MOD_SHIFT) | shift)
             }
             Group::Finish => {
-                input.mods == opener || (action == Shortcut::Cancel && input.mods == MOD_WIN)
+                Some(input.mods) == opener || (action == Shortcut::Cancel && input.mods == MOD_WIN)
             }
             _ => false,
         }
@@ -337,10 +389,12 @@ impl Settings {
 
     pub(super) fn validate_shortcuts(&self) -> Result<(), String> {
         for (index, action) in Shortcut::ALL.into_iter().enumerate() {
-            let chord = self.chord(action);
+            let Some(chord) = self.binding(action) else {
+                continue;
+            };
             chord.validate(action)?;
             for &other in &Shortcut::ALL[..index] {
-                if action.shares_context(other) && self.chord(other) == chord {
+                if action.shares_context(other) && self.binding(other) == Some(chord) {
                     return Err(format!(
                         "{} уже назначено на «{}» и «{}».",
                         chord.label(),

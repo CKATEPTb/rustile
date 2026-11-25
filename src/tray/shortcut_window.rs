@@ -1,4 +1,5 @@
 mod capture;
+mod conflict;
 mod view;
 
 use std::{
@@ -67,9 +68,11 @@ pub(super) struct ShortcutWindow {
     command: Cell<Option<Command>>,
     saving: Cell<bool>,
     capture: RefCell<Option<capture::Capture>>,
+    conflict: Cell<HWND>,
+    transfer: Cell<Option<Command>>,
     scroll: Cell<i32>,
     colors: Cell<Colors>,
-    fonts: RefCell<Option<view::EditorFonts>>,
+    fonts: RefCell<Option<Fonts>>,
 }
 
 impl Default for ShortcutWindow {
@@ -83,6 +86,8 @@ impl Default for ShortcutWindow {
             command: Cell::default(),
             saving: Cell::new(false),
             capture: RefCell::default(),
+            conflict: Cell::default(),
+            transfer: Cell::default(),
             scroll: Cell::new(0),
             colors: Cell::new(Colors::current()),
             fonts: RefCell::default(),
@@ -105,6 +110,10 @@ impl ShortcutWindow {
         anchor: POINT,
         settings: Settings,
     ) -> Result<(), String> {
+        if !self.conflict.get().is_null() {
+            unsafe { SetForegroundWindow(self.conflict.get()) };
+            return Ok(());
+        }
         self.owner.set(owner);
         self.set_settings(settings);
         let mut hwnd = self.hwnd.get();
@@ -134,8 +143,8 @@ impl ShortcutWindow {
                 GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut y_dpi);
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
-                    right: self.p(920),
-                    bottom: self.p(610),
+                    right: self.p(760),
+                    bottom: self.p(392),
                     ..Default::default()
                 };
                 AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());
@@ -204,11 +213,24 @@ impl ShortcutWindow {
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
             self.update_rows();
-            caption(child(hwnd, STATUS), error.unwrap_or("Настройки сохранены"));
+            self.set_status(error.unwrap_or_default());
         }
     }
 
     pub(super) fn pre_translate(&self, msg: &MSG) -> bool {
+        let dialog = self.conflict.get();
+        if !dialog.is_null() && (msg.hwnd == dialog || unsafe { IsChild(dialog, msg.hwnd) } != 0) {
+            if msg.wParam == usize::from(VK_RETURN)
+                && let Some(down) = capture::is_key_down(msg.message)
+            {
+                if !down {
+                    let accept = unsafe { GetFocus() } == child(dialog, IDOK);
+                    self.finish_transfer(dialog, accept);
+                }
+                return true;
+            }
+            return unsafe { IsDialogMessageW(dialog, msg) } != 0;
+        }
         let hwnd = self.hwnd.get();
         if hwnd.is_null() || (msg.hwnd != hwnd && unsafe { IsChild(hwnd, msg.hwnd) } == 0) {
             return false;
@@ -263,7 +285,11 @@ impl ShortcutWindow {
         {
             return capture.keys.label();
         }
-        self.settings.get().chord(action).label()
+        self.settings
+            .get()
+            .binding(action)
+            .map(|chord| chord.label())
+            .unwrap_or_else(|| "Не назначено".into())
     }
 
     fn update_row(&self, action: Shortcut) {
@@ -282,7 +308,7 @@ impl ShortcutWindow {
         let defaults = Settings::default();
         for action in Shortcut::ALL {
             self.update_row(action);
-            let changed = settings.chord(action) != defaults.chord(action);
+            let changed = settings.binding(action) != defaults.binding(action);
             unsafe {
                 EnableWindow(
                     child(view, RESET_ROW + action.index() as i32),
@@ -297,7 +323,7 @@ impl ShortcutWindow {
             .is_ok_and(|s| s != settings);
         unsafe {
             EnableWindow(
-                child(hwnd, RESET_ALL),
+                child(view, RESET_ALL),
                 (can_reset && !self.saving.get()) as i32,
             )
         };
@@ -312,12 +338,12 @@ impl ShortcutWindow {
                 InvalidateRect(self.row(old), null(), 0);
                 InvalidateRect(self.row(action), null(), 0);
             }
-            caption(child(self.hwnd.get(), STATUS), view::HINT);
+            self.set_status("");
         }
     }
 
     fn start_capture(&self, action: Shortcut) {
-        if self.saving.get() || self.recording(action) {
+        if self.saving.get() || !self.conflict.get().is_null() || self.recording(action) {
             return;
         }
         self.select(action);
@@ -326,10 +352,7 @@ impl ShortcutWindow {
             Ok(capture) => {
                 self.capture.replace(Some(capture));
                 self.update_row(action);
-                caption(
-                    child(self.hwnd.get(), STATUS),
-                    "Отпустите все клавиши, чтобы сохранить сочетание. Esc — отмена.",
-                );
+                self.set_status("");
             }
             Err(e) => self.result(Some(&e)),
         }
@@ -338,7 +361,7 @@ impl ShortcutWindow {
     fn end_capture(&self) {
         if self.capture.take().is_some() {
             self.update_row(self.selected.get());
-            caption(child(self.hwnd.get(), STATUS), view::HINT);
+            self.set_status("");
         }
     }
 
@@ -368,11 +391,25 @@ impl ShortcutWindow {
     }
 
     fn submit(&self, command: Command) {
-        if self.saving.get() {
+        if self.saving.get() || !self.conflict.get().is_null() {
             return;
         }
         self.end_capture();
         let settings = self.settings.get();
+        let assignment = match command {
+            Command::Shortcut(action, chord) => Some((action, chord)),
+            Command::ResetShortcut(action) => Some((action, action.default_chord())),
+            _ => None,
+        };
+        if let Some((action, chord)) = assignment
+            && settings.binding(action) != Some(chord)
+            && let Some(previous) = settings.conflict(action, chord)
+        {
+            if let Err(error) = self.ask_transfer(action, chord, previous) {
+                self.result(Some(&error));
+            }
+            return;
+        }
         match settings.changed(command) {
             Err(e) => self.result(Some(&e)),
             Ok(next) if next == settings => {}
@@ -480,6 +517,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                         ui.submit(Command::ResetShortcuts);
                     } else if event == BN_SETFOCUS {
                         ui.end_capture();
+                        ui.reveal_row(hwnd, lp as HWND);
                     }
                 } else if id == IDCANCEL && lp == 0 {
                     if ui.capture.borrow().is_some() {

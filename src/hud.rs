@@ -45,11 +45,13 @@ impl ResizeHud {
             let mut label = format!("Размер   {} × {}", tile.w, tile.h);
             let mut width = scale(390).min(tile.w);
             if tile.w >= scale(390) {
-                let full = format!(
-                    "{label}    ·    {} — готово    {} — отмена",
-                    settings.chord(Shortcut::Confirm).label(),
-                    settings.chord(Shortcut::Cancel).label()
-                );
+                let mut full = label.clone();
+                for (action, hint) in [(Shortcut::Confirm, "готово"), (Shortcut::Cancel, "отмена")]
+                {
+                    if let Some(chord) = settings.binding(action) {
+                        full.push_str(&format!("    ·    {} — {hint}", chord.label()));
+                    }
+                }
                 let text: Vec<_> = full.encode_utf16().collect();
                 let dc = GetDC(self.label);
                 let font = hint_font(self.label);
