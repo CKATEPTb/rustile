@@ -1,15 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND,
-    EVENT_SYSTEM_MOVESIZESTART,
+    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
+    EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
 };
 
 use crate::hud::{FocusOutline, ResizeHud};
 use crate::layout::{Direction, Id, Layout, Rect};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
-use crate::native::{self, Original};
+use crate::native::{self, Original, TileState};
 use crate::settings::Settings;
 
 #[cfg(test)]
@@ -30,6 +30,19 @@ struct TrackedWindow {
     desktop: DesktopId,
     original: Original,
     requested: Option<Rect>,
+    repairs: u8,
+}
+
+impl TrackedWindow {
+    // A successful async request can still be superseded by the app restoring
+    // its own normal frame. Bound retries for apps that reject a tile size.
+    fn frame_drifted(&mut self, rect: Rect) -> bool {
+        if self.original.is_at(rect) {
+            self.repairs = 0;
+            return false;
+        }
+        self.repairs < 2
+    }
 }
 
 struct Workspace {
@@ -63,6 +76,7 @@ pub struct Manager {
     workspace: Workspace,
     parked: HashMap<DesktopId, Workspace>,
     windows: HashMap<Id, TrackedWindow>,
+    expanded: HashSet<Id>,
     needs_desktop_retry: bool,
     area: Option<Rect>,
     dragging: Option<Id>,
@@ -85,6 +99,7 @@ impl Manager {
             workspace: Workspace::new(native::spacing_px(settings.gap)),
             parked: HashMap::new(),
             windows: HashMap::new(),
+            expanded: HashSet::new(),
             needs_desktop_retry: false,
             area: tiling_area(settings),
             dragging: None,
@@ -152,6 +167,7 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        self.expanded.remove(&id);
         if let Some(window) = self.windows.remove(&id) {
             self.detach(id, window.desktop);
             self.remove_empty_desktop(window.desktop);
@@ -179,6 +195,20 @@ impl Manager {
         self.reconcile_desktop();
     }
 
+    fn observe(&mut self, id: Id) -> TileState {
+        let state = native::tile_state(id);
+        match state {
+            TileState::Expanded => {
+                self.expanded.insert(id);
+            }
+            TileState::Eligible => {
+                self.expanded.remove(&id);
+            }
+            TileState::Excluded => {}
+        }
+        state
+    }
+
     pub fn reconcile_desktop(&mut self) {
         if !self.settings.enabled {
             return;
@@ -199,10 +229,23 @@ impl Manager {
                 }
             }
         }
-        let visible: Vec<_> = native::enumerate()
+        let inventory = native::enumerate();
+        self.expanded.retain(|id| inventory.contains(id));
+        let visible: Vec<_> = inventory
             .into_iter()
             .filter_map(|id| {
-                if !native::eligible(id) {
+                let state = self.observe(id);
+                if state != TileState::Eligible {
+                    // Some browsers restore the normal bounds before restoring
+                    // their resizable frame. Recheck that transition even if
+                    // the window was already fullscreen when Rustile started.
+                    if state == TileState::Excluded
+                        && self.expanded.contains(&id)
+                        && !native::cloaked(id)
+                        && matches!(self.desktops.membership(id), DesktopMembership::Current(_))
+                    {
+                        self.needs_desktop_retry = true;
+                    }
                     return None;
                 }
                 match self.desktops.membership(id) {
@@ -242,18 +285,7 @@ impl Manager {
             self.workspace.last_foreground = Some(foreground);
         }
         self.remember_tile(foreground);
-        if let Some(area) = self.area {
-            for (id, rect) in self.workspace.layout.placements(area) {
-                if self.on_current(id)
-                    && native::eligible(id)
-                    && let Some(window) = self.windows.get_mut(&id)
-                    && !window.original.is_at(rect)
-                {
-                    window.requested = None;
-                }
-            }
-        }
-        self.apply();
+        self.place_tiles(true);
     }
 
     // A HIDE can precede both the Shell cloak and the membership change.
@@ -270,6 +302,9 @@ impl Manager {
 
     fn suspend(&mut self, id: Id) {
         self.rollback_resize();
+        if self.dragging == Some(id) {
+            self.dragging = None;
+        }
         self.workspace.remove(id);
         if let Some(window) = self.windows.get_mut(&id) {
             window.requested = None;
@@ -405,6 +440,7 @@ impl Manager {
             desktop,
             original,
             requested: None,
+            repairs: 0,
         });
         true
     }
@@ -425,7 +461,23 @@ impl Manager {
             }
         }
 
-        let eligible = native::eligible(id);
+        if event == EVENT_SYSTEM_MOVESIZEEND && self.dragging == Some(id) {
+            self.dragging = None;
+        }
+        let state = self.observe(id);
+        let eligible = state == TileState::Eligible;
+        if !eligible
+            && self.expanded.contains(&id)
+            && matches!(
+                event,
+                EVENT_OBJECT_LOCATIONCHANGE
+                    | EVENT_OBJECT_STATECHANGE
+                    | EVENT_OBJECT_SHOW
+                    | EVENT_SYSTEM_MINIMIZEEND
+            )
+        {
+            self.needs_desktop_retry = true;
+        }
         if !eligible && !self.tracks_window(id) && event != EVENT_SYSTEM_FOREGROUND {
             return;
         }
@@ -450,15 +502,14 @@ impl Manager {
                 if event == EVENT_SYSTEM_FOREGROUND {
                     self.workspace.last_foreground = Some(id);
                 }
-                // A HIDE or transient frame/monitor change can precede the
-                // shell cloak. Only an explicit iconic/zoomed state proves
-                // this window left the tiling layout during the switch.
+                // Fullscreen, maximized and minimized windows release their
+                // tile. An ordinary HIDE may still be a shell desktop switch.
                 if self.workspace.layout.contains(id)
                     && !eligible
                     && event != EVENT_OBJECT_CLOAKED
                     && !native::cloaked(id)
                 {
-                    if native::minimized_or_maximized(id) {
+                    if state == TileState::Expanded || native::minimized_or_maximized(id) {
                         self.suspend(id);
                         self.apply();
                     } else {
@@ -497,9 +548,7 @@ impl Manager {
             self.dragging = Some(id);
             return;
         }
-        if event == EVENT_SYSTEM_MOVESIZEEND && self.dragging == Some(id) {
-            self.dragging = None;
-        } else if self.dragging == Some(id) {
+        if self.dragging == Some(id) {
             return;
         }
         if !self.workspace.layout.contains(id) {
@@ -524,6 +573,21 @@ impl Manager {
                 window.requested = None;
             }
             self.apply();
+        } else if matches!(
+            event,
+            EVENT_OBJECT_LOCATIONCHANGE
+                | EVENT_OBJECT_STATECHANGE
+                | EVENT_OBJECT_SHOW
+                | EVENT_SYSTEM_FOREGROUND
+                | EVENT_SYSTEM_MINIMIZEEND
+        ) && let Some(window) = self.windows.get_mut(&id)
+            && window
+                .requested
+                .is_none_or(|rect| window.frame_drifted(rect))
+        {
+            // Check again after WinEvents settle. An older LOCATIONCHANGE can
+            // arrive while a newer placement is still in the target's queue.
+            self.needs_desktop_retry = true;
         }
         if self.workspace.last_foreground == Some(id) {
             self.remember_tile(id);
@@ -531,6 +595,10 @@ impl Manager {
     }
 
     fn apply(&mut self) {
+        self.place_tiles(false);
+    }
+
+    fn place_tiles(&mut self, verify: bool) {
         let Some(area) = self.area else { return };
         for (id, rect) in self.workspace.layout.placements(area) {
             let Some(window) = self.windows.get_mut(&id) else {
@@ -538,12 +606,24 @@ impl Manager {
             };
             // Window positioning is asynchronous. Compare the last enqueued
             // target, so Esc also supersedes a preview still in the target's queue.
-            if self.dragging != Some(id)
-                && window.requested != Some(rect)
-                && self.desktops.membership(id) == DesktopMembership::Current(window.desktop)
-                && window.original.place(rect)
+            if self.dragging == Some(id)
+                || (!verify && window.requested == Some(rect))
+                || self.desktops.membership(id) != DesktopMembership::Current(window.desktop)
             {
-                window.requested = Some(rect);
+                continue;
+            }
+            if window.requested != Some(rect) {
+                if window.original.place(rect) {
+                    window.requested = Some(rect);
+                    window.repairs = 0;
+                }
+            } else if window.frame_drifted(rect) && native::eligible(id) {
+                window.original.refresh_frame();
+                if !window.original.is_at(rect) {
+                    window.repairs += 1;
+                    window.original.place(rect);
+                    self.needs_desktop_retry |= window.repairs < 2;
+                }
             }
         }
     }
@@ -689,6 +769,7 @@ impl Manager {
         }
         self.workspace = Workspace::new(native::spacing_px(self.settings.gap));
         self.parked.clear();
+        self.expanded.clear();
         self.current = None;
         self.needs_desktop_retry = false;
         self.dragging = None;

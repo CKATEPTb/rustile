@@ -18,6 +18,8 @@ internal static class DesktopSmoke {
     const int TraySelect = 0x400, TrayContext = 0x7b, TrayKeyboard = 0x401;
     const int ShowFixtureDialog = 0x8001, RequestFocus = 0x8002;
     const int ReadGeometryChanges = 0x8003, SetFixtureCloak = 0x8004;
+    const int SetFixtureMode = 0x8005;
+    enum FixtureMode { Normal, Borderless, Maximize, AppBounds, RestoreNormalStyle }
     const int ExtendedFrameBounds = 9, WindowCornerPreference = 33;
     static readonly int[] FixtureCorners = { 2, 3, 1 }; // round, small, square
 
@@ -64,6 +66,11 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+    [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr hwnd, int index);
+    [DllImport("user32.dll")] static extern int SetWindowLongW(IntPtr hwnd, int index, int value);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after,
+        int x, int y, int w, int h, uint flags);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hwnd, ref Point point);
     [DllImport("user32.dll")] static extern IntPtr ChildWindowFromPointEx(IntPtr hwnd, Point point, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
@@ -102,6 +109,8 @@ internal static class DesktopSmoke {
 
     class Fixture : Form {
         Rectangle lastBounds;
+        readonly Rectangle normalBounds;
+        int normalStyle;
         int geometryChanges;
         public Fixture(int index) {
             Text = "Rustile fixture " + index;
@@ -111,6 +120,39 @@ internal static class DesktopSmoke {
             if (index == 5) MinimumSize = new Size(160, TallMinimum(work));
             int corners = FixtureCorners[index % FixtureCorners.Length];
             Require(DwmSetWindowAttribute(Handle, WindowCornerPreference, ref corners, sizeof(int)) == 0, "Cannot configure fixture corners");
+            normalBounds = DesktopSmoke.Bounds(Handle);
+        }
+        bool ApplyMode(FixtureMode mode) {
+            var bounds = normalBounds;
+            uint flags = 0x14; // SWP_NOZORDER | SWP_NOACTIVATE
+            switch (mode) {
+                case FixtureMode.Borderless:
+                    normalStyle = GetWindowLongW(Handle, -16 /* GWL_STYLE */);
+                    SetWindowLongW(Handle, -16, (normalStyle & ~0x00cf0000 /* WS_OVERLAPPEDWINDOW */)
+                        | unchecked((int)0x80000000) /* WS_POPUP */);
+                    bounds = Screen.FromHandle(Handle).Bounds;
+                    flags |= 0x20; // SWP_FRAMECHANGED
+                    break;
+                case FixtureMode.Maximize:
+                    WindowState = FormWindowState.Maximized;
+                    return IsZoomed(Handle);
+                case FixtureMode.Normal:
+                    if (IsZoomed(Handle)) {
+                        WindowState = FormWindowState.Normal;
+                    } else {
+                        SetWindowLongW(Handle, -16, normalStyle);
+                        flags |= 0x20;
+                    }
+                    break;
+                case FixtureMode.RestoreNormalStyle:
+                    // No application move, resize or foreground notification.
+                    SetWindowLongW(Handle, -16, normalStyle);
+                    return GetWindowLongW(Handle, -16) == normalStyle;
+                case FixtureMode.AppBounds:
+                    break;
+            }
+            return SetWindowPos(Handle, IntPtr.Zero, bounds.X, bounds.Y, bounds.Width, bounds.Height, flags)
+                && (mode != FixtureMode.AppBounds || DesktopSmoke.Bounds(Handle) == normalBounds);
         }
         protected override void WndProc(ref Message m) {
             if (m.Msg == ShowFixtureDialog) {
@@ -122,6 +164,8 @@ internal static class DesktopSmoke {
             } else if (m.Msg == SetFixtureCloak) {
                 int value = m.WParam == IntPtr.Zero ? 0 : 1;
                 m.Result = (IntPtr)DwmSetWindowAttribute(Handle, 13 /* DWMWA_CLOAK */, ref value, sizeof(int));
+            } else if (m.Msg == SetFixtureMode) {
+                m.Result = ApplyMode((FixtureMode)m.WParam.ToInt32()) ? (IntPtr)1 : IntPtr.Zero;
             } else {
                 base.WndProc(ref m);
                 if (m.Msg == 0x47 /* WM_WINDOWPOSCHANGED */) {
@@ -225,6 +269,109 @@ internal static class DesktopSmoke {
         Rect frame;
         Require(DwmGetWindowAttribute(hwnd, ExtendedFrameBounds, out frame, Marshal.SizeOf(typeof(Rect))) == 0, "Cannot read DWM frame");
         return Rectangle.FromLTRB(frame.Left, frame.Top, frame.Right, frame.Bottom);
+    }
+    static void SetMode(IntPtr hwnd, FixtureMode mode) {
+        UIntPtr result;
+        Require(SendMessageTimeout(hwnd, SetFixtureMode, (IntPtr)(int)mode, IntPtr.Zero,
+            2 /* SMTO_ABORTIFHUNG */, 3000, out result) != IntPtr.Zero && result != UIntPtr.Zero,
+            "Fixture failed to change mode: " + mode);
+    }
+    static bool PairFills(Rectangle area, int gap, IntPtr app, IntPtr peer) {
+        var a = VisibleFrame(app);
+        var b = VisibleFrame(peer);
+        if (Rectangle.Union(a, b) != area) return false;
+        if (a.Top == area.Top && b.Top == area.Top && a.Height == area.Height && b.Height == area.Height)
+            return Math.Max(a.Left, b.Left) - Math.Min(a.Right, b.Right) == gap;
+        return a.Left == area.Left && b.Left == area.Left && a.Width == area.Width && b.Width == area.Width
+            && Math.Max(a.Top, b.Top) - Math.Min(a.Bottom, b.Bottom) == gap;
+    }
+    static void StackOnLeft(Rectangle area, int gap, IntPtr app, IntPtr peer) {
+        int w = (area.Width - gap) / 2, h = (area.Height - gap) / 2;
+        var top = new Rectangle(area.Left, area.Top, w, h);
+        var bottom = Rectangle.FromLTRB(area.Left, top.Bottom + gap, top.Right, area.Bottom);
+        var windows = new[] { app, peer };
+        var target = new[] { top, bottom };
+        for (int i = 0; i < windows.Length; i++) {
+            var outer = Bounds(windows[i]);
+            var frame = VisibleFrame(windows[i]);
+            Require(SetWindowPos(windows[i], IntPtr.Zero,
+                target[i].Left + outer.Left - frame.Left, target[i].Top + outer.Top - frame.Top,
+                target[i].Width + outer.Width - frame.Width, target[i].Height + outer.Height - frame.Height,
+                0x14 /* SWP_NOACTIVATE | SWP_NOZORDER */), "Failed to stack fixture on left");
+        }
+        Require(VisibleFrame(app) == top && VisibleFrame(peer) == bottom, "Expected both frames in the left half");
+    }
+    static void FullscreenRoundTrips(string rustile, string desktop, List<Child> children,
+        IntPtr app, IntPtr peer, Rectangle[] originals) {
+        var screen = Screen.PrimaryScreen;
+        int gap = (int)((8 * GetDpiForSystem() + 48) / 96);
+        var tiledArea = Rectangle.Inflate(screen.WorkingArea, -gap, -gap);
+        int owner;
+        GetWindowThreadProcessId(peer, out owner);
+        Message(peer, ShowFixtureDialog);
+        IntPtr dialog = IntPtr.Zero;
+        Until("Open the excluded owned dialog for the fullscreen test", () => (dialog = Find(owner, true)) != IntPtr.Zero);
+        var dialogBounds = VisibleFrame(dialog);
+        var beforeFocus = GetForegroundWindow();
+
+        SetMode(app, FixtureMode.Borderless);
+        Until("The borderless fixture must cover the monitor", () => VisibleFrame(app) == screen.Bounds);
+        var manager = new Child(rustile, "", desktop, true);
+        children.Add(manager);
+        Until("Startup must exclude an existing fullscreen window and tile the other app", () =>
+            VisibleFrame(peer) == tiledArea && VisibleFrame(app) == screen.Bounds);
+        Console.WriteLine("PASS  Startup with an existing fullscreen app tiles its peer and leaves the fullscreen frame intact");
+
+        bool enteredBeforeStartup = true;
+        foreach (var mode in new[] { FixtureMode.Borderless, FixtureMode.Borderless, FixtureMode.Maximize }) {
+            bool stackOnReturn = mode == FixtureMode.Borderless && !enteredBeforeStartup;
+            if (!enteredBeforeStartup) SetMode(app, mode);
+            if (mode == FixtureMode.Maximize) {
+                Until("Native maximize must cover the work area", () => IsZoomed(app) && VisibleFrame(app).Contains(tiledArea));
+                var maximized = VisibleFrame(app);
+                Until("The fixture must maximize while its sibling reclaims the work area", () =>
+                    IsZoomed(app) && VisibleFrame(app) == maximized && VisibleFrame(peer) == tiledArea);
+            } else {
+                Until("Fullscreen must remain at monitor bounds while its peer fills the work area", () =>
+                    VisibleFrame(app) == screen.Bounds && VisibleFrame(peer) == tiledArea);
+            }
+            Require(VisibleFrame(dialog) == dialogBounds, "Fullscreen transition moved the excluded dialog");
+            if (enteredBeforeStartup) {
+                // Browser/video apps may shrink the popup first. The new
+                // geometry arrives while the HWND is still ineligible.
+                SetMode(app, FixtureMode.AppBounds);
+                Thread.Sleep(230);
+                Require(Bounds(app) == originals[0] && VisibleFrame(peer) == tiledArea
+                    && (GetWindowLongW(app, -16) & 0x00cf0000) == 0, "The intermediate popup should stay excluded");
+                SetMode(app, FixtureMode.RestoreNormalStyle);
+                enteredBeforeStartup = false;
+            } else {
+                SetMode(app, FixtureMode.Normal);
+            }
+            Until("The returning app and its peer must exactly fill the work area: " + mode, () =>
+                !IsZoomed(app) && PairFills(tiledArea, gap, app, peer));
+
+            // The first request has reached both HWNDs. A later, unsnapped
+            // application SetWindowPos emits a real LOCATIONCHANGE by itself.
+            Thread.Sleep(400);
+            if (stackOnReturn) StackOnLeft(tiledArea, gap, app, peer);
+            else SetMode(app, FixtureMode.AppBounds);
+            Until("Delayed app restore must rejoin both tiles without a focus event: " + mode, () =>
+                PairFills(tiledArea, gap, app, peer));
+            Thread.Sleep(150); // a stale DWM sample must not pass for a stable repair
+            Require(PairFills(tiledArea, gap, app, peer), "The repaired tile frames drifted: " + mode);
+            Require(VisibleFrame(dialog) == dialogBounds, "Restoring the app moved the excluded dialog");
+            if (mode == FixtureMode.Borderless) {
+                Require(GetForegroundWindow() == beforeFocus, "Borderless round trip changed foreground");
+            }
+        }
+        manager.Send(0x12 /* WM_QUIT */, 0);
+        Require(manager.Exited(5000) && manager.ExitCode == 0, "Fullscreen test manager failed to exit cleanly");
+        Until("Fullscreen test manager must restore the two original windows", () =>
+            Bounds(app) == originals[0] && Bounds(peer) == originals[1]);
+        Message(dialog, WmClose);
+        Until("Excluded dialog should close after fullscreen checks", () => Find(owner, true) == IntPtr.Zero);
+        Console.WriteLine("PASS  Fullscreen and maximize/restore refill the work area after delayed app bounds or two windows stacked in its left half");
     }
     static IntPtr TrayWindow(Child manager, string className = "Rustile.Tray") {
         IntPtr tray = IntPtr.Zero;
@@ -728,6 +875,7 @@ internal static class DesktopSmoke {
                 originals[index] = Bounds(windows[index]);
             };
             launch(0); launch(1);
+            FullscreenRoundTrips(rustile, desktopName, children, windows[0], windows[1], originals);
             // Exercise the default Windows modifier even when another application
             // has already registered Win+Enter on this desktop.
             ownsShortcut = RegisterHotKey(IntPtr.Zero, fixtureShortcut, 8, 13);

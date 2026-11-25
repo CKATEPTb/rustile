@@ -72,7 +72,11 @@ unsafe extern "system" fn on_window_event(
     }
     // Controls can emit LOCATIONCHANGE at scroll/animation rates. Never query
     // the parent of a destroyed HWND; the manager still needs its removal.
-    if event == EVENT_OBJECT_LOCATIONCHANGE && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
+    if matches!(
+        event,
+        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_STATECHANGE
+    ) && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
+    {
         return;
     }
     let item = (event, hwnd as isize);
@@ -102,6 +106,7 @@ impl EventHooks {
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
             (EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+            (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         ] {
@@ -339,8 +344,8 @@ fn pump(
         };
         if reconcile {
             manager.reconcile_desktop();
-            // A new top-level HWND can briefly have no desktop GUID. Give the
-            // shell time to register it, without polling an idle desktop forever.
+            // Desktop membership, window styles and app-restored bounds may
+            // settle at different times. Keep retries finite on an idle desktop.
             if manager.take_desktop_retry() && retries > 0 {
                 let delay = if retries == 2 { 2 } else { 4 };
                 retries -= 1;

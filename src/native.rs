@@ -261,39 +261,48 @@ pub fn outline_frame(id: Id) -> Option<(Rect, Rect)> {
     }
 }
 
-pub fn eligible(id: Id) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TileState {
+    Eligible,
+    Expanded,
+    Excluded,
+}
+
+pub(crate) fn tile_state(id: Id) -> TileState {
     let hwnd = id as HWND;
     if hwnd.is_null() {
-        return false;
+        return TileState::Excluded;
     }
     unsafe {
         if IsWindowVisible(hwnd) == 0
-            || minimized_or_maximized(id)
+            || IsIconic(hwnd) != 0
             || GetAncestor(hwnd, GA_ROOT) != hwnd
             || !GetWindow(hwnd, GW_OWNER).is_null()
             || hwnd == GetShellWindow()
             || IsHungAppWindow(hwnd) != 0
         {
-            return false;
+            return TileState::Excluded;
         }
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let extended = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let resizable = style & WS_THICKFRAME != 0;
+        let borderless = style & WS_CAPTION != WS_CAPTION;
         if style & WS_CHILD != 0
-            || style & WS_THICKFRAME == 0
+            || (!resizable && !borderless)
             || extended & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_DLGMODALFRAME) != 0
             || cloaked(id)
             || shell_or_dialog(hwnd)
         {
-            return false;
+            return TileState::Excluded;
         }
         let Some(info) = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)) else {
-            return false;
+            return TileState::Excluded;
         };
         if info.dwFlags & MONITORINFOF_PRIMARY == 0 {
-            return false;
+            return TileState::Excluded;
         }
         let Some(outer) = outer_bounds(hwnd) else {
-            return false;
+            return TileState::Excluded;
         };
         let frame = frame_bounds(hwnd, outer);
         let screen = rect(info.rcMonitor);
@@ -302,16 +311,30 @@ pub fn eligible(id: Id) -> bool {
             && frame.x + frame.w >= screen.x + screen.w
             && frame.y + frame.h >= screen.y + screen.h;
         let compact = frame.w <= screen.w / 2 && frame.h <= screen.h / 2;
-        let borderless = style & WS_CAPTION != WS_CAPTION;
-        let fullscreen = covers_monitor && (borderless || rect(info.rcWork) != screen);
+        // Browsers can drop WS_THICKFRAME on F11. DWM may still report the
+        // old resize border briefly after the outer window reaches the screen.
+        let fullscreen = (covers_monitor && (borderless || rect(info.rcWork) != screen))
+            || (borderless && outer == screen);
         // Our own tile may have made an ordinary topmost window compact.
         let floating_panel = extended & WS_EX_TOPMOST != 0
             && (borderless || (compact && GetPropW(hwnd, marker_name()).is_null()));
-        if fullscreen || floating_panel {
-            return false;
+        let state = if fullscreen || (resizable && IsZoomed(hwnd) != 0 && !floating_panel) {
+            TileState::Expanded
+        } else if resizable && !floating_panel {
+            TileState::Eligible
+        } else {
+            return TileState::Excluded;
+        };
+        if ordinary_process(pid(id)) {
+            state
+        } else {
+            TileState::Excluded
         }
-        ordinary_process(pid(id))
     }
+}
+
+pub fn eligible(id: Id) -> bool {
+    tile_state(id) == TileState::Eligible
 }
 
 fn marker_name() -> *const u16 {
@@ -363,7 +386,14 @@ impl FrameInsets {
 
 impl Original {
     pub fn is_at(&self, target: Rect) -> bool {
-        outer_bounds(self.id as HWND) == Some(self.insets.outer_for(target))
+        let hwnd = self.id as HWND;
+        let Some(outer) = outer_bounds(hwnd) else {
+            return false;
+        };
+        // Leaving fullscreen can change the invisible resize border. Only
+        // accept a differing outer rectangle if DWM confirms the visible tile.
+        outer == self.insets.outer_for(target)
+            || (measured_frame(hwnd, outer) == Some(target) && outer_bounds(hwnd) == Some(outer))
     }
 
     pub fn matches(&self, id: Id) -> bool {
