@@ -6,6 +6,8 @@ mod vacancy;
 #[cfg(test)]
 mod focused_insert_tests;
 #[cfg(test)]
+mod mouse_resize_tests;
+#[cfg(test)]
 mod move_sequence_tests;
 #[cfg(test)]
 mod work_area_tests;
@@ -196,6 +198,11 @@ pub enum Direction {
 }
 
 impl Direction {
+    fn coordinate(self, rect: Rect) -> i64 {
+        let (first, last) = self.axis().bounds(rect);
+        if self.towards_start() { first } else { last }
+    }
+
     fn towards_start(self) -> bool {
         matches!(self, Self::Left | Self::Up)
     }
@@ -1137,6 +1144,189 @@ impl Layout {
         self.occupants.swap(source, target);
         self.settle_invalid_pairs(area);
         true
+    }
+
+    /// Move the specified visible frame edge in physical screen coordinates.
+    /// Work on a proposal so a clamped drag cannot accidentally commit a move preview.
+    pub fn resize_edge_to(&mut self, id: Id, edge: Direction, coordinate: i32, area: Rect) -> bool {
+        let Some(slot) = self.slot(id) else {
+            return false;
+        };
+        let current = edge.coordinate(self.visible_rects(area)[slot]);
+        if current == edge.coordinate(area) || current == i64::from(coordinate) {
+            return false;
+        }
+        let mut proposal = self.clone();
+        if !proposal.drag_divider(id, edge, coordinate, area) {
+            return false;
+        }
+        *self = proposal;
+        true
+    }
+
+    fn drag_divider(&mut self, id: Id, edge: Direction, coordinate: i32, area: Rect) -> bool {
+        let axis = edge.axis();
+        let across = axis.perpendicular();
+        let gap = self.grid.gap;
+        loop {
+            let slot = self.slot(id).expect("the resized window remains tiled");
+            let cells = self.cell_rects(area);
+            if let Some(i) = self
+                .shared
+                .iter()
+                .position(|p| p.slots().any(|s| s == slot))
+            {
+                if let Some(changed) =
+                    self.drag_shared_divider(i, slot, edge, coordinate, area, &cells)
+                {
+                    return changed;
+                }
+                // An external edge of a rotated pair, an L-shaped pair, or a
+                // reclaimed vacancy belongs to the currently displayed tiling.
+                if !self.freeze_pair(i, area) {
+                    return false;
+                }
+                continue;
+            }
+            let current = edge.coordinate(cells[slot]);
+            let roots = self.grid.rects(area);
+            let root = self.bsp.root(slot, roots.len());
+            let scope = self.bsp.divider_scope(slot, edge, &roots, gap).or_else(|| {
+                (edge.coordinate(roots[root]) == current)
+                    .then(|| self.grid.divider_scope(root, edge, area, &roots))
+                    .flatten()
+            });
+            let Some(scope) = scope else { return false };
+            let (start, end) = across.bounds(scope);
+            let divider = current
+                - if edge.towards_start() {
+                    i64::from(gap)
+                } else {
+                    0
+                };
+            let side = |rect: Rect| {
+                let (a, b) = across.bounds(rect);
+                if a < start || b > end {
+                    return None;
+                }
+                let (lo, hi) = axis.bounds(rect);
+                if hi == divider {
+                    Some(false)
+                } else if lo == divider + i64::from(gap) {
+                    Some(true)
+                } else {
+                    None
+                }
+            };
+            if let Some(i) = self
+                .shared
+                .iter()
+                .position(|p| p.slots().any(|s| side(cells[s]).is_some()))
+            {
+                if !self.freeze_pair(i, area) {
+                    return false;
+                }
+                continue;
+            }
+
+            // Only rectangles facing the selected seam give or receive space.
+            // This keeps every other edge fixed, including interior BSP cuts.
+            let (mut min, mut max) = (i64::MIN, i64::MAX);
+            for (&cell, window) in cells.iter().zip(&self.occupants) {
+                let spare = i64::from(axis.length(cell) - axis.min_dimension(window.min));
+                match side(cell) {
+                    Some(true) => max = max.min(spare),
+                    Some(false) => min = min.max(-spare),
+                    None => {}
+                }
+            }
+            if min == i64::MIN || max == i64::MAX || min > max {
+                return false;
+            }
+            let delta = (i64::from(coordinate) - current).clamp(min, max) as i32;
+            if delta == 0 {
+                return false;
+            }
+            let mut resized = cells;
+            for cell in &mut resized {
+                match (axis, side(*cell)) {
+                    (Axis::X, Some(false)) => cell.w += delta,
+                    (Axis::Y, Some(false)) => cell.h += delta,
+                    (Axis::X, Some(true)) => {
+                        cell.x = cell.x.saturating_add(delta);
+                        cell.w -= delta;
+                    }
+                    (Axis::Y, Some(true)) => {
+                        cell.y = cell.y.saturating_add(delta);
+                        cell.h -= delta;
+                    }
+                    (_, None) => {}
+                }
+            }
+            let Some(outer) = self.bsp.update_dividers(resized, gap) else {
+                return false;
+            };
+            self.grid.update_dividers(&roots, &outer);
+            return self.shared.is_empty()
+                || SharedPair::can_freeze(
+                    &self.shared,
+                    area,
+                    &self.cell_rects(area),
+                    &self.occupants,
+                    gap,
+                );
+        }
+    }
+
+    // A drag on the temporary divider can preserve the pending second move.
+    fn drag_shared_divider(
+        &mut self,
+        index: usize,
+        slot: usize,
+        edge: Direction,
+        coordinate: i32,
+        area: Rect,
+        cells: &[Rect],
+    ) -> Option<bool> {
+        let pair = &mut self.shared[index];
+        let (source, target) = pair.rectangles(cells, &self.occupants, self.grid.gap)?;
+        let Partition::Divider {
+            axis,
+            source_first,
+            part,
+            whole,
+        } = &mut pair.partition
+        else {
+            return None;
+        };
+        if edge != axis.direction((pair.source == slot) != *source_first) {
+            return None;
+        }
+        let (first, second, a, b) = if *source_first {
+            (source, target, pair.source, pair.target)
+        } else {
+            (target, source, pair.target, pair.source)
+        };
+        let current = axis.length(first);
+        let available = current + axis.length(second);
+        let delta = i64::from(coordinate)
+            - edge.coordinate(if slot == pair.source { source } else { target });
+        let next = (i64::from(current) + delta).clamp(
+            i64::from(axis.min_dimension(self.occupants[a].min)),
+            i64::from(available - axis.min_dimension(self.occupants[b].min)),
+        ) as i32;
+        if next == current {
+            return Some(false);
+        }
+        *part = next;
+        *whole = available;
+        Some(SharedPair::can_freeze(
+            &self.shared,
+            area,
+            cells,
+            &self.occupants,
+            self.grid.gap,
+        ))
     }
 
     pub fn resize(

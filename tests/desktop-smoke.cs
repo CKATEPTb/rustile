@@ -106,18 +106,22 @@ internal static class DesktopSmoke {
         int height = Math.Min(work.Height, Math.Min(1160, work.Width) / 2);
         return height / 2 + Math.Min(60, height / 6);
     }
+    static Size DragPeerMinimum(Rectangle work) {
+        return new Size(Math.Min(300, work.Width / 4), Math.Min(200, work.Height / 4));
+    }
 
     class Fixture : Form {
         Rectangle lastBounds;
         readonly Rectangle normalBounds;
         int normalStyle;
         int geometryChanges;
-        public Fixture(int index) {
+        public Fixture(int index, bool dragPeer) {
             Text = "Rustile fixture " + index;
             var work = Screen.PrimaryScreen.WorkingArea;
             StartPosition = FormStartPosition.Manual;
             Bounds = new Rectangle(work.X + 30 + index * 28, work.Y + 25 + index * 25, 320 + index * 15, 230);
             if (index == 5) MinimumSize = new Size(160, TallMinimum(work));
+            if (dragPeer) MinimumSize = DragPeerMinimum(work);
             int corners = FixtureCorners[index % FixtureCorners.Length];
             Require(DwmSetWindowAttribute(Handle, WindowCornerPreference, ref corners, sizeof(int)) == 0, "Cannot configure fixture corners");
             normalBounds = DesktopSmoke.Bounds(Handle);
@@ -285,20 +289,20 @@ internal static class DesktopSmoke {
         return a.Left == area.Left && b.Left == area.Left && a.Width == area.Width && b.Width == area.Width
             && Math.Max(a.Top, b.Top) - Math.Min(a.Bottom, b.Bottom) == gap;
     }
+    static void SetFixtureFrame(IntPtr hwnd, Rectangle target) {
+        var outer = Bounds(hwnd);
+        var frame = VisibleFrame(hwnd);
+        Require(SetWindowPos(hwnd, IntPtr.Zero,
+            target.Left + outer.Left - frame.Left, target.Top + outer.Top - frame.Top,
+            target.Width + outer.Width - frame.Width, target.Height + outer.Height - frame.Height,
+            0x14 /* SWP_NOACTIVATE | SWP_NOZORDER */), "Cannot position fixture at " + target);
+    }
     static void StackOnLeft(Rectangle area, int gap, IntPtr app, IntPtr peer) {
         int w = (area.Width - gap) / 2, h = (area.Height - gap) / 2;
         var top = new Rectangle(area.Left, area.Top, w, h);
         var bottom = Rectangle.FromLTRB(area.Left, top.Bottom + gap, top.Right, area.Bottom);
-        var windows = new[] { app, peer };
-        var target = new[] { top, bottom };
-        for (int i = 0; i < windows.Length; i++) {
-            var outer = Bounds(windows[i]);
-            var frame = VisibleFrame(windows[i]);
-            Require(SetWindowPos(windows[i], IntPtr.Zero,
-                target[i].Left + outer.Left - frame.Left, target[i].Top + outer.Top - frame.Top,
-                target[i].Width + outer.Width - frame.Width, target[i].Height + outer.Height - frame.Height,
-                0x14 /* SWP_NOACTIVATE | SWP_NOZORDER */), "Failed to stack fixture on left");
-        }
+        SetFixtureFrame(app, top);
+        SetFixtureFrame(peer, bottom);
         Require(VisibleFrame(app) == top && VisibleFrame(peer) == bottom, "Expected both frames in the left half");
     }
     static void FullscreenRoundTrips(string rustile, string desktop, List<Child> children,
@@ -883,6 +887,98 @@ internal static class DesktopSmoke {
         }
         return -1;
     }
+    static void BeginMouseDrag(IntPtr hwnd) {
+        NotifyWinEvent(0x000a /* EVENT_SYSTEM_MOVESIZESTART */, hwnd, 0, 0);
+        // WinEvent hooks are delivered asynchronously to the manager thread.
+        // Give it the same stationary start frame as a real border press.
+        Thread.Sleep(120);
+    }
+    static void SetDragFrame(IntPtr hwnd, Rectangle frame) {
+        SetFixtureFrame(hwnd, frame);
+        NotifyWinEvent(0x800b /* EVENT_OBJECT_LOCATIONCHANGE */, hwnd, 0, 0);
+    }
+    static void EndMouseDrag(IntPtr hwnd) {
+        NotifyWinEvent(0x000b /* EVENT_SYSTEM_MOVESIZEEND */, hwnd, 0, 0);
+    }
+    static void MouseResize(Child manager, IntPtr[] windows, int anchor, int gap, Rectangle work) {
+        var original = windows.Select(VisibleFrame).ToArray();
+        var active = windows[anchor];
+        var source = original[anchor];
+        int sibling = NeighborDirection(source, original[2]);
+        int other = NeighborDirection(source, original[1 - anchor]);
+        Require(sibling >= 0 && other >= 0 && sibling / 2 != other / 2,
+            "Expected two perpendicular shared borders on the original focused tile");
+        bool left = sibling == 0 || other == 0, top = sibling == 2 || other == 2;
+        int x = left ? source.Left - gap : source.Right;
+        int y = top ? source.Top - gap : source.Bottom;
+        int signX = left ? -1 : 1, signY = top ? -1 : 1;
+        // Move only edges bordering the shared gaps. The monitor perimeter and
+        // all unrelated boundaries retain their exact original DWM coordinates.
+        Func<int, int, Rectangle[]> expected = (dx, dy) => original.Select(r => Rectangle.FromLTRB(
+            r.Left == x + gap ? r.Left + dx : r.Left, r.Top == y + gap ? r.Top + dy : r.Top,
+            r.Right == x ? r.Right + dx : r.Right, r.Bottom == y ? r.Bottom + dy : r.Bottom)).ToArray();
+        Func<Rectangle[], bool> matches = rectangles => windows.Select(VisibleFrame).SequenceEqual(rectangles);
+        var foreground = GetForegroundWindow();
+
+        BeginMouseDrag(active);
+        var grown = expected(signX * 32, signY * 24);
+        SetDragFrame(active, grown[anchor]);
+        Until("Both neighbors should follow a growing corner before MOVESIZEEND", () => matches(grown));
+        var smaller = expected(-signX * 29, -signY * 19);
+        SetDragFrame(active, smaller[anchor]);
+        Until("Both neighbors should follow the same corner back past its start", () => matches(smaller));
+        EndMouseDrag(active);
+        Thread.Sleep(200);
+        SendTrayMessage(TrayWindow(manager), 0x1a /* WM_SETTINGCHANGE */, (IntPtr)47 /* SPI_SETWORKAREA */, IntPtr.Zero);
+        Thread.Sleep(350);
+        Require(matches(smaller), "The resized corner must survive release and desktop reconciliation");
+
+        BeginMouseDrag(active);
+        var translated = smaller[anchor];
+        translated.Offset(13, 9);
+        SetDragFrame(active, translated);
+        Thread.Sleep(150);
+        Require(VisibleFrame(windows[2]) == smaller[2] && VisibleFrame(windows[1 - anchor]) == smaller[1 - anchor],
+            "Moving the whole frame must not resize its neighbors");
+        EndMouseDrag(active);
+        Until("Releasing a translated tile should restore its saved slot", () => matches(smaller));
+
+        // Attempt to push one sibling below the minimum it advertised through
+        // WM_GETMINMAXINFO. The native tracking minimum is an outer dimension.
+        bool horizontal = sibling < 2;
+        var minOuter = DragPeerMinimum(work);
+        var peerOuter = Bounds(windows[2]);
+        int extent = horizontal ? original[2].Width : original[2].Height;
+        int min = horizontal ? Math.Max(160, minOuter.Width - (peerOuter.Width - smaller[2].Width))
+            : Math.Max(100, minOuter.Height - (peerOuter.Height - smaller[2].Height));
+        Func<int, Rectangle[]> shrinkPeerTo = size => horizontal
+            ? expected(signX * (extent - size), -signY * 19)
+            : expected(-signX * 29, signY * (extent - size));
+        Require(min < extent && min > 24, "Test setup must permit resizing the sibling into its native minimum");
+        var limit = shrinkPeerTo(min);
+        BeginMouseDrag(active);
+        SetDragFrame(active, shrinkPeerTo(24)[anchor]);
+        Until("Dragging past the sibling's native minimum should clamp its live frame", () => VisibleFrame(windows[2]) == limit[2]);
+        EndMouseDrag(active);
+        Until("At release, the tile and its neighbor must meet at their clamped gap", () => matches(limit));
+
+        BeginMouseDrag(active);
+        SetDragFrame(active, smaller[anchor]);
+        Until("A new preview should start from the committed limit", () => matches(smaller));
+        // A native cancellation restores the HWND before the end notification.
+        SetDragFrame(active, limit[anchor]);
+        EndMouseDrag(active);
+        Until("Cancelling a corner resize must restore both neighbors", () => matches(limit));
+
+        // A quick drag may have already moved the HWND when START is delivered.
+        NotifyWinEvent(0x000a /* EVENT_SYSTEM_MOVESIZESTART */, active, 0, 0);
+        SetDragFrame(active, original[anchor]);
+        EndMouseDrag(active);
+        Until("A quick drag back should restore both original borders", () => matches(original));
+        Thread.Sleep(200);
+        Require(matches(original) && GetForegroundWindow() == foreground, "Restoring the layout changed the tiles or focus");
+        Console.WriteLine("PASS  Native mouse drag resizes both shared edges live, clamps at the peer minimum, persists on release, and ignores pure moves");
+    }
     static void MoveOnHiddenDesktop(Child manager, IntPtr[] windows) {
         var active = GetForegroundWindow();
         int source = Array.IndexOf(windows, active);
@@ -965,13 +1061,14 @@ internal static class DesktopSmoke {
             var windows = new IntPtr[3];
             var originals = new Rectangle[3];
             var fixtures = new Child[3];
-            Action<int> launch = delegate(int index) {
-                var fixture = new Child(self, "fixture " + index, desktopName);
+            Action<int, bool> launchFixture = delegate(int index, bool dragPeer) {
+                var fixture = new Child(self, "fixture " + index + (dragPeer ? " drag-peer" : ""), desktopName);
                 children.Add(fixture);
                 fixtures[index] = fixture;
                 Until("Fixture should create its window", () => (windows[index] = Find(fixture.Pid, false)) != IntPtr.Zero);
                 originals[index] = Bounds(windows[index]);
             };
+            Action<int> launch = index => launchFixture(index, false);
             launch(0); launch(1);
             FullscreenRoundTrips(rustile, desktopName, children, windows[0], windows[1], originals);
             // Exercise the default Windows modifier even when another application
@@ -1004,7 +1101,7 @@ internal static class DesktopSmoke {
                     .ThenBy(i => startupTiles[i].Top).ThenBy(i => startupTiles[i].Left).First();
                 NotifyWinEvent(3 /* EVENT_SYSTEM_FOREGROUND */, windows[anchor], 0, 0);
             }
-            launch(2);
+            launchFixture(2, true);
             Until("Newly opened fixture should receive a tile", () => Tiled(area, windows));
             Until("New fixture should split only the previous foreground tile", () =>
                 VisibleFrame(windows[1 - anchor]) == startupTiles[1 - anchor] &&
@@ -1016,6 +1113,7 @@ internal static class DesktopSmoke {
                 windows.Select(VisibleFrame).Aggregate(Rectangle.Union) == inset);
             Require(windows.Select(CornerPreference).SequenceEqual(FixtureCorners), "Tiling changed an app's corner preference");
             Console.WriteLine("PASS  Outer gutter and native round, small, and square corner preferences preserved");
+            MouseResize(manager, windows, anchor, outerGap, area);
 
             bool resized = ResizeOnHiddenDesktop(manager, windows);
             Console.WriteLine(resized ? "PASS  Shortcut dispatch, opposite arrows, Escape and Enter"
@@ -1111,7 +1209,8 @@ internal static class DesktopSmoke {
     static int Main(string[] args) {
         try {
             SetProcessDpiAwarenessContext((IntPtr)(-4));
-            if (args.Length == 2 && args[0] == "fixture") Application.Run(new Fixture(int.Parse(args[1])));
+            if ((args.Length == 2 || args.Length == 3) && args[0] == "fixture")
+                Application.Run(new Fixture(int.Parse(args[1]), args.Length == 3 && args[2] == "drag-peer"));
             else if (args.Length == 2) {
                 // A WinForms STA may already own an OLE window, which prevents
                 // switching its desktop. Start a clean worker before using USER.

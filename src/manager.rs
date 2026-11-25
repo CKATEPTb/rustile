@@ -12,6 +12,9 @@ use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
 use crate::native::{self, Original, TileState};
 use crate::settings::Settings;
 
+mod mouse;
+use mouse::MouseDrag;
+
 #[cfg(test)]
 mod desktop_test;
 
@@ -102,7 +105,7 @@ pub struct Manager {
     needs_desktop_retry: bool,
     work_area: Option<WorkArea>,
     area: Option<Rect>,
-    dragging: Option<Id>,
+    dragging: Option<MouseDrag>,
     session: Option<ResizeSession>,
     hud: ResizeHud,
     outline: FocusOutline,
@@ -159,6 +162,10 @@ impl Manager {
         self.windows.contains_key(&id)
     }
 
+    fn drag_target(&self) -> Option<Id> {
+        self.dragging.as_ref().map(|drag| drag.target)
+    }
+
     pub fn take_desktop_retry(&mut self) -> bool {
         std::mem::take(&mut self.needs_desktop_retry)
     }
@@ -173,7 +180,7 @@ impl Manager {
                 self.rollback_resize();
             }
             self.workspace.remove(id);
-            if self.dragging == Some(id) {
+            if self.drag_target() == Some(id) {
                 self.dragging = None;
             }
         } else if let Some(previous) = self.parked.get_mut(&desktop) {
@@ -192,6 +199,9 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        if self.drag_target() == Some(id) {
+            self.dragging = None;
+        }
         self.expanded.remove(&id);
         if let Some(window) = self.windows.remove(&id) {
             self.detach(id, window.desktop);
@@ -345,7 +355,10 @@ impl Manager {
             .is_some_and(|key| self.windows.values().any(|w| w.desktop == key));
         self.remember_tile(foreground);
         for (id, desktop) in visible {
-            if self.current != Some(desktop) || self.workspace.layout.contains(id) {
+            if self.current != Some(desktop)
+                || self.workspace.layout.contains(id)
+                || self.drag_target() == Some(id)
+            {
                 continue;
             }
             self.rollback_resize();
@@ -391,7 +404,7 @@ impl Manager {
 
     fn suspend(&mut self, id: Id) {
         self.rollback_resize();
-        if self.dragging == Some(id) {
+        if self.drag_target() == Some(id) {
             self.dragging = None;
         }
         self.workspace.remove(id);
@@ -559,8 +572,13 @@ impl Manager {
             }
         }
 
-        if event == EVENT_SYSTEM_MOVESIZEEND && self.dragging == Some(id) {
-            self.dragging = None;
+        let finished_drag = self
+            .dragging
+            .take_if(|drag| event == EVENT_SYSTEM_MOVESIZEEND && drag.target == id);
+        if finished_drag.is_some() {
+            // END can coincide with minimizing or switching desktops. Settle
+            // neighbors even if the target can no longer accept a placement.
+            self.needs_desktop_retry = true;
         }
         let state = self.observe(id);
         let eligible = state == TileState::Eligible;
@@ -643,10 +661,13 @@ impl Manager {
             self.finish_mode(false);
         }
         if event == EVENT_SYSTEM_MOVESIZESTART {
-            self.dragging = Some(id);
+            self.start_mouse_drag(id);
             return;
         }
-        if self.dragging == Some(id) {
+        if self.drag_target() == Some(id) {
+            if event == EVENT_OBJECT_LOCATIONCHANGE {
+                self.preview_mouse_drag(id);
+            }
             return;
         }
         let was_tiled = self.workspace.layout.contains(id);
@@ -663,6 +684,11 @@ impl Manager {
                 self.needs_desktop_retry = true;
             }
             self.apply();
+        } else if event == EVENT_SYSTEM_MOVESIZEEND
+            && !switched
+            && let Some(drag) = finished_drag
+        {
+            self.finish_mouse_drag(drag);
         } else if event == EVENT_SYSTEM_MOVESIZEEND
             || (matches!(event, EVENT_OBJECT_LOCATIONCHANGE | EVENT_SYSTEM_FOREGROUND)
                 && native::is_snapped(id))
@@ -708,13 +734,19 @@ impl Manager {
 
     fn place_tiles(&mut self, verify: bool) {
         let Some(area) = self.area else { return };
-        for (id, rect) in self.workspace.layout.placements(area) {
+        let preview = self
+            .dragging
+            .as_ref()
+            .and_then(|drag| drag.resized_layout(&self.workspace.layout, area));
+        let layout = preview.as_ref().unwrap_or(&self.workspace.layout);
+        let drag_target = self.drag_target();
+        for (id, rect) in layout.placements(area) {
             let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
             // Window positioning is asynchronous. Compare the last enqueued
             // target, so Esc also supersedes a preview still in the target's queue.
-            if self.dragging == Some(id)
+            if drag_target == Some(id)
                 || (!verify && window.requested == Some(rect))
                 || self.desktops.membership(id) != DesktopMembership::Current(window.desktop)
             {
@@ -749,7 +781,7 @@ impl Manager {
 
     pub fn begin_resize(&mut self, target: Id) -> bool {
         let Some(area) = self.area else { return false };
-        if self.session.is_some() || !self.can_act_on(target) {
+        if self.session.is_some() || self.dragging.is_some() || !self.can_act_on(target) {
             return false;
         }
         let tiles = self.workspace.layout.placements(area);
@@ -845,6 +877,7 @@ impl Manager {
     pub fn move_window(&mut self, target: Id, direction: Direction) {
         if let Some(area) = self.area
             && self.session.is_none()
+            && self.dragging.is_none()
             && self.can_act_on(target)
             && self.workspace.layout.move_window(target, direction, area)
         {

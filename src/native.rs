@@ -444,6 +444,17 @@ fn floating_frame(frame: Rect, work: Rect, minimum: (i32, i32)) -> Rect {
 }
 
 impl Original {
+    /// Read the live drag rectangle in the same visible-frame coordinates used by `place`.
+    pub fn visible_frame(&self) -> Option<Rect> {
+        // DWM can still report the preceding frame while the window's edge is moving.
+        let outer = outer_bounds(self.id as HWND)?;
+        if !self.matches(self.id) {
+            return None;
+        }
+        let frame = self.insets.frame_for(outer);
+        (frame.w > 0 && frame.h > 0).then_some(frame)
+    }
+
     pub fn is_at(&self, target: Rect) -> bool {
         let hwnd = self.id as HWND;
         let Some(outer) = outer_bounds(hwnd) else {

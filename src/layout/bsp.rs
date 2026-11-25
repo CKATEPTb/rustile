@@ -180,6 +180,50 @@ impl Bsp {
         slot
     }
 
+    pub fn divider_scope(
+        &self,
+        mut slot: usize,
+        edge: Direction,
+        roots: &[Rect],
+        gap: i32,
+    ) -> Option<Rect> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let (leaves, parents) = self.leaves_and_parents(roots.to_vec(), gap);
+        let coordinate = edge.coordinate(leaves[slot]);
+        for (i, cut) in self.0.iter().enumerate().rev() {
+            let trailing = slot == roots.len() + i;
+            if !trailing && slot != cut.at {
+                continue;
+            }
+            slot = cut.at;
+            if cut.axis == edge.axis() && trailing == edge.towards_start() {
+                let (a, b) = cut.parts(parents[i], gap);
+                if edge.coordinate(if trailing { b } else { a }) == coordinate {
+                    return Some(parents[i]);
+                }
+            }
+        }
+        None
+    }
+
+    // Keep the existing tree. Folding its leaves back into their original
+    // parents also keeps interior dividers stationary on a mouse drag.
+    pub fn update_dividers(&mut self, mut cells: Vec<Rect>, gap: i32) -> Option<Vec<Rect>> {
+        for cut in self.0.iter_mut().rev() {
+            let trailing = cells.pop()?;
+            let leading = cells[cut.at];
+            let parent = leading.joined(trailing, cut.axis, gap)?;
+            if cut.parts(parent, gap).0 != leading {
+                cut.part = cut.axis.length(leading);
+                cut.whole = cut.axis.length(parent) - gap;
+            }
+            cells[cut.at] = parent;
+        }
+        Some(cells)
+    }
+
     // Fold child requirements upward before fitting tracks or moving a
     // divider. Save each pair before its leading slot is reused by its parent.
     pub fn minimums(&self, mut sizes: Vec<Size>, gap: i32) -> (Vec<Size>, Vec<(Size, Size)>) {

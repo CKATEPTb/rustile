@@ -202,6 +202,57 @@ impl Grid {
         result
     }
 
+    pub fn divider_scope(
+        &self,
+        slot: usize,
+        edge: Direction,
+        area: Rect,
+        roots: &[Rect],
+    ) -> Option<Rect> {
+        let (band, segment) = self.tracks(slot)?;
+        let (track, count, scope) = if edge.axis() == self.flow {
+            (segment, self.segments[band].len(), roots[slot])
+        } else {
+            (band, self.bands.len(), area)
+        };
+        let adjacent = if edge.towards_start() {
+            track > 0
+        } else {
+            track + 1 < count
+        };
+        adjacent.then_some(scope)
+    }
+
+    // Pixel lengths are exact weights at the current work area. Other bands
+    // keep their original ratios, even if their current projection is rounded.
+    pub fn update_dividers(&mut self, old: &[Rect], new: &[Rect]) {
+        let mut offset = 0;
+        let across = self.flow.perpendicular();
+        let mut heights = Vec::with_capacity(self.bands.len());
+        let mut changed = false;
+        for row in &mut self.segments {
+            let end = offset + row.len();
+            let before = &old[offset..end];
+            let after = &new[offset..end];
+            if before
+                .iter()
+                .zip(after)
+                .any(|(&a, &b)| self.flow.length(a) != self.flow.length(b))
+            {
+                for (weight, &rect) in row.iter_mut().zip(after) {
+                    *weight = self.flow.length(rect);
+                }
+            }
+            let thickness = across.length(after[0]);
+            changed |= across.length(before[0]) != thickness;
+            heights.push(thickness);
+            offset = end;
+        }
+        if changed {
+            self.bands = heights;
+        }
+    }
+
     pub fn resize(
         &mut self,
         cell: usize,
