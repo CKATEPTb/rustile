@@ -11,18 +11,20 @@ use windows_sys::Win32::{
         Threading::GetCurrentThreadId,
     },
     UI::WindowsAndMessaging::{
-        EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-        FindWindowExW, GWL_EXSTYLE, GetDesktopWindow, GetWindowLongW, GetWindowRect,
-        GetWindowTextW, HTTRANSPARENT, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SendMessageW,
-        SetPropW, ShowWindowAsync, WM_NCHITTEST, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TRANSPARENT,
+        EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
+        EVENT_SYSTEM_FOREGROUND, FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetDesktopWindow, GetPropW,
+        GetWindowLongW, GetWindowRect, GetWindowTextW, HTTRANSPARENT, IsWindow, IsWindowVisible,
+        IsZoomed, SW_HIDE, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SendMessageW, SetPropW, SetWindowLongW,
+        ShowWindowAsync, WM_NCHITTEST, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+        WS_MAXIMIZEBOX,
     },
 };
 use windows_sys::core::w;
 
 use super::{Direction, Id, Manager, Mode, Rect, native};
 use crate::runtime::{
-    CANCEL, CONFIRM, EXPAND, QUICK_RESIZE, QUICK_REVERSE, START_RESIZE, dispatch,
+    CANCEL, CLOSE_WINDOW, CONFIRM, EXPAND, QUICK_RESIZE, QUICK_REVERSE, START_RESIZE,
+    TOGGLE_MAXIMIZE, dispatch,
 };
 
 mod virtual_desktops;
@@ -641,20 +643,24 @@ fn move_left_past_tall_window(manager: &mut Manager, windows: [Id; 6], area: Rec
 // A layout of three tiles is full if two can be joined along a gutter
 // and their union joins the third to recover the entire original column.
 fn join_frames(a: Rect, b: Rect) -> Option<Rect> {
+    join_frames_with_gap(a, b, 8)
+}
+
+fn join_frames_with_gap(a: Rect, b: Rect, gap: i32) -> Option<Rect> {
     if a.y == b.y && a.h == b.h {
         let (left, right) = if a.x < b.x { (a, b) } else { (b, a) };
-        if left.x + left.w + 8 == right.x {
+        if left.x + left.w + gap == right.x {
             return Some(Rect {
-                w: left.w + 8 + right.w,
+                w: left.w + gap + right.w,
                 ..left
             });
         }
     }
     if a.x == b.x && a.w == b.w {
         let (top, bottom) = if a.y < b.y { (a, b) } else { (b, a) };
-        if top.y + top.h + 8 == bottom.y {
+        if top.y + top.h + gap == bottom.y {
             return Some(Rect {
-                h: top.h + 8 + bottom.h,
+                h: top.h + gap + bottom.h,
                 ..top
             });
         }
@@ -988,6 +994,112 @@ fn check_normal_placement(id: Id) {
         assert_eq!(native::foreground(), foreground);
         assert_eq!(native::corner_radius_dip(id), corner);
     }
+}
+
+#[test]
+#[ignore = "run with tests/desktop-smoke.ps1 on its isolated Win32 desktop"]
+fn window_controls() {
+    use super::{DesktopId, DesktopMembership};
+
+    native::init_dpi();
+    let windows: [Id; 3] = fixtures();
+    let failure_file = env::var_os("RUSTILE_SMOKE_FAILURE").unwrap();
+    std::panic::set_hook(Box::new(move |failure| {
+        let _ = std::fs::write(&failure_file, failure.to_string());
+    }));
+    let active = windows[2];
+    let zoomed = || unsafe { IsZoomed(active as _) != 0 };
+    assert_ne!(unsafe { ShowWindowAsync(active as _, SW_MAXIMIZE) }, 0);
+    let work = native::work_area().unwrap();
+    until("native maximize before Rustile started", || {
+        let large = frame(active);
+        zoomed()
+            && large.x <= work.x + 1
+            && large.y <= work.y + 1
+            && large.x + large.w >= work.x + work.w - 1
+            && large.y + large.h >= work.y + work.h - 1
+    });
+    // The reference is this same native HWND, including any DWM frame overhang.
+    let maximized_frame = frame(active);
+    let mut manager = Manager::new();
+    manager
+        .desktops
+        .set_memberships(windows.map(|id| (id, DesktopMembership::Current(DesktopId(1)))));
+    manager.reconcile_desktop();
+    settle(&manager, 2);
+    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    until(
+        "window already maximized at startup can return to the mosaic",
+        || !zoomed(),
+    );
+    manager.reconcile_desktop();
+    settle(&manager, 3);
+    let initial = windows.map(frame);
+    for direction in [Direction::Left, Direction::Up] {
+        manager.quick_resize(active, direction, false);
+        settle(&manager, 3);
+        if windows.map(frame) != initial {
+            break;
+        }
+    }
+    let custom = windows.map(frame);
+    assert_ne!(
+        custom, initial,
+        "the round trip must exercise a custom divider"
+    );
+
+    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    until("fixture maximized", zoomed);
+    manager.event(EVENT_OBJECT_LOCATIONCHANGE, active);
+    manager.reconcile_desktop();
+    until(
+        "Win+F matches all four edges of native Windows maximize",
+        || frame(active) == maximized_frame,
+    );
+    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    until("fixture restored from maximize", || !zoomed());
+    manager.event(EVENT_OBJECT_LOCATIONCHANGE, active);
+    manager.reconcile_desktop();
+    settle(&manager, 3);
+    assert_eq!(windows.map(frame), custom);
+
+    // A resizable tile can disable its maximize button while still accepting close.
+    let style = unsafe { GetWindowLongW(active as _, GWL_STYLE) };
+    assert_ne!(style as u32 & WS_MAXIMIZEBOX, 0);
+    assert_eq!(
+        unsafe { SetWindowLongW(active as _, GWL_STYLE, style & !(WS_MAXIMIZEBOX as i32)) },
+        style
+    );
+    assert_eq!(
+        manager.shortcut_target(active),
+        Some(super::ShortcutTarget::Tile {
+            id: active,
+            can_maximize: false
+        })
+    );
+    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    let veto = w!("Rustile.Smoke.VetoNextClose");
+    assert_ne!(unsafe { SetPropW(active as _, veto, 1usize as _) }, 0);
+    dispatch(&mut manager, active, CLOSE_WINDOW);
+    until("fixture processed its close veto", || unsafe {
+        GetPropW(active as _, veto).is_null()
+    });
+    assert_ne!(unsafe { IsWindow(active as _) }, 0);
+    assert!(!zoomed());
+    manager.reconcile_desktop();
+    settle(&manager, 3);
+    assert_eq!(windows.map(frame), custom);
+    dispatch(&mut manager, active, CLOSE_WINDOW);
+    until("fixture accepted the next close request", || unsafe {
+        IsWindow(active as _) == 0
+    });
+    manager.event(EVENT_OBJECT_DESTROY, active);
+    manager.reconcile_desktop();
+    settle(&manager, 2);
+    let [a, b] = [windows[0], windows[1]].map(frame);
+    let gap = native::spacing_px(manager.settings.gap);
+    assert_eq!(join_frames_with_gap(a, b, gap), manager.area);
+    manager.shutdown();
 }
 
 #[test]

@@ -91,6 +91,7 @@ internal static class DesktopSmoke {
     static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp, uint flags,
         uint timeout, out UIntPtr result);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetProp(IntPtr hwnd, string name);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr RemoveProp(IntPtr hwnd, string name);
     [DllImport("user32.dll")] static extern uint GetDpiForSystem();
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
@@ -160,6 +161,11 @@ internal static class DesktopSmoke {
             }
             return SetWindowPos(Handle, IntPtr.Zero, bounds.X, bounds.Y, bounds.Width, bounds.Height, flags)
                 && (mode != FixtureMode.AppBounds || DesktopSmoke.Bounds(Handle) == normalBounds);
+        }
+        protected override void OnFormClosing(FormClosingEventArgs e) {
+            if (RemoveProp(Handle, "Rustile.Smoke.VetoNextClose") != IntPtr.Zero)
+                e.Cancel = true;
+            base.OnFormClosing(e);
         }
         protected override void WndProc(ref Message m) {
             if (m.Msg == ShowFixtureDialog) {
@@ -464,7 +470,7 @@ internal static class DesktopSmoke {
         CaptureKey(row, modifier, false, system);
     }
     static string[] ShortcutLabels(IntPtr editor) {
-        return Enumerable.Range(1000, 27).Select(id => ControlText(EditorControl(editor, id))).ToArray();
+        return Enumerable.Range(1000, 29).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
     static void EmptyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
@@ -825,8 +831,9 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1027) == IntPtr.Zero,
-            "The page should expose 27 editable shortcuts and no quit command");
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1029) == IntPtr.Zero
+            && initial[27].Contains("Win+") && initial[28].Contains("Win+"),
+            "The page should expose 29 editable shortcuts including both window actions");
         var arrows = new[] { "←", "→", "↑", "↓" };
         for (int i = 0; i < arrows.Length; ++i) {
             Require(initial[19 + i].EndsWith("Win+Alt+" + arrows[i])
@@ -1407,6 +1414,12 @@ internal static class DesktopSmoke {
             Require(GetProp(windows[4], "Rustile.Smoke.OffsetSevenPassed") != IntPtr.Zero, "Seven-window geometry test did not run");
             Until("Manager should restore all seven fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Seven windows: Up into an offset wider tile shares that tile and fills the bottom row; a second Up exchanges the original slots");
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Take(3).Select(w => w.ToInt64())));
+            geometryTest("window_controls");
+            Require(fixtures[2].Exited(3000), "The fixture should exit after accepting the second close request");
+            Until("The two surviving fixtures should return to their original bounds", () =>
+                windows.Take(2).Select(Bounds).SequenceEqual(originals.Take(2)));
+            Console.WriteLine("PASS  Win+F restores custom tile sizes; Win+Q honors a veto and reclaims the tile after close");
         } finally {
             children.Reverse();
             foreach (var child in children) child.Dispose();

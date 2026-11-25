@@ -24,6 +24,20 @@ pub enum Mode {
     Resize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShortcutTarget {
+    Tile { id: Id, can_maximize: bool },
+    Expanded(Id),
+}
+
+impl ShortcutTarget {
+    pub(crate) fn id(self) -> Id {
+        match self {
+            Self::Tile { id, .. } | Self::Expanded(id) => id,
+        }
+    }
+}
+
 struct ResizeSession {
     target: Id,
     // Quick shortcuts share divider stops while the keyboard stays in normal mode.
@@ -38,6 +52,14 @@ struct TrackedWindow {
     repairs: u8,
     // A former tile can remain floating until the monitor has room again.
     overflow: bool,
+    before_maximize: Option<Box<MaximizedLayout>>,
+}
+
+// Peers fill the work area while this window is maximized. Restore the exact
+// old splits only if the user has kept the resulting peer arrangement.
+struct MaximizedLayout {
+    previous: Layout,
+    peers: Vec<(Id, Rect)>,
 }
 
 impl TrackedWindow {
@@ -228,6 +250,7 @@ impl Manager {
         let window = self.windows.get_mut(&id).unwrap();
         window.desktop = desktop;
         window.requested = None;
+        window.before_maximize = None;
         self.remove_empty_desktop(old);
         self.current == Some(old)
     }
@@ -251,6 +274,9 @@ impl Manager {
         let area = work.tiles(self.settings);
         let gap = native::scaled_spacing(self.settings.gap, work.dpi);
         let windows = &mut self.windows;
+        for window in windows.values_mut() {
+            window.before_maximize = None;
+        }
         for workspace in std::iter::once(&mut self.workspace).chain(self.parked.values_mut()) {
             let released = workspace.layout.refit_work_area(area, gap, |id| {
                 if !dpi_changed {
@@ -278,7 +304,7 @@ impl Manager {
     fn observe(&mut self, id: Id) -> TileState {
         let state = native::tile_state(id);
         match state {
-            TileState::Expanded => {
+            TileState::Maximized | TileState::Fullscreen => {
                 self.expanded.insert(id);
             }
             TileState::Eligible => {
@@ -399,8 +425,13 @@ impl Manager {
                 DesktopMembership::Unknown if desktop_confirmed => false,
                 _ => continue,
             };
+            let mut maximized = false;
             let release = match native::cloak_state(id) {
-                Cloak::None if on_current => !native::eligible(id),
+                Cloak::None if on_current => {
+                    let state = native::tile_state(id);
+                    maximized = state == TileState::Maximized;
+                    state != TileState::Eligible
+                }
                 Cloak::None => native::hidden_or_minimized(id),
                 Cloak::Application if desktop_confirmed => {
                     if native::hidden_or_minimized(id) || previous_cloaks.contains(&id) {
@@ -416,19 +447,29 @@ impl Manager {
                 _ => false,
             };
             if release {
-                self.suspend(id);
+                self.suspend(id, maximized);
             }
         }
     }
 
-    fn suspend(&mut self, id: Id) {
+    fn suspend(&mut self, id: Id, maximized: bool) {
         self.finish_mode();
         if self.drag_target() == Some(id) {
             self.dragging = None;
         }
+        let previous = self
+            .area
+            .filter(|_| maximized)
+            .map(|area| (area, self.workspace.layout.clone()));
         self.workspace.remove(id);
         if let Some(window) = self.windows.get_mut(&id) {
             window.requested = None;
+            window.before_maximize = previous.map(|(area, layout)| {
+                Box::new(MaximizedLayout {
+                    previous: layout,
+                    peers: self.workspace.layout.placements(area),
+                })
+            });
         }
     }
 
@@ -473,6 +514,9 @@ impl Manager {
             .as_ref()
             .is_some_and(|(work, ..)| Some(*work) != self.work_area);
         if let Some((_, area, active, others)) = proposed {
+            for window in self.windows.values_mut() {
+                window.before_maximize = None;
+            }
             self.area = Some(area);
             self.workspace.layout = active;
             for (desktop, layout) in others {
@@ -505,6 +549,23 @@ impl Manager {
     }
 
     fn admit_new(&mut self, id: Id) -> bool {
+        if let Some(window) = self.windows.get_mut(&id)
+            && let Some(mut saved) = window.before_maximize.take()
+            && let Some(area) = self.area
+            && saved.peers == self.workspace.layout.placements(area)
+        {
+            window.original.refresh_frame();
+            let minimum = window.original.minimum_frame_size();
+            let gap = native::spacing_px(self.settings.gap);
+            if saved
+                .previous
+                .refit_work_area(area, gap, |other| (other == id).then_some(minimum))
+                .is_empty()
+            {
+                self.workspace.layout = saved.previous;
+                return true;
+            }
+        }
         if let Some(anchor) = self
             .workspace
             .focus_history
@@ -570,6 +631,7 @@ impl Manager {
             requested: None,
             repairs: 0,
             overflow: false,
+            before_maximize: None,
         });
         true
     }
@@ -656,8 +718,8 @@ impl Manager {
                     && event != EVENT_OBJECT_CLOAKED
                     && !native::cloaked(id)
                 {
-                    if state == TileState::Expanded || native::minimized_or_maximized(id) {
-                        self.suspend(id);
+                    if state == TileState::Fullscreen || native::minimized_or_maximized(id) {
+                        self.suspend(id, state == TileState::Maximized);
                         self.apply();
                     } else {
                         self.needs_desktop_retry = true;
@@ -805,6 +867,44 @@ impl Manager {
             && native::eligible(target)
     }
 
+    fn shortcut_target(&self, id: Id) -> Option<ShortcutTarget> {
+        if !self.settings.enabled || !native::window_enabled(id) {
+            return None;
+        }
+        if self.can_act_on(id) {
+            return Some(ShortcutTarget::Tile {
+                id,
+                can_maximize: native::can_maximize(id),
+            });
+        }
+        // A window can already be maximized when Rustile starts, even on a
+        // desktop with no normal tiles. Check its actual Shell membership.
+        (native::maximized(id)
+            && native::tile_state(id) == TileState::Maximized
+            && matches!(self.desktops.membership(id), DesktopMembership::Current(_))
+            && self.windows.get(&id).is_none_or(|w| w.original.matches(id)))
+        .then_some(ShortcutTarget::Expanded(id))
+    }
+
+    pub fn close_window(&mut self, target: Id) {
+        if self.shortcut_target(target).is_some() {
+            self.finish_mode();
+            native::close_window(target);
+        }
+    }
+
+    pub fn toggle_maximize(&mut self, target: Id) {
+        let maximize = match self.shortcut_target(target) {
+            Some(ShortcutTarget::Expanded(_)) => false,
+            Some(ShortcutTarget::Tile {
+                can_maximize: true, ..
+            }) => true,
+            _ => return,
+        };
+        self.finish_mode();
+        native::set_maximized(target, maximize);
+    }
+
     pub fn begin_resize(&mut self, target: Id) -> bool {
         let Some(area) = self.area else { return false };
         if self.mode() == Mode::Resize || self.dragging.is_some() || !self.can_act_on(target) {
@@ -836,12 +936,13 @@ impl Manager {
 
     // Sample foreground once so the cue and the keyboard target agree, including
     // when a modal dialog receives focus while its owner is still tiled.
-    pub fn refresh_focus(&mut self) -> Option<Id> {
+    pub fn refresh_focus(&mut self) -> Option<ShortcutTarget> {
         if !self.settings.enabled {
             return None;
         }
         let id = native::foreground();
-        let eligible = self.can_act_on(id);
+        let target = self.shortcut_target(id);
+        let eligible = matches!(target, Some(ShortcutTarget::Tile { .. }));
         if self
             .session
             .as_ref()
@@ -852,11 +953,10 @@ impl Manager {
         if eligible {
             self.outline
                 .show(id, self.settings.outline, self.settings.gap == 0);
-            Some(id)
         } else {
             self.outline.hide();
-            None
         }
+        target
     }
 
     pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {

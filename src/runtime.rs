@@ -27,6 +27,8 @@ use crate::startup;
 use crate::tray::Tray;
 
 pub(crate) const START_RESIZE: i32 = 1;
+pub(crate) const CLOSE_WINDOW: i32 = 2;
+pub(crate) const TOGGLE_MAXIMIZE: i32 = 3;
 const FOCUS: i32 = 10;
 pub(crate) const EXPAND: i32 = 20;
 const SHRINK: i32 = 30;
@@ -197,6 +199,8 @@ pub(crate) fn dispatch(manager: &mut Manager, target: isize, command: i32) {
         (Mode::Normal, START_RESIZE) => {
             manager.begin_resize(target);
         }
+        (Mode::Normal, CLOSE_WINDOW) => manager.close_window(target),
+        (Mode::Normal, TOGGLE_MAXIMIZE) => manager.toggle_maximize(target),
         (Mode::Normal, _) => {
             if let Some(dir) = direction(MOVE) {
                 manager.move_window(target, dir);

@@ -11,10 +11,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
-    CANCEL, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK,
-    START_RESIZE,
+    CANCEL, CLOSE_WINDOW, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE,
+    SHRINK, START_RESIZE, TOGGLE_MAXIMIZE,
 };
-use crate::manager::Mode;
+use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
 
 // The table is rebuilt only on a settings change. The hook inspects virtual
@@ -34,16 +34,25 @@ impl KeyRoutes {
         }
     }
 
-    fn command(self, mode: Mode, mods: u32) -> Option<i32> {
+    fn command(self, target: ShortcutTarget, mode: Mode, mods: u32) -> Option<i32> {
         let commands = match mode {
             Mode::Normal => self.normal,
             Mode::Resize => self.resize,
         };
-        commands
+        let id = commands
             .get(mods as usize)
             .copied()
             .filter(|&id| id != 0)
-            .map(i32::from)
+            .map(i32::from)?;
+        match target {
+            ShortcutTarget::Tile {
+                can_maximize: false,
+                ..
+            } if id == TOGGLE_MAXIMIZE => None,
+            ShortcutTarget::Tile { .. } => Some(id),
+            ShortcutTarget::Expanded(_) if matches!(id, CLOSE_WINDOW | TOGGLE_MAXIMIZE) => Some(id),
+            ShortcutTarget::Expanded(_) => None,
+        }
     }
 }
 
@@ -97,6 +106,8 @@ fn command_id(action: Shortcut) -> u8 {
         MoveUp => MOVE + 2,
         MoveDown => MOVE + 3,
         StartResize => START_RESIZE,
+        CloseWindow => CLOSE_WINDOW,
+        ToggleMaximize => TOGGLE_MAXIMIZE,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -173,7 +184,7 @@ impl Press {
 
 #[derive(Clone, Copy)]
 struct Snapshot {
-    target: isize,
+    target: Option<ShortcutTarget>,
     mode: Mode,
     focus_epoch: usize,
     handled: usize,
@@ -187,7 +198,7 @@ struct Routing {
 static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
     Mutex::new(Routing {
         focus: Snapshot {
-            target: 0,
+            target: None,
             mode: Mode::Normal,
             focus_epoch: 0,
             handled: 0,
@@ -196,10 +207,9 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
     })
 });
 
-pub(super) fn update(target: Option<isize>, mode: Mode, handled: usize) {
+pub(super) fn update(target: Option<ShortcutTarget>, mode: Mode, handled: usize) {
     let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
     let state = &mut routing.focus;
-    let target = target.unwrap_or(0);
     if state.target != target {
         state.focus_epoch = state.focus_epoch.wrapping_add(1);
         state.target = target;
@@ -296,17 +306,30 @@ fn mark_modifier_used() {
     unsafe { SendInput(2, marker.as_ptr(), size_of::<INPUT>() as i32) };
 }
 
-fn bound_command(slot: usize, pending: Pending) -> Option<(i32, Snapshot, u32)> {
+#[derive(Clone, Copy)]
+struct BoundCommand {
+    id: i32,
+    target: isize,
+    focus_epoch: usize,
+    mods: u32,
+}
+
+fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
     let (state, key) = {
         let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
         (routing.focus, routing.keys.0[slot]?)
     };
-    if state.target == 0 || state.target != unsafe { GetForegroundWindow() } as isize {
+    let target = state.target?;
+    if target.id() != unsafe { GetForegroundWindow() } as isize {
         return None;
     }
     let mods = modifiers();
-    key.command(pending.mode(state), mods)
-        .map(|id| (id, state, mods))
+    Some(BoundCommand {
+        id: key.command(target, pending.mode(state), mods)?,
+        target: target.id(),
+        focus_epoch: state.focus_epoch,
+        mods,
+    })
 }
 
 unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isize {
@@ -326,23 +349,24 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             } else {
                 None
             };
-            match (press.route(down, binding.map(|(id, _, _)| id)), binding) {
+            match (press.route(down, binding.map(|b| b.id)), binding) {
                 (Action::Consume, _) => {
                     HELD.with(|held| held[slot].set(press));
                     return 1;
                 }
-                (Action::Command(id), Some((_, state, mods))) => {
-                    let target = state.target;
-                    let transition = pending.transition(id, state.focus_epoch);
+                (Action::Command(id), Some(binding)) => {
+                    let transition = pending.transition(id, binding.focus_epoch);
                     let ticket = transition.map_or(0, |next| next.ticket);
                     let command = (ticket << 8) | id as usize;
-                    if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
+                    if unsafe {
+                        PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, binding.target)
+                    } != 0
                     {
                         HELD.with(|held| held[slot].set(press));
                         if let Some(next) = transition {
                             PENDING.set(next);
                         }
-                        if previous == Press::Up && mods & (MOD_WIN | MOD_ALT) != 0 {
+                        if previous == Press::Up && binding.mods & (MOD_WIN | MOD_ALT) != 0 {
                             mark_modifier_used();
                         }
                         return 1;
@@ -451,7 +475,10 @@ mod tests {
                 held: [Press::Up; 256],
                 settings: Settings::default(),
                 state: Snapshot {
-                    target: 100,
+                    target: Some(ShortcutTarget::Tile {
+                        id: 100,
+                        can_maximize: true,
+                    }),
                     mode: Mode::Normal,
                     focus_epoch: 1,
                     handled: 0,
@@ -471,9 +498,7 @@ mod tests {
             let slot = usize::from(key);
             let routes = Routes::new(self.settings);
             let command = routes.0[slot].and_then(|route| {
-                (self.state.target != 0)
-                    .then(|| self.pending.mode(self.state))
-                    .and_then(|mode| route.command(mode, mods))
+                route.command(self.state.target?, self.pending.mode(self.state), mods)
             });
             let action = self.held[slot].route(down, command);
             if let Action::Command(id) = action
@@ -505,6 +530,69 @@ mod tests {
     }
 
     #[test]
+    fn window_commands_require_fresh_presses_even_when_the_foreground_changes() {
+        for (key, command) in [(VK_Q, CLOSE_WINDOW), (VK_F, TOGGLE_MAXIMIZE)] {
+            let mut keyboard = Keyboard::new();
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
+            keyboard.state.target = Some(ShortcutTarget::Expanded(100));
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+            keyboard.state.target = Some(ShortcutTarget::Tile {
+                id: 101,
+                can_maximize: true,
+            });
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+            keyboard.state.target = None;
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Pass);
+            assert_eq!(keyboard.key(key, false, 0), Action::Pass);
+        }
+    }
+
+    #[test]
+    fn a_tile_without_a_maximize_button_only_releases_its_maximize_chord() {
+        let mut keyboard = Keyboard::new();
+        keyboard.state.target = Some(ShortcutTarget::Tile {
+            id: 100,
+            can_maximize: false,
+        });
+        assert_eq!(keyboard.key(VK_F, true, MOD_WIN), Action::Pass);
+        assert_eq!(keyboard.key(VK_F, false, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_LEFT, true, MOD_WIN), Action::Command(FOCUS));
+        assert_eq!(
+            keyboard.key(VK_Q, true, MOD_WIN),
+            Action::Command(CLOSE_WINDOW)
+        );
+    }
+
+    #[test]
+    fn expanded_windows_only_receive_their_current_window_bindings() {
+        let mut keyboard = Keyboard::new();
+        keyboard.state.target = Some(ShortcutTarget::Expanded(100));
+        keyboard.assign(Shortcut::ToggleMaximize, MOD_ALT, VK_F8);
+        for (mods, key) in [
+            (MOD_WIN, VK_F),
+            (MOD_WIN, VK_LEFT),
+            (WIN_SHIFT, VK_RIGHT),
+            (MOD_WIN, VK_RETURN),
+            (MOD_WIN | MOD_ALT, VK_UP),
+        ] {
+            assert_eq!(keyboard.key(key, true, mods), Action::Pass);
+            assert_eq!(keyboard.key(key, false, 0), Action::Pass);
+        }
+        assert_eq!(
+            keyboard.key(VK_F8, true, MOD_ALT),
+            Action::Command(TOGGLE_MAXIMIZE)
+        );
+        assert_eq!(keyboard.key(VK_F8, false, 0), Action::Consume);
+        assert_eq!(
+            keyboard.key(VK_Q, true, MOD_WIN),
+            Action::Command(CLOSE_WINDOW)
+        );
+    }
+
+    #[test]
     fn quick_resize_repeats_and_reverses_without_entering_modal_routing() {
         let mut k = Keyboard::new();
         let mods = MOD_WIN | MOD_ALT;
@@ -527,7 +615,7 @@ mod tests {
             assert_eq!(k.key(key, false, 0), Action::Pass);
         }
         assert_eq!(k.pending.ticket, 0);
-        k.state.target = 0;
+        k.state.target = None;
         assert_eq!(k.key(VK_LEFT, true, mods), Action::Pass);
         assert_eq!(k.key(VK_LEFT, false, 0), Action::Pass);
     }
@@ -617,13 +705,16 @@ mod tests {
             keyboard.key(VK_RETURN, true, MOD_WIN),
             Action::Command(START_RESIZE)
         );
-        keyboard.state.target = 0;
+        keyboard.state.target = None;
         keyboard.state.focus_epoch += 1;
         assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
         assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Pass);
         assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Pass);
         assert_eq!(keyboard.key(VK_RIGHT, true, WIN_SHIFT), Action::Pass);
-        keyboard.state.target = 100;
+        keyboard.state.target = Some(ShortcutTarget::Tile {
+            id: 100,
+            can_maximize: true,
+        });
         keyboard.state.focus_epoch += 1;
         assert_eq!(keyboard.key(VK_UP, true, 0), Action::Pass);
     }
@@ -677,7 +768,7 @@ mod tests {
             k.key(VK_K, true, MOD_CONTROL | MOD_ALT),
             Action::Command(MOVE + 2)
         );
-        k.state.target = 0;
+        k.state.target = None;
         assert_eq!(k.key(VK_K, false, 0), Action::Consume);
         assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Pass);
     }

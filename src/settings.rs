@@ -328,6 +328,39 @@ mod tests {
     }
 
     #[test]
+    fn existing_bindings_keep_win_q_and_win_f_until_reassigned_or_reset() {
+        use Shortcut::{CloseWindow, FocusLeft, MoveRight, ToggleMaximize};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F, VK_Q};
+
+        let saved = "shortcuts.focus_left = { mods = 8, key = 81 }\n\
+                     shortcuts.move_right = { mods = 8, key = 70 }";
+        let profile = toml::from_str::<Settings>(saved)
+            .unwrap()
+            .validated()
+            .unwrap();
+        for (action, owner, key) in [
+            (CloseWindow, FocusLeft, VK_Q),
+            (ToggleMaximize, MoveRight, VK_F),
+        ] {
+            let chord = Chord { mods: MOD_WIN, key };
+            assert_eq!(action.default_chord(), chord);
+            assert_eq!(profile.binding(action), None);
+            assert_eq!(profile.binding(owner), Some(chord));
+            assert_eq!(profile.conflict(action, chord), Some(owner));
+            let moved = profile
+                .changed(Command::ReassignShortcut(action, chord, owner))
+                .unwrap();
+            let roundtrip: Settings = toml::from_str(&toml::to_string(&moved).unwrap()).unwrap();
+            assert_eq!(roundtrip.binding(action), Some(chord));
+            assert_eq!(roundtrip.binding(owner), None);
+        }
+        assert_eq!(
+            profile.changed(Command::ResetShortcuts).unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
     fn individual_bindings_roundtrip_without_changing_legacy_profile_or_neighbors() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_LEFT, VK_RIGHT};
         let profile: Settings = toml::from_str(

@@ -2,7 +2,7 @@ use super::*;
 use Shortcut::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-const GROUPS: [(&str, &[Shortcut]); 4] = [
+const GROUPS: [(&str, &[Shortcut]); 5] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
         "Навигация по окнам",
@@ -37,6 +37,7 @@ const GROUPS: [(&str, &[Shortcut]); 4] = [
             QuickReverseDown,
         ],
     ),
+    ("Управление окном", &[Shortcut::CloseWindow, ToggleMaximize]),
 ];
 
 impl ShortcutWindow {
@@ -244,7 +245,6 @@ impl ShortcutWindow {
     fn layout_rows(&self, view: HWND, width: i32, height: i32) {
         let p = |n| self.p(n);
         let columns = width >= p(710);
-        let column_for = |section: usize| if columns { section % 2 } else { 0 };
         let stacked = width < p(400);
         let row_h = if stacked { p(43) } else { p(29) };
         let header_h = p(29);
@@ -255,11 +255,11 @@ impl ShortcutWindow {
                 0
             }
         };
-        let mut starts = [0; GROUPS.len()];
+        let mut starts = [(0, 0); GROUPS.len()];
         let mut end = [p(7); 2];
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let column = column_for(i);
-            starts[i] = end[column];
+            let column = usize::from(columns && end[1] < end[0]);
+            starts[i] = (column, end[column]);
             end[column] +=
                 header_h + actions.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(10);
         }
@@ -294,8 +294,9 @@ impl ShortcutWindow {
             p(24),
         );
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let x = margin + column_for(i) as i32 * (col + gap);
-            let mut y = starts[i] - self.scroll.get();
+            let (column, start) = starts[i];
+            let x = margin + column as i32 * (col + gap);
+            let mut y = start - self.scroll.get();
             place(
                 child(view, SECTION + i as i32),
                 x + p(2),

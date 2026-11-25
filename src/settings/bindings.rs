@@ -15,6 +15,7 @@ enum Group {
     Finish,
     Quick,
     QuickReverse,
+    Window,
 }
 
 macro_rules! shortcuts {
@@ -24,7 +25,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 27] = [$( Self::$name, )+];
+            pub const ALL: [Self; 29] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -61,6 +62,8 @@ shortcuts! {
     QuickReverseRight, "Вправо (обратно)",   QuickReverse, VK_RIGHT;
     QuickReverseUp,    "Вверх (обратно)",    QuickReverse, VK_UP;
     QuickReverseDown,  "Вниз (обратно)",     QuickReverse, VK_DOWN;
+    CloseWindow,    "Закрыть окно",              Window, VK_Q;
+    ToggleMaximize, "Развернуть или восстановить", Window, VK_F;
 }
 
 impl Shortcut {
@@ -94,6 +97,7 @@ impl Shortcut {
             Group::Shrink => MOD_SHIFT,
             Group::Quick => MOD_WIN | MOD_ALT,
             Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
+            Group::Window => MOD_WIN,
         };
         Chord { mods, key }
     }
@@ -310,19 +314,21 @@ impl From<StoredOverrides> for Overrides {
         for (action, chord) in stored.bindings {
             overrides.0[action.index()] = Some(chord);
         }
-        // A profile written before quick resize may already own one of its
-        // default chords. Keep that assignment and expose the new action as free.
-        for quick in Shortcut::ALL {
-            if !matches!(quick.spec().1, Group::Quick | Group::QuickReverse)
-                || overrides.0[quick.index()].is_some()
+        // Older profiles may already assign the default chord of a new action.
+        // Keep the user's binding and leave the newly introduced action unassigned.
+        for action in Shortcut::ALL {
+            if !matches!(
+                action.spec().1,
+                Group::Quick | Group::QuickReverse | Group::Window
+            ) || overrides.0[action.index()].is_some()
             {
                 continue;
             }
-            let chord = Binding::Assigned(quick.default_chord());
+            let chord = Binding::Assigned(action.default_chord());
             if Shortcut::ALL.into_iter().any(|other| {
-                quick.shares_context(other) && overrides.0[other.index()] == Some(chord)
+                action.shares_context(other) && overrides.0[other.index()] == Some(chord)
             }) {
-                overrides.0[quick.index()] = Some(Binding::Disabled);
+                overrides.0[action.index()] = Some(Binding::Disabled);
             }
         }
         overrides

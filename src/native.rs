@@ -294,6 +294,28 @@ pub fn minimized_or_maximized(id: Id) -> bool {
     unsafe { IsIconic(id as HWND) != 0 || IsZoomed(id as HWND) != 0 }
 }
 
+pub fn maximized(id: Id) -> bool {
+    unsafe { IsZoomed(id as HWND) != 0 }
+}
+
+pub fn window_enabled(id: Id) -> bool {
+    unsafe { IsWindowEnabled(id as HWND) != 0 }
+}
+
+pub fn can_maximize(id: Id) -> bool {
+    unsafe { GetWindowLongW(id as HWND, GWL_STYLE) as u32 & WS_MAXIMIZEBOX != 0 }
+}
+
+pub fn close_window(id: Id) {
+    // The owning UI thread handles save prompts and may cancel or hide to tray.
+    unsafe { PostMessageW(id as HWND, WM_CLOSE, 0, 0) };
+}
+
+pub fn set_maximized(id: Id, maximize: bool) {
+    let command = if maximize { SC_MAXIMIZE } else { SC_RESTORE };
+    unsafe { PostMessageW(id as HWND, WM_SYSCOMMAND, command as usize, 0) };
+}
+
 pub fn hidden_or_minimized(id: Id) -> bool {
     unsafe { IsWindowVisible(id as HWND) == 0 || IsIconic(id as HWND) != 0 }
 }
@@ -323,7 +345,8 @@ pub fn outline_frame(id: Id) -> Option<(Rect, Rect)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TileState {
     Eligible,
-    Expanded,
+    Maximized,
+    Fullscreen,
     Excluded,
 }
 
@@ -397,8 +420,14 @@ pub(crate) fn tile_state(id: Id) -> TileState {
             (covers_monitor && (borderless || work != screen)) || (borderless && outer == screen);
         // Our own tile may have made an ordinary topmost window compact.
         let floating_panel = extended & WS_EX_TOPMOST != 0 && (borderless || (compact && !tracked));
-        let state = if fullscreen || (resizable && IsZoomed(hwnd) != 0 && !floating_panel) {
-            TileState::Expanded
+        // With no reserved screen edge, even a normal maximized custom frame
+        // can cover the monitor. Its native maximize button still toggles it back.
+        let fullscreen_only =
+            borderless && fullscreen && (work != screen || style & WS_MAXIMIZEBOX == 0);
+        let state = if resizable && IsZoomed(hwnd) != 0 && !floating_panel && !fullscreen_only {
+            TileState::Maximized
+        } else if fullscreen {
+            TileState::Fullscreen
         } else if resizable && !floating_panel {
             TileState::Eligible
         } else {
