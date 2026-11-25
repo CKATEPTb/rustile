@@ -404,6 +404,9 @@ fn pump(
                 return Ok(());
             }
             if let Err(detail) = preferences.apply(manager, hook, tray, command) {
+                // The inline control must display the last accepted value when
+                // the layout rejects a spacing change or the save fails.
+                tray.set_settings(preferences.live);
                 show_error(&detail);
             }
         }

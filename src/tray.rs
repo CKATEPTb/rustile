@@ -1,5 +1,6 @@
 mod menu;
 mod paint;
+mod stepper;
 
 use std::{
     cell::{Cell, RefCell},
@@ -26,6 +27,7 @@ use windows_sys::core::w;
 use crate::settings::{Command, Settings};
 use menu::{Action, Page, Row};
 use paint::{Colors, Fonts, Painter};
+use stepper::{EDIT_ID, EndEdit, Inline, arrow_info};
 
 const CALLBACK: u32 = WM_APP + 20;
 const ICON_ID: u32 = 1;
@@ -40,6 +42,7 @@ fn scale(dip: i32, dpi: u32) -> i32 {
 struct State {
     settings: Cell<Settings>,
     commands: RefCell<VecDeque<Command>>,
+    applying: Cell<Option<Command>>,
     icon: HICON,
     taskbar_created: u32,
     registered: Cell<bool>,
@@ -53,6 +56,7 @@ struct State {
     buttons: RefCell<Vec<HWND>>,
     hot: Cell<HWND>,
     keyboard: Cell<bool>,
+    inline: Inline,
 }
 
 pub struct Tray {
@@ -93,6 +97,7 @@ impl Tray {
             let state = Box::new(State {
                 settings: Cell::new(settings),
                 commands: RefCell::default(),
+                applying: Cell::new(None),
                 icon,
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 registered: Cell::new(false),
@@ -106,6 +111,7 @@ impl Tray {
                 buttons: RefCell::default(),
                 hot: Cell::default(),
                 keyboard: Cell::new(false),
+                inline: Inline::default(),
             });
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -133,8 +139,9 @@ impl Tray {
     }
 
     pub fn set_settings(&self, settings: Settings) {
-        self.state.settings.set(settings);
-        if self.state.registered.get() {
+        self.state.applying.set(None);
+        let previous = self.state.settings.replace(settings);
+        if previous.enabled != settings.enabled && self.state.registered.get() {
             let mut data = self.state.icon_data(self.hwnd);
             data.uFlags = NIF_TIP | NIF_SHOWTIP;
             if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
@@ -143,12 +150,14 @@ impl Tray {
             }
         }
         if unsafe { IsWindowVisible(self.hwnd) } != 0 {
-            self.state.layout(self.hwnd, self.state.page.get());
+            self.state.refresh_rows(self.hwnd);
         }
     }
 
     pub fn take_command(&self) -> Option<Command> {
-        self.state.commands.borrow_mut().pop_front()
+        let command = self.state.commands.borrow_mut().pop_front();
+        self.state.applying.set(command);
+        command
     }
 }
 
@@ -270,7 +279,11 @@ impl State {
     }
 
     fn layout(&self, hwnd: HWND, page: Page) {
-        self.page.set(page);
+        if self.page.replace(page) != page {
+            self.finish_edit(hwnd, EndEdit::Blur);
+            self.inline.wheel.set(None);
+            self.hide_arrows(hwnd);
+        }
         self.hot.set(null_mut());
         let rows = menu::rows(page, self.settings.get());
         let count = rows.len();
@@ -288,7 +301,7 @@ impl State {
         }
         let work = monitor.rcWork;
         let p = |n| scale(n, self.dpi.get());
-        let width = p(325).min((work.right - work.left).max(1));
+        let width = p(340).min((work.right - work.left).max(1));
         // Keep all choices reachable on a small high-DPI monitor.
         let ideal = self
             .entries
@@ -324,7 +337,7 @@ impl State {
                         0,
                         w!("BUTTON"),
                         name.as_ptr(),
-                        WS_CHILD | WS_TABSTOP | BS_OWNERDRAW as u32,
+                        WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW as u32,
                         0,
                         0,
                         0,
@@ -358,6 +371,15 @@ impl State {
                 );
                 InvalidateRect(btn, null(), 0);
             }
+            if let Action::Adjust(measure) = row.action {
+                let rect = RECT {
+                    left: p(5),
+                    top: y,
+                    right: client.right - p(5),
+                    bottom: y + h,
+                };
+                self.layout_arrows(hwnd, i, measure, rect, row.separator);
+            }
             y += h;
         }
         let extra = self.buttons.borrow()[count..].to_vec();
@@ -372,6 +394,8 @@ impl State {
     }
 
     fn hide(&self, hwnd: HWND, return_to_tray: bool) {
+        self.finish_edit(hwnd, EndEdit::Blur);
+        self.inline.wheel.set(None);
         unsafe {
             ShowWindow(hwnd, SW_HIDE);
             if return_to_tray && self.registered.get() {
@@ -398,6 +422,7 @@ impl State {
             .filter(|r| r.enabled)
             .map(|r| r.action);
         match action {
+            Some(Action::Adjust(_)) => self.start_edit(hwnd, index),
             Some(Action::Open(page)) => {
                 self.layout(hwnd, page);
                 let selected = self
@@ -438,6 +463,12 @@ impl State {
 
     fn key(&self, hwnd: HWND, index: usize, key: u16) -> bool {
         self.keyboard.set(true);
+        if matches!(key, VK_LEFT | VK_RIGHT)
+            && let Some(m) = self.measure(index)
+        {
+            self.step(hwnd, m, if key == VK_RIGHT { 1 } else { -1 });
+            return true;
+        }
         match key {
             VK_ESCAPE => self.hide(hwnd, true),
             VK_LEFT | VK_BACK => self.back(hwnd),
@@ -494,14 +525,43 @@ unsafe extern "system" fn button_proc(
         let parent = GetParent(btn);
         let ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const State;
         if let Some(state) = ptr.as_ref() {
+            let id = GetDlgCtrlID(btn) as usize;
+            let arrow = arrow_info(id);
+            let Some(index) = arrow
+                .map(|(index, _)| index)
+                .or_else(|| id.checked_sub(100))
+            else {
+                return DefSubclassProc(btn, msg, wp, lp);
+            };
             match msg {
+                WM_MOUSEWHEEL => {
+                    state.wheel(parent, wp, lp);
+                    return 0;
+                }
+                WM_KEYDOWN if arrow.is_some() && matches!(wp as u16, VK_SPACE | VK_RETURN) => {
+                    if lp & (1 << 30) == 0 {
+                        let (_, increasing) = arrow.unwrap();
+                        state.arrow_click(parent, index, increasing);
+                    }
+                    return 0;
+                }
                 WM_KEYDOWN if matches!(wp as u16, VK_SPACE | VK_RETURN) && lp & (1 << 30) != 0 => {
                     return 0;
                 }
                 WM_KEYUP | WM_CHAR if matches!(wp as u16, VK_SPACE | VK_RETURN) => {
                     return 0;
                 }
-                WM_KEYDOWN if state.key(parent, (GetDlgCtrlID(btn) - 100) as usize, wp as u16) => {
+                WM_KEYDOWN if state.key(parent, index, wp as u16) => {
+                    return 0;
+                }
+                WM_CHAR
+                    if (b'0' as usize..=b'9' as usize).contains(&wp)
+                        && state.measure(index).is_some() =>
+                {
+                    state.start_edit(parent, index);
+                    if let Some(edit) = state.editor(parent) {
+                        SendMessageW(edit, WM_CHAR, wp, lp);
+                    }
                     return 0;
                 }
                 WM_MOUSEMOVE if state.hot.get() != btn => {
@@ -587,6 +647,18 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 state.hide(hwnd, false);
                 0
             }
+            WM_MOUSEWHEEL => {
+                state.wheel(hwnd, wp, lp);
+                0
+            }
+            WM_CTLCOLOREDIT if GetDlgCtrlID(lp as HWND) == EDIT_ID as i32 => {
+                let (text, background) = state.colors.get().edit_colors();
+                let dc = wp as HDC;
+                SetTextColor(dc, text);
+                SetBkColor(dc, background);
+                SetDCBrushColor(dc, background);
+                GetStockObject(DC_BRUSH) as LRESULT
+            }
             WM_SETTINGCHANGE | WM_THEMECHANGED if IsWindowVisible(hwnd) != 0 => {
                 let updated = Colors::current();
                 if updated != state.colors.get() {
@@ -600,36 +672,50 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
                 0
             }
+            WM_COMMAND if lp != 0 && wp & 0xffff == EDIT_ID && wp >> 16 == EN_CHANGE as usize => {
+                if state.inline.invalid.replace(false)
+                    && let Some(index) = state.inline.editing.get()
+                {
+                    InvalidateRect(GetDlgItem(hwnd, 100 + index as i32), null(), 0);
+                }
+                0
+            }
             WM_COMMAND
                 if lp != 0 && wp >> 16 == BN_CLICKED as usize && IsWindowVisible(hwnd) != 0 =>
             {
-                if let Some(i) = (wp & 0xffff).checked_sub(100) {
+                if let Some((index, increasing)) = arrow_info(wp & 0xffff) {
+                    state.arrow_click(hwnd, index, increasing);
+                } else if let Some(i) = (wp & 0xffff).checked_sub(100) {
                     state.activate(hwnd, i);
                 }
                 0
             }
             WM_DRAWITEM if lp != 0 => {
                 let draw = &*(lp as *const DRAWITEMSTRUCT);
-                let Some(i) = draw.CtlID.checked_sub(100) else {
-                    return 0;
-                };
-                let row = state.entries.borrow().get(i as usize).cloned();
-                if let (Some(row), Some(fonts)) = (row, state.fonts.borrow().as_ref()) {
-                    Painter {
+                if let Some(fonts) = state.fonts.borrow().as_ref() {
+                    let painter = Painter {
                         dpi: state.dpi.get(),
                         colors: state.colors.get(),
                         fonts,
                         icon: state.icon,
                         keyboard: state.keyboard.get(),
                         enabled: state.settings.get().enabled,
+                    };
+                    let hover = state.hot.get() == draw.hwndItem;
+                    let focus = GetFocus() == draw.hwndItem;
+                    if let Some((_, increasing)) = arrow_info(draw.CtlID as usize) {
+                        painter.arrow(draw, increasing, hover, focus);
+                    } else if let Some(i) = draw.CtlID.checked_sub(100)
+                        && let Some(mut row) = state.entries.borrow().get(i as usize).cloned()
+                    {
+                        if state.inline.invalid.get()
+                            && state.inline.editing.get() == Some(i as usize)
+                            && let Action::Adjust(measure) = row.action
+                        {
+                            row.label = format!("Введите от 0 до {}", measure.max());
+                        }
+                        painter.row(draw, &row, i == 0, hover, focus);
                     }
-                    .row(
-                        draw,
-                        &row,
-                        i == 0,
-                        state.hot.get() == draw.hwndItem,
-                        GetFocus() == draw.hwndItem,
-                    );
                 }
                 1
             }

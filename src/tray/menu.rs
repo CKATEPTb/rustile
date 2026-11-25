@@ -5,9 +5,6 @@ pub(super) enum Page {
     Main,
     Shortcuts,
     Binding(Binding),
-    Outline,
-    Gap,
-    Padding,
 }
 
 impl Page {
@@ -24,9 +21,46 @@ impl Page {
             Self::Main => "Rustile",
             Self::Shortcuts => "Горячие клавиши",
             Self::Binding(b) => binding_label(b),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Measure {
+    Outline,
+    Gap,
+    Padding,
+}
+
+impl Measure {
+    pub fn label(self) -> &'static str {
+        match self {
             Self::Outline => "Толщина обводки",
             Self::Gap => "Между окнами",
             Self::Padding => "По краям экрана",
+        }
+    }
+
+    pub fn value(self, settings: Settings) -> u8 {
+        match self {
+            Self::Outline => settings.outline,
+            Self::Gap => settings.gap,
+            Self::Padding => settings.padding,
+        }
+    }
+
+    pub fn max(self) -> u8 {
+        match self {
+            Self::Outline => Settings::MAX_OUTLINE,
+            Self::Gap | Self::Padding => Settings::MAX_SPACING,
+        }
+    }
+
+    pub fn command(self, value: u8) -> Command {
+        match self {
+            Self::Outline => Command::Outline(value),
+            Self::Gap => Command::Gap(value),
+            Self::Padding => Command::Padding(value),
         }
     }
 }
@@ -35,6 +69,7 @@ impl Page {
 pub(super) enum Action {
     Back,
     Open(Page),
+    Adjust(Measure),
     Apply(Command),
     None,
 }
@@ -114,13 +149,6 @@ fn chord(binding: Binding, modifier: Modifier) -> String {
     format!("{}+{key}", modifier.label())
 }
 
-fn measure(page: Page, n: u8) -> String {
-    match (page, n) {
-        (Page::Outline, 0) => "Выкл.".to_owned(),
-        _ => format!("{n} px"),
-    }
-}
-
 pub(super) fn rows(page: Page, s: Settings) -> Vec<Row> {
     let mut rows = vec![Row::new(
         page.title(),
@@ -147,14 +175,14 @@ pub(super) fn rows(page: Page, s: Settings) -> Vec<Row> {
                 "\u{e765}",
                 Action::Open(Page::Shortcuts),
             ));
-            for (page, glyph, n) in [
-                (Page::Outline, "\u{e739}", s.outline),
-                (Page::Gap, "\u{e8ab}", s.gap),
-                (Page::Padding, "\u{e9a6}", s.padding),
+            for (measure, glyph) in [
+                (Measure::Outline, "\u{e739}"),
+                (Measure::Gap, "\u{e8ab}"),
+                (Measure::Padding, "\u{e9a6}"),
             ] {
-                let mut row =
-                    Row::new(page.title(), glyph, Action::Open(page)).value(measure(page, n));
-                row.separator = page == Page::Outline;
+                let mut row = Row::new(measure.label(), glyph, Action::Adjust(measure))
+                    .value(format!("{} px", measure.value(s)));
+                row.separator = measure == Measure::Outline;
                 rows.push(row);
             }
             rows.push(
@@ -205,28 +233,6 @@ pub(super) fn rows(page: Page, s: Settings) -> Vec<Row> {
                     Binding::Move => modifier != s.focus,
                     Binding::Resize => true,
                 };
-                rows.push(row);
-            }
-        }
-        Page::Outline | Page::Gap | Page::Padding => {
-            let (choices, current): (&[u8], _) = match page {
-                Page::Outline => (&[0, 1, 2, 3, 4], s.outline),
-                Page::Gap => (&[0, 4, 8, 12, 16, 24, 32], s.gap),
-                _ => (&[0, 4, 8, 12, 16, 24, 32], s.padding),
-            };
-            // A hand-edited setting can use any whole value in the supported range.
-            let mut choices = choices.to_vec();
-            if let Err(at) = choices.binary_search(&current) {
-                choices.insert(at, current);
-            }
-            for n in choices {
-                let command = match page {
-                    Page::Outline => Command::Outline(n),
-                    Page::Gap => Command::Gap(n),
-                    _ => Command::Padding(n),
-                };
-                let mut row = Row::new(measure(page, n), "", Action::Apply(command));
-                row.checked = n == current;
                 rows.push(row);
             }
         }

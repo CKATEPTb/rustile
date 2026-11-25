@@ -64,6 +64,8 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hwnd, ref Point point);
+    [DllImport("user32.dll")] static extern IntPtr ChildWindowFromPointEx(IntPtr hwnd, Point point, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -259,10 +261,54 @@ internal static class DesktopSmoke {
         Require(IsWindowEnabled(button), "Tray button is disabled: " + label);
         Message(button, 0x00f5); // BM_CLICK
     }
-    static void TrayKey(IntPtr tray, string label, Keys key) {
-        var button = TrayButton(tray, label);
-        if (!PostMessage(button, 0x0100 /* WM_KEYDOWN */, (IntPtr)(int)key, IntPtr.Zero))
+    static void ClickArrow(IntPtr tray, string label) {
+        var arrow = TrayButton(tray, label);
+        var bounds = Bounds(arrow);
+        var point = new Point(bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2);
+        var trayPoint = point;
+        Require(ScreenToClient(tray, ref trayPoint), "Cannot locate tray arrow");
+        var hit = ChildWindowFromPointEx(tray, trayPoint, 3 /* skip invisible and disabled */);
+        Require(hit == arrow, "The pointer cannot reach " + label);
+        Require(ScreenToClient(hit, ref point), "Cannot locate arrow center");
+        var coords = (IntPtr)((point.Y << 16) | (point.X & 0xffff));
+        if (!PostMessage(hit, 0x0201 /* WM_LBUTTONDOWN */, (IntPtr)1, coords)
+            || !PostMessage(hit, 0x0202 /* WM_LBUTTONUP */, IntPtr.Zero, coords))
             throw new Win32Exception();
+    }
+    static void KeyDown(IntPtr control, Keys key) {
+        if (!PostMessage(control, 0x0100 /* WM_KEYDOWN */, (IntPtr)(int)key, IntPtr.Zero))
+            throw new Win32Exception();
+    }
+    static void TrayKey(IntPtr tray, string label, Keys key) { KeyDown(TrayButton(tray, label), key); }
+    static void Wheel(IntPtr receiver, IntPtr hovered, int delta) {
+        var bounds = Bounds(hovered);
+        int x = bounds.Left + bounds.Width / 2, y = bounds.Top + bounds.Height / 2;
+        if (!PostMessage(receiver, 0x020a /* WM_MOUSEWHEEL */, (IntPtr)(delta << 16),
+                (IntPtr)((y << 16) | (x & 0xffff)))) throw new Win32Exception();
+    }
+    static IntPtr TypeNumber(IntPtr tray, string label, string value) {
+        TrayClick(tray, label);
+        var edit = IntPtr.Zero;
+        int pid;
+        int tid = (int)GetWindowThreadProcessId(tray, out pid);
+        var info = new GuiThreadInfo { size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        Until("The inline edit should take focus for " + label, () => {
+            if (!GetGUIThreadInfo(tid, ref info)) throw new Win32Exception();
+            edit = info.focus;
+            var cls = new StringBuilder(20);
+            return edit != IntPtr.Zero && IsWindowVisible(edit) && GetClassName(edit, cls, cls.Capacity) > 0
+                && String.Equals(cls.ToString(), "Edit", StringComparison.OrdinalIgnoreCase);
+        });
+        foreach (var digit in value) {
+            if (!PostMessage(edit, 0x0102 /* WM_CHAR */, (IntPtr)(int)digit, IntPtr.Zero))
+                throw new Win32Exception();
+        }
+        return edit;
+    }
+    static void EditNumber(IntPtr tray, string label, string value, Keys finish) {
+        var edit = TypeNumber(tray, label, value);
+        KeyDown(edit, finish);
+        Until("Editing should finish inside the menu", () => !IsWindowVisible(edit) && IsWindowVisible(tray));
     }
     static void TrayFocus(Child manager, IntPtr tray, string label) {
         var button = TrayButton(tray, label);
@@ -304,21 +350,56 @@ internal static class DesktopSmoke {
         TrayFocus(manager, tray, "Горячие клавиши");
         TrayKey(tray, "Горячие клавиши", Keys.Escape);
         Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
-        TrayChoose(tray, TraySelect, area, "Между окнами", "16 px");
-        TrayChoose(tray, TrayContext, area, "По краям экрана", "12 px");
-        Until("The selected tray spacing should reach the DWM frames", () => HasSpacing(pair, area));
-        TrayOpen(tray, TrayKeyboard, area);
-        TrayKey(tray, "Толщина обводки", Keys.Right);
-        TrayFocus(manager, tray, "1 px");
-        TrayKey(tray, "3 px", Keys.Enter);
-        Until("Choosing a thickness with Enter should dismiss the flyout", () => !IsWindowVisible(tray));
         TrayOpen(tray, TraySelect, area);
+        ClickArrow(tray, "Увеличить: Толщина обводки");
+        TrayButton(tray, "Толщина обводки, 2 px");
+        ClickArrow(tray, "Уменьшить: Толщина обводки");
+        TrayButton(tray, "Толщина обводки, 1 px");
+        TrayKey(tray, "Толщина обводки", Keys.Right);
+        TrayButton(tray, "Толщина обводки, 2 px");
+        TrayKey(tray, "Толщина обводки", Keys.Left);
+        TrayButton(tray, "Толщина обводки, 1 px");
+
+        EditNumber(tray, "Между окнами", "13", Keys.Enter);
+        var gapRow = TrayButton(tray, "Между окнами, 13 px");
+        // Wheel input may be delivered to the focused row even when the
+        // pointer is over a different setting. Use actual screen coordinates.
+        TrayKey(tray, "Между окнами", Keys.Up);
+        TrayFocus(manager, tray, "Толщина обводки");
+        var elsewhere = TrayButton(tray, "Толщина обводки");
+        Wheel(elsewhere, gapRow, 60);
+        Wheel(elsewhere, gapRow, 60);
+        TrayButton(tray, "Между окнами, 14 px");
+        Wheel(elsewhere, gapRow, 360);
+        TrayButton(tray, "Между окнами, 17 px");
+        Wheel(elsewhere, gapRow, -120);
+        TrayButton(tray, "Между окнами, 16 px");
+        EditNumber(tray, "По краям экрана", "12", Keys.Enter);
+        TrayButton(tray, "По краям экрана, 12 px");
+        Until("The selected tray spacing should reach the DWM frames", () => HasSpacing(pair, area));
+        EditNumber(tray, "Между окнами", "2", Keys.Escape);
+        TrayButton(tray, "Между окнами, 16 px");
+        var invalid = TypeNumber(tray, "Между окнами", "45");
+        KeyDown(invalid, Keys.Enter);
+        // After rejection the same edit is still active, with the draft selected.
+        if (!PostMessage(invalid, 0x0102, (IntPtr)(int)'1', IntPtr.Zero)
+            || !PostMessage(invalid, 0x0102, (IntPtr)(int)'5', IntPtr.Zero))
+            throw new Win32Exception();
+        KeyDown(invalid, Keys.Enter);
+        TrayButton(tray, "Между окнами, 15 px");
+        ClickArrow(tray, "Увеличить: Между окнами");
+        TrayButton(tray, "Между окнами, 16 px");
+        EditNumber(tray, "Толщина обводки", "4", Keys.Enter);
+        TrayButton(tray, "Толщина обводки, 4 px");
+        Require(!IsWindowEnabled(TrayButton(tray, "Увеличить: Толщина обводки")), "Maximum thickness should disable increase");
+        ClickArrow(tray, "Уменьшить: Толщина обводки");
+        TrayButton(tray, "Толщина обводки, 3 px");
         TrayClick(tray, "Горячие клавиши");
         TrayClick(tray, "Перевести фокус");
         Require(!IsWindowEnabled(TrayButton(tray, "Win+Shift+стрелки")), "A duplicate move binding was offered");
         TrayClick(tray, "Alt+стрелки");
         Until("Choosing a shortcut should dismiss the flyout", () => !IsWindowVisible(tray));
-        Console.WriteLine("PASS  Left, right and keyboard tray callbacks; live inner/outer spacing, outline option and conflict-aware shortcuts");
+        Console.WriteLine("PASS  Inline tray controls stay open through clicks, arrow keys, fractional wheel input, typed values and cancellation");
 
         var tiled = pair.Select(VisibleFrame).ToArray();
         TrayChoose(tray, TrayContext, area, "Мозаика");

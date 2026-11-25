@@ -6,7 +6,7 @@ use windows_sys::Win32::{
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Controls::{DRAWITEMSTRUCT, ODS_SELECTED},
+        Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_SELECTED},
         WindowsAndMessaging::*,
     },
 };
@@ -25,6 +25,7 @@ pub(super) struct Colors {
     text: COLORREF,
     secondary: COLORREF,
     disabled: COLORREF,
+    control: COLORREF,
     hover: COLORREF,
     hover_text: COLORREF,
     accent: COLORREF,
@@ -51,6 +52,7 @@ impl Colors {
                     text: GetSysColor(COLOR_MENUTEXT),
                     secondary: GetSysColor(COLOR_MENUTEXT),
                     disabled: GetSysColor(COLOR_GRAYTEXT),
+                    control: GetSysColor(COLOR_MENU),
                     hover: GetSysColor(COLOR_HIGHLIGHT),
                     hover_text: GetSysColor(COLOR_HIGHLIGHTTEXT),
                     accent: GetSysColor(COLOR_HIGHLIGHT),
@@ -76,6 +78,7 @@ impl Colors {
                     text: rgb(246, 247, 249),
                     secondary: rgb(199, 201, 207),
                     disabled: rgb(147, 150, 156),
+                    control: rgb(53, 55, 59),
                     hover: rgb(60, 63, 68),
                     hover_text: rgb(255, 255, 255),
                     accent: rgb(108, 199, 255),
@@ -89,6 +92,7 @@ impl Colors {
                     text: rgb(29, 31, 35),
                     secondary: rgb(86, 90, 97),
                     disabled: rgb(112, 115, 119),
+                    control: rgb(255, 255, 255),
                     hover: rgb(235, 237, 240),
                     hover_text: rgb(19, 22, 25),
                     accent: rgb(0, 100, 172),
@@ -97,6 +101,10 @@ impl Colors {
                 }
             }
         }
+    }
+
+    pub fn edit_colors(self) -> (COLORREF, COLORREF) {
+        (self.text, self.control)
     }
 }
 
@@ -108,6 +116,10 @@ pub(super) struct Fonts {
 }
 
 impl Fonts {
+    pub fn value_font(&self) -> HFONT {
+        self.small
+    }
+
     pub fn new(dpi: u32) -> Self {
         let font = |dip, weight, name| unsafe {
             CreateFontW(
@@ -196,7 +208,85 @@ pub(super) struct Painter<'a> {
     pub enabled: bool,
 }
 
+// Use the same rectangles for native children, the editor and owner drawing.
+// Accept either tray-client or row-client coordinates so DPI rounding is identical.
+pub(super) fn stepper_rects(row: RECT, dpi: u32, separator: bool) -> [RECT; 3] {
+    let p = |n| scale(n, dpi);
+    let right = (row.right - p(6)).max(row.left);
+    let width = right - row.left;
+    let arrow = p(28).min(width / 4);
+    let value = p(48).min(width - 2 * arrow);
+    let content_top = (row.top + if separator { p(9) } else { 0 }).min(row.bottom);
+    let height = p(28).min(row.bottom - content_top);
+    let top = content_top + (row.bottom - content_top - height) / 2;
+    let segment = |left, right| RECT {
+        left,
+        right,
+        top,
+        bottom: top + height,
+    };
+    [
+        segment(right - 2 * arrow - value, right - arrow - value),
+        segment(right - arrow - value, right - arrow),
+        segment(right - arrow, right),
+    ]
+}
+
+fn inset(rc: RECT, by: i32) -> RECT {
+    RECT {
+        left: rc.left + by,
+        top: rc.top + by,
+        right: rc.right - by,
+        bottom: rc.bottom - by,
+    }
+}
+
 impl Painter<'_> {
+    fn control(&self, dc: HDC, rc: RECT, surface: COLORREF) {
+        let radius = scale(4, self.dpi);
+        fill(dc, &rc, self.colors.border, radius);
+        let stroke = scale(1, self.dpi);
+        fill(dc, &inset(rc, stroke), surface, radius - stroke);
+    }
+
+    pub fn arrow(&self, item: &DRAWITEMSTRUCT, increasing: bool, hover: bool, focus: bool) {
+        let p = |n| scale(n, self.dpi);
+        let dc = item.hDC;
+        let rc = item.rcItem;
+        let c = self.colors;
+        let disabled = item.itemState & ODS_DISABLED != 0;
+        let active = !disabled && (hover || item.itemState & ODS_SELECTED != 0);
+        fill(dc, &rc, c.background, 0);
+        // The child clips the inner, square end. Joined with the value and its
+        // other arrow, the three HWNDs share a single rounded outer edge.
+        let mut surface = rc;
+        if increasing {
+            surface.left -= p(6);
+        } else {
+            surface.right += p(6);
+        }
+        self.control(dc, surface, if active { c.hover } else { c.control });
+        let ink = if disabled {
+            c.disabled
+        } else if active {
+            c.hover_text
+        } else {
+            c.text
+        };
+        unsafe { SetBkMode(dc, TRANSPARENT as i32) };
+        text(
+            dc,
+            rc,
+            if increasing { "\u{e76c}" } else { "\u{e76b}" },
+            self.fonts.symbol,
+            ink,
+            DT_CENTER,
+        );
+        if focus && self.keyboard {
+            unsafe { DrawFocusRect(dc, &inset(rc, p(3))) };
+        }
+    }
+
     pub fn row(&self, item: &DRAWITEMSTRUCT, row: &Row, header: bool, hover: bool, focus: bool) {
         let Colors {
             background,
@@ -333,6 +423,25 @@ impl Painter<'_> {
                 p(5),
             );
             label.right = pill.left - p(8);
+        } else if matches!(row.action, Action::Adjust(_)) {
+            let [left, value, right] = stepper_rects(item.rcItem, self.dpi, row.separator);
+            self.control(
+                dc,
+                RECT {
+                    right: right.right,
+                    ..left
+                },
+                self.colors.control,
+            );
+            text(
+                dc,
+                value,
+                &row.detail,
+                self.fonts.value_font(),
+                primary,
+                DT_CENTER,
+            );
+            label.right = left.left - p(8);
         } else if !row.detail.is_empty() {
             let width = text(dc, label, &row.detail, self.fonts.small, sub, DT_CALCRECT);
             text(dc, label, &row.detail, self.fonts.small, sub, DT_RIGHT);

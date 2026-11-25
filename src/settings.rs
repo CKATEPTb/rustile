@@ -112,14 +112,22 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub const MAX_OUTLINE: u8 = 4;
+    pub const MAX_SPACING: u8 = 32;
+
     fn validated(self) -> Result<Self, String> {
         if self.version != 1 {
             return Err(format!("Неизвестная версия настроек: {}.", self.version));
         }
-        if self.gap > 32 || self.padding > 32 || self.outline > 4 {
-            return Err(
-                "Размер отступов должен быть от 0 до 32, толщина обводки — от 0 до 4.".into(),
-            );
+        if self.gap > Self::MAX_SPACING
+            || self.padding > Self::MAX_SPACING
+            || self.outline > Self::MAX_OUTLINE
+        {
+            return Err(format!(
+                "Размер отступов должен быть от 0 до {}, толщина обводки — от 0 до {}.",
+                Self::MAX_SPACING,
+                Self::MAX_OUTLINE
+            ));
         }
         if self.focus == self.movement {
             return Err("Фокус и перемещение используют одни и те же стрелки. Выберите разные модификаторы.".into());
