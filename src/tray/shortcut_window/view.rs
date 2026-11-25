@@ -2,7 +2,7 @@ use super::*;
 use Shortcut::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-const GROUPS: [(&str, &[Shortcut]); 5] = [
+const GROUPS: [(&str, &[Shortcut]); 6] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
         "Навигация по окнам",
@@ -40,6 +40,15 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
     (
         "Управление окнами",
         &[Shortcut::CloseWindow, ToggleMaximize, ToggleMosaic],
+    ),
+    (
+        "Рабочие столы",
+        &[
+            PreviousDesktop,
+            PreviousDesktopAlt,
+            NextDesktop,
+            NextDesktopAlt,
+        ],
     ),
 ];
 

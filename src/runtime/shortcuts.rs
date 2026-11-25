@@ -11,8 +11,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
-    CANCEL, CLOSE_WINDOW, CONFIRM, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE,
-    SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
+    CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_NEXT, DESKTOP_PREVIOUS, EXPAND, FOCUS, KEY_COMMAND,
+    MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
 };
 use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
@@ -31,7 +31,7 @@ impl KeyRoutes {
         if !action.is_resize() {
             self.normal[mods as usize] = id;
         }
-        if action.is_resize() || action == Shortcut::ToggleMosaic {
+        if action.is_resize() || action.is_global() {
             self.resize[mods as usize] = id;
         }
     }
@@ -52,8 +52,12 @@ impl KeyRoutes {
             .copied()
             .filter(|&id| id != 0)
             .map(i32::from)?;
-        let target = if id == TOGGLE_MOSAIC {
-            0 // Pause/resume belongs to Rustile even when there are no tiled windows.
+        if matches!(id, DESKTOP_PREVIOUS | DESKTOP_NEXT) && !state.desktop_navigation {
+            // In particular, leave native Win+Ctrl+Left/Right to Explorer.
+            return None;
+        }
+        let target = if matches!(id, TOGGLE_MOSAIC | DESKTOP_PREVIOUS | DESKTOP_NEXT) {
+            0 // Global commands also work on an empty desktop or while tiling is paused.
         } else {
             let target = state.target?;
             match target {
@@ -135,6 +139,8 @@ fn command_id(action: Shortcut) -> u8 {
         CloseWindow => CLOSE_WINDOW,
         ToggleMaximize => TOGGLE_MAXIMIZE,
         ToggleMosaic => TOGGLE_MOSAIC,
+        PreviousDesktop | PreviousDesktopAlt => DESKTOP_PREVIOUS,
+        NextDesktop | NextDesktopAlt => DESKTOP_NEXT,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -213,6 +219,7 @@ impl Press {
 struct Snapshot {
     target: Option<ShortcutTarget>,
     mode: Mode,
+    desktop_navigation: bool,
     focus_epoch: usize,
     handled: usize,
 }
@@ -227,6 +234,7 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         focus: Snapshot {
             target: None,
             mode: Mode::Normal,
+            desktop_navigation: false,
             focus_epoch: 0,
             handled: 0,
         },
@@ -235,6 +243,14 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         keys: Routes::EMPTY,
     })
 });
+
+pub(super) fn set_desktop_navigation(available: bool) {
+    ROUTING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .focus
+        .desktop_navigation = available;
+}
 
 pub(super) fn update(target: Option<ShortcutTarget>, mode: Mode, handled: usize) {
     let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
@@ -505,6 +521,7 @@ mod tests {
                         can_maximize: true,
                     }),
                     mode: Mode::Normal,
+                    desktop_navigation: false,
                     focus_epoch: 1,
                     handled: 0,
                 },
@@ -536,6 +553,51 @@ mod tests {
                 self.pending = next;
             }
             action
+        }
+    }
+
+    #[test]
+    fn desktop_shortcuts_are_global_and_switch_once_per_physical_press() {
+        let mods = MOD_CONTROL | MOD_WIN;
+        let mut keyboard = Keyboard::new();
+        keyboard.state.target = None;
+        for mode in [Mode::Normal, Mode::Resize] {
+            keyboard.state.mode = mode;
+            for (key, id) in [
+                (VK_LEFT, DESKTOP_PREVIOUS),
+                (VK_UP, DESKTOP_PREVIOUS),
+                (VK_RIGHT, DESKTOP_NEXT),
+                (VK_DOWN, DESKTOP_NEXT),
+            ] {
+                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
+                keyboard.state.desktop_navigation = true;
+                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
+                assert_eq!(keyboard.key(key, false, mods), Action::Pass);
+                assert_eq!(keyboard.key(key, true, mods), Action::Command(id));
+                assert_eq!(keyboard.key(key, true, mods), Action::Consume);
+                keyboard.state.desktop_navigation = false;
+                assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+            }
+        }
+    }
+
+    #[test]
+    fn remapping_one_desktop_shortcut_preserves_its_alternative_in_all_modes() {
+        let mods = MOD_CONTROL | MOD_WIN;
+        let mut keyboard = Keyboard::new();
+        keyboard.assign(Shortcut::NextDesktop, MOD_ALT, VK_F8);
+        keyboard.state.desktop_navigation = true;
+        let routes = Routes::new(keyboard.settings);
+        for mode in [Mode::Normal, Mode::Resize] {
+            keyboard.state.mode = mode;
+            let command = |key: u16, mods| {
+                routes.0[key as usize]?
+                    .binding(keyboard.state, Pending::NEW, mods, || 999)
+                    .map(|b| (b.id, b.target))
+            };
+            assert_eq!(command(VK_RIGHT, mods), None);
+            assert_eq!(command(VK_F8, MOD_ALT), Some((DESKTOP_NEXT, 0)));
+            assert_eq!(command(VK_DOWN, mods), Some((DESKTOP_NEXT, 0)));
         }
     }
 

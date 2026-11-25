@@ -471,7 +471,7 @@ internal static class DesktopSmoke {
         CaptureKey(row, modifier, false, system);
     }
     static string[] ShortcutLabels(IntPtr editor) {
-        return Enumerable.Range(1000, 30).Select(id => ControlText(EditorControl(editor, id))).ToArray();
+        return Enumerable.Range(1000, 34).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
     static void EmptyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
@@ -521,7 +521,13 @@ internal static class DesktopSmoke {
         };
         Until("Cancel must have the initial keyboard focus", () => focused() == cancel);
         if (choice == ConflictChoice.ClickAssign) {
-            SendTrayMessage(assign, 0x00f5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
+            // BM_CLICK can silently fail on a dialog outside the input desktop.
+            // Queue a click at the button center on the dialog's own message loop.
+            var size = Bounds(assign).Size;
+            var center = (IntPtr)(((size.Height / 2) << 16) | (size.Width / 2));
+            if (!PostMessage(assign, 0x0201 /* WM_LBUTTONDOWN */, (IntPtr)1, center)
+                || !PostMessage(assign, 0x0202 /* WM_LBUTTONUP */, IntPtr.Zero, center))
+                throw new Win32Exception();
         } else if (choice == ConflictChoice.Escape) {
             CaptureKey(cancel, Keys.Escape, true);
         } else {
@@ -832,17 +838,19 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1030) == IntPtr.Zero
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1034) == IntPtr.Zero
             && initial[27].Contains("Win+") && initial[28].Contains("Win+") && initial[29].Contains("Win+"),
-            "The page should expose 30 editable shortcuts including the mosaic toggle");
+            "The page should expose 34 editable shortcuts including the desktop navigation keys");
         var arrows = new[] { "←", "→", "↑", "↓" };
         for (int i = 0; i < arrows.Length; ++i) {
+            Require(initial[30 + i].EndsWith("Ctrl+Win+" + arrows[i]),
+                "Desktop navigation should display its default shortcut for " + arrows[i]);
             Require(initial[19 + i].EndsWith("Win+Alt+" + arrows[i])
                 && initial[23 + i].EndsWith("Win+Alt+Shift+" + arrows[i]),
                 "Quick resize should display the default forward and reverse shortcuts for " + arrows[i]);
         }
         var view = Bounds(viewHwnd);
-        if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 660 * GetDpiForWindow(editor))
+        if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 760 * GetDpiForWindow(editor))
             Require(Enumerable.Range(1000, initial.Length).All(i => view.Contains(Bounds(EditorControl(editor, i)))),
                 "Every shortcut should fit on the default-sized editor page");
         TrayOpen(tray, TraySelect, area);

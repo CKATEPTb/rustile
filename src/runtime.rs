@@ -1,3 +1,5 @@
+mod desktop_watch;
+mod dynamic_desktops;
 mod instance;
 mod shortcuts;
 #[cfg(test)]
@@ -30,6 +32,8 @@ pub(crate) const START_RESIZE: i32 = 1;
 pub(crate) const CLOSE_WINDOW: i32 = 2;
 pub(crate) const TOGGLE_MAXIMIZE: i32 = 3;
 pub(crate) const TOGGLE_MOSAIC: i32 = 4;
+pub(crate) const DESKTOP_PREVIOUS: i32 = 5;
+pub(crate) const DESKTOP_NEXT: i32 = 6;
 const FOCUS: i32 = 10;
 pub(crate) const EXPAND: i32 = 20;
 const SHRINK: i32 = 30;
@@ -42,6 +46,7 @@ const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
 pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
+const DESKTOP_LIST_CHANGED: u32 = WM_APP + 5;
 const DESKTOP_SETTLE_MS: u32 = 160;
 
 // GetMessage dispatches out-of-context WinEvents on the hook's installing thread.
@@ -315,9 +320,17 @@ fn pump(
     let mut message = MSG::default();
     let mut events = Vec::new();
     let mut desktop_timer = MessageTimer::default();
+    let mut inventory_timer = MessageTimer::default();
+    let mut workspaces = dynamic_desktops::Workspaces::new();
     let mut drag_timer = MessageTimer::default();
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
     let thread_id = unsafe { GetCurrentThreadId() };
+    let mut desktop_watch = None;
+    shortcuts::set_desktop_navigation(workspaces.available());
+    if workspaces.supported {
+        desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
+        inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+    }
     let mut retries = 0;
     if manager.take_desktop_retry() {
         retries = 2;
@@ -339,6 +352,9 @@ fn pump(
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
         let has_events = !events.is_empty();
         let timer_fired = desktop_timer.take(&message);
+        let inventory_due = inventory_timer.take(&message);
+        let desktops_changed = message.message == DESKTOP_LIST_CHANGED;
+        let mut inventory_changed = desktops_changed;
         let work_area_changed = tray.take_work_area_change();
         // Some appbars reserve their edge without a settings broadcast. Read
         // rcWork once per event batch, before placing any newly shown HWNDs.
@@ -346,8 +362,19 @@ fn pump(
         if refitted {
             manager.reconcile_desktop();
         }
-        let mut settling = false;
+        let mut settling = desktops_changed;
         for (event, id) in events.drain(..) {
+            inventory_changed |= matches!(
+                event,
+                EVENT_OBJECT_CREATE
+                    | EVENT_OBJECT_DESTROY
+                    | EVENT_OBJECT_SHOW
+                    | EVENT_OBJECT_HIDE
+                    | EVENT_OBJECT_CLOAKED
+                    | EVENT_OBJECT_UNCLOAKED
+                    | EVENT_SYSTEM_FOREGROUND
+                    | EVENT_SYSTEM_DESKTOPSWITCH
+            );
             settling |= matches!(
                 event,
                 EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
@@ -382,6 +409,18 @@ fn pump(
         if has_events || reconcile {
             refresh(manager, 0);
         }
+        let needs_scan = inventory_changed && workspaces.activity();
+        if inventory_due {
+            if let Some(delay) = workspaces.reconcile() {
+                inventory_timer.schedule(delay);
+            }
+            shortcuts::set_desktop_navigation(workspaces.available());
+            if workspaces.supported && desktop_watch.is_none() {
+                desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
+            }
+        } else if needs_scan && inventory_timer.0 == 0 {
+            inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+        }
         if drag_timer.matches(&message) {
             manager.refresh_drop_preview(false);
         }
@@ -397,6 +436,14 @@ fn pump(
             let ticket = message.wParam >> 8;
             if command == TOGGLE_MOSAIC && target == 0 {
                 shortcut_command = Some((Command::Toggle, ticket));
+            } else if target == 0 && matches!(command, DESKTOP_PREVIOUS | DESKTOP_NEXT) {
+                if workspaces.navigate(command == DESKTOP_NEXT) {
+                    manager.finish_mode();
+                    manager.cancel_mouse_move();
+                    desktop_timer.schedule(DESKTOP_SETTLE_MS);
+                }
+                inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+                refresh(manager, ticket);
             } else {
                 if target != 0 && target == crate::native::foreground() {
                     dispatch(manager, target, command);

@@ -1,3 +1,6 @@
+pub(crate) mod occupancy;
+pub(crate) mod shell;
+
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::io;
@@ -104,25 +107,31 @@ impl Service {
         unsafe { &**self.interface.as_ptr() }
     }
 
-    fn query(&self, hwnd: HWND) -> Result<DesktopMembership, HRESULT> {
+    fn desktop_id(&self, hwnd: HWND) -> Result<DesktopId, HRESULT> {
         let this = self.interface.as_ptr().cast();
         let mut guid = GUID::default();
         let result = unsafe { (self.vtable().desktop_id)(this, hwnd, &mut guid) };
         if result < 0 {
             return Err(result);
         }
-        let id = DesktopId(
+        Ok(DesktopId(
             (u128::from(guid.data1) << 96)
                 | (u128::from(guid.data2) << 80)
                 | (u128::from(guid.data3) << 64)
                 | u128::from(u64::from_be_bytes(guid.data4)),
-        );
+        ))
+    }
+
+    fn query(&self, hwnd: HWND) -> Result<DesktopMembership, HRESULT> {
+        let id = self.desktop_id(hwnd)?;
         // The shell also returns GUID_NULL for windows without a workspace.
         if id.0 == 0 {
             return Ok(DesktopMembership::Unknown);
         }
         let mut current = 0;
-        let result = unsafe { (self.vtable().is_current)(this, hwnd, &mut current) };
+        let result = unsafe {
+            (self.vtable().is_current)(self.interface.as_ptr().cast(), hwnd, &mut current)
+        };
         if result < 0 {
             return Err(result);
         }

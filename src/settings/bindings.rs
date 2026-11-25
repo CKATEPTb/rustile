@@ -16,6 +16,7 @@ enum Group {
     Quick,
     QuickReverse,
     Window,
+    Desktop,
 }
 
 macro_rules! shortcuts {
@@ -25,7 +26,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 30] = [$( Self::$name, )+];
+            pub const ALL: [Self; 34] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -65,6 +66,10 @@ shortcuts! {
     CloseWindow,    "Закрыть окно",              Window, VK_Q;
     ToggleMaximize, "Развернуть или восстановить", Window, VK_F;
     ToggleMosaic,   "Переключить мозаику",        Window, VK_Y;
+    PreviousDesktop,    "Предыдущий стол",        Desktop, VK_LEFT;
+    NextDesktop,        "Следующий стол",         Desktop, VK_RIGHT;
+    PreviousDesktopAlt, "Предыдущий стол (доп.)", Desktop, VK_UP;
+    NextDesktopAlt,     "Следующий стол (доп.)",  Desktop, VK_DOWN;
 }
 
 impl Shortcut {
@@ -80,14 +85,16 @@ impl Shortcut {
         matches!(self.spec().1, Group::Grow | Group::Shrink | Group::Finish)
     }
 
+    pub fn is_global(self) -> bool {
+        self == Self::ToggleMosaic || self.spec().1 == Group::Desktop
+    }
+
     pub fn default_chord(self) -> Chord {
         self.inherited(&Settings::default())
     }
 
     fn shares_context(self, other: Self) -> bool {
-        self == Self::ToggleMosaic
-            || other == Self::ToggleMosaic
-            || self.is_resize() == other.is_resize()
+        self.is_global() || other.is_global() || self.is_resize() == other.is_resize()
     }
 
     fn inherited(self, settings: &Settings) -> Chord {
@@ -101,6 +108,7 @@ impl Shortcut {
             Group::Quick => MOD_WIN | MOD_ALT,
             Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
             Group::Window => MOD_WIN,
+            Group::Desktop => MOD_WIN | MOD_CONTROL,
         };
         Chord { mods, key }
     }
@@ -311,9 +319,15 @@ fn layout_key_name(key: u16) -> Option<String> {
 
 // In memory, a fixed table keeps the hook allocation-free. The file contains
 // only overrides, keyed by action name so adding an action preserves old files.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(from = "StoredOverrides", into = "BTreeMap<Shortcut, Binding>")]
 pub(super) struct Overrides([Option<Binding>; Shortcut::ALL.len()]);
+
+impl Default for Overrides {
+    fn default() -> Self {
+        Self([None; Shortcut::ALL.len()])
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 enum Binding {
@@ -351,7 +365,7 @@ impl From<StoredOverrides> for Overrides {
         for action in Shortcut::ALL {
             if !matches!(
                 action.spec().1,
-                Group::Quick | Group::QuickReverse | Group::Window
+                Group::Quick | Group::QuickReverse | Group::Window | Group::Desktop
             ) || overrides.0[action.index()].is_some()
             {
                 continue;
@@ -389,7 +403,7 @@ impl Settings {
         let owner = |resize| {
             let context = Shortcut::ALL
                 .into_iter()
-                .filter(|other| *other == Shortcut::ToggleMosaic || other.is_resize() == resize);
+                .filter(|other| other.is_global() || other.is_resize() == resize);
             // Explicit bindings win over the variants that keep the resize opener held.
             context
                 .clone()
@@ -401,11 +415,11 @@ impl Settings {
                 })
                 .filter(|&other| action != other)
         };
-        if action != Shortcut::ToggleMosaic {
+        if !action.is_global() {
             return owner(action.is_resize()).map(BindingOwners::One);
         }
         match (owner(false), owner(true)) {
-            (Some(a), Some(b)) => Some(BindingOwners::Both(a, b)),
+            (Some(a), Some(b)) if a != b => Some(BindingOwners::Both(a, b)),
             (one, other) => one.or(other).map(BindingOwners::One),
         }
     }

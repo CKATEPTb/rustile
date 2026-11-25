@@ -417,6 +417,39 @@ mod tests {
     }
 
     #[test]
+    fn desktop_shortcuts_preserve_older_assignments_and_transfer_between_global_actions() {
+        use Shortcut::{FocusUp, GrowUp, NextDesktop, PreviousDesktop};
+
+        let settings: Settings = toml::from_str(
+            "shortcuts.focus_up = { mods = 10, key = 37 }\nshortcuts.grow_up = { mods = 10, key = 37 }",
+        )
+        .unwrap();
+        let settings = settings.validated().unwrap();
+        let chord = PreviousDesktop.default_chord();
+        assert_eq!(settings.binding(PreviousDesktop), None);
+        let owners = BindingOwners::Both(FocusUp, GrowUp);
+        assert_eq!(settings.conflict(PreviousDesktop, chord), Some(owners));
+        let reassigned = settings
+            .changed(Command::ReassignShortcut(PreviousDesktop, chord, owners))
+            .unwrap();
+        assert_eq!(
+            reassigned.conflict(NextDesktop, chord),
+            Some(PreviousDesktop.into())
+        );
+        let transferred = reassigned
+            .changed(Command::ReassignShortcut(
+                NextDesktop,
+                chord,
+                PreviousDesktop.into(),
+            ))
+            .unwrap();
+        assert_eq!(transferred.binding(PreviousDesktop), None);
+        assert_eq!(transferred.binding(NextDesktop), Some(chord));
+        let restored: Settings = toml::from_str(&toml::to_string(&transferred).unwrap()).unwrap();
+        assert_eq!(restored.validated().unwrap(), transferred);
+    }
+
+    #[test]
     fn assigning_a_global_chord_confirms_the_normal_binding_and_modal_alias() {
         use Shortcut::{FocusLeft, GrowLeft, ToggleMosaic};
 
