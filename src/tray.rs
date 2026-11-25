@@ -285,9 +285,11 @@ impl State {
         self.apply_theme(hwnd, Colors::current());
         self.layout(hwnd);
         unsafe {
+            // Win32 paints visible child controls. Let DWM compose the popup
+            // without presenting it until the owner-drawn rows are ready.
+            let cloaked = set_popup_cloak(hwnd, true);
             // A launcher may pass STARTF_USESHOWWINDOW with SW_HIDE. The first
-            // ShowWindow would then ignore its requested state. Reveal the
-            // popup explicitly after its rows have been positioned.
+            // ShowWindow would then ignore its requested state.
             SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -297,6 +299,20 @@ impl State {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
             );
+            RedrawWindow(
+                hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            GdiFlush();
+            if cloaked {
+                DwmFlush();
+                if !set_popup_cloak(hwnd, false) {
+                    ShowWindow(hwnd, SW_HIDE);
+                    return;
+                }
+            }
             SetForegroundWindow(hwnd);
         }
         self.focus(hwnd, 1);
@@ -591,6 +607,18 @@ impl State {
     }
 }
 
+fn set_popup_cloak(hwnd: HWND, cloak: bool) -> bool {
+    let value = i32::from(cloak);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK as u32,
+            (&raw const value).cast(),
+            size_of_val(&value) as u32,
+        ) >= 0
+    }
+}
+
 unsafe extern "system" fn button_proc(
     btn: HWND,
     msg: u32,
@@ -612,6 +640,12 @@ unsafe extern "system" fn button_proc(
                 return DefSubclassProc(btn, msg, wp, lp);
             };
             match msg {
+                WM_ERASEBKGND => {
+                    let mut rect = RECT::default();
+                    GetClientRect(btn, &mut rect);
+                    paint::background(wp as HDC, &rect, state.colors.get());
+                    return 1;
+                }
                 WM_MOUSEWHEEL => {
                     state.wheel(parent, wp, lp);
                     return 0;

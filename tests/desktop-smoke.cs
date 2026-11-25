@@ -69,6 +69,11 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, UIntPtr wp, StringBuilder text, uint flags,
@@ -409,6 +414,26 @@ internal static class DesktopSmoke {
     }
     static void TrayOpen(IntPtr tray, int activation, Rectangle screen) {
         TrayNotify(tray, activation, screen);
+        // Sample the existing window surface immediately. PrintWindow, waiting
+        // for a control, or sending WM_PAINT would hide the blank-first-frame bug.
+        var header = GetDlgItem(tray, 100);
+        Require(header != IntPtr.Zero && IsWindowVisible(header), "Missing visible tray header at open");
+        int dpi = (int)GetDpiForWindow(header);
+        int size = (20 * dpi + 48) / 96, left = (10 * dpi + 48) / 96;
+        int top = Bounds(header).Height / 2 - size / 2;
+        var dc = GetDC(header);
+        Require(dc != IntPtr.Zero, "Cannot sample the first tray frame");
+        try {
+            // Two differently colored tiles within the logo, independent of
+            // the current light, dark or high-contrast background.
+            uint main = GetPixel(dc, left + size / 4, top + size / 2);
+            uint upper = GetPixel(dc, left + size * 7 / 10, top + size / 4);
+            Require(main != uint.MaxValue && upper != uint.MaxValue && main != upper,
+                String.Format("Tray exposed an unpainted header on activation {0}: {1:X8}, {2:X8}", activation, main, upper));
+        } finally { ReleaseDC(header, dc); }
+        int cloaked;
+        Require(DwmGetWindowAttribute(tray, 14 /* DWMWA_CLOAKED */, out cloaked, sizeof(int)) == 0
+            && (cloaked & 1 /* DWM_CLOAKED_APP */) == 0, "Rustile left the tray popup cloaked");
         TrayButton(tray, "Мозаика");
         Require(Screen.FromHandle(tray).WorkingArea.Contains(Bounds(tray)), "The tray popup extends outside its monitor's work area");
     }
@@ -435,6 +460,9 @@ internal static class DesktopSmoke {
         TrayFocus(manager, tray, "Горячие клавиши");
         TrayKey(tray, "Горячие клавиши", Keys.Escape);
         Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
+        // Exercise a busy message queue as well: sent shell notifications take
+        // precedence over posted messages, and WM_PAINT normally comes last.
+        for (int i = 0; i < 2048; ++i) Message(tray, 0 /* WM_NULL */);
         TrayOpen(tray, TraySelect, area);
         TrayNotify(tray, TraySelect, area);
         Until("A second left click on the tray icon should close the popup", () => !IsWindowVisible(tray));
