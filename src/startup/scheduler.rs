@@ -7,7 +7,9 @@ use std::ptr::{null, null_mut};
 use windows::{
     Win32::{
         Foundation::{
-            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, RPC_E_CHANGED_MODE, VARIANT_BOOL,
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SERVICE_DISABLED,
+            ERROR_SERVICE_NOT_ACTIVE, REGDB_E_CLASSNOTREG, RPC_E_CHANGED_MODE,
+            SCHED_E_SERVICE_NOT_RUNNING, VARIANT_BOOL,
         },
         System::{Com::*, TaskScheduler::*, Variant::VARIANT},
     },
@@ -253,31 +255,47 @@ struct Registration {
     task: Option<IRegisteredTask>,
     name: BSTR,
     exe: PathBuf,
+    registered_exe: Option<PathBuf>,
     scheduler: Scheduler,
 }
 
 impl Registration {
     fn open(sid: &str) -> Result<Self, String> {
         let scheduler = Scheduler::connect().map_err(failure)?;
+        let record = Self::inspect(scheduler, sid)?;
+        if record.task.is_some() && record.registered_exe.is_none() {
+            return Err(tr(Msg::SystemSchedulerOccupied).into());
+        }
+        Ok(record)
+    }
+
+    fn inspect(scheduler: Scheduler, sid: &str) -> Result<Self, String> {
         let name = BSTR::from(format!("Rustile.Autostart.{sid}"));
-        let exe = protected::exe_path(sid)?;
+        let exe = protected::installed_exe()?;
         // The scheduler expands %variables% in Exec paths at logon.
         if exe.as_os_str().encode_wide().any(|c| c == b'%' as u16) {
             return Err(tr(Msg::SystemPercentPath).into());
         }
         let task = scheduler.lookup(&name).map_err(failure)?;
+        let mut registered_exe = None;
         if let Some(current) = &task {
             let flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
             let sddl = unsafe { current.GetSecurityDescriptor(flags as i32) }.map_err(failure)?;
             let def = unsafe { current.Definition() }.map_err(failure)?;
-            if !protected_acl(&sddl) || !matches_definition(&def, sid, &exe).map_err(failure)? {
-                return Err(tr(Msg::SystemSchedulerOccupied).into());
+            if protected_acl(&sddl) {
+                for candidate in [&exe, &protected::legacy_exe(sid)?] {
+                    if matches_definition(&def, sid, candidate).map_err(failure)? {
+                        registered_exe = Some(candidate.clone());
+                        break;
+                    }
+                }
             }
         }
         Ok(Self {
             scheduler,
             name,
             exe,
+            registered_exe,
             task,
         })
     }
@@ -290,7 +308,7 @@ pub(super) fn installed(sid: &str) -> Result<bool, String> {
     };
     let trigger = (|| unsafe { task.Definition()?.Triggers()?.get_Item(1) })().map_err(failure)?;
     let enabled: VARIANT_BOOL = property(|out| unsafe { trigger.Enabled(out) }).map_err(failure)?;
-    Ok(record.exe.is_file()
+    Ok(record.registered_exe.is_some_and(|path| path.is_file())
         && enabled.as_bool()
         && unsafe { task.Enabled() }.map_err(failure)?.as_bool())
 }
@@ -307,12 +325,62 @@ pub(super) fn install(sid: &str) -> Result<(), String> {
     } else {
         TASK_CREATE
     };
+    register(&record, sid, &task, mode)
+}
+
+pub(super) fn migrate(sid: &str) -> Result<(), String> {
+    // Some systems have no Task Scheduler. A fresh install still works there.
+    const RPC_S_SERVER_UNAVAILABLE: u32 = 1722;
+    let scheduler = match Scheduler::connect() {
+        Ok(scheduler) => scheduler,
+        Err(error)
+            if [
+                SCHED_E_SERVICE_NOT_RUNNING,
+                REGDB_E_CLASSNOTREG,
+                HRESULT::from_win32(ERROR_SERVICE_DISABLED.0),
+                HRESULT::from_win32(ERROR_SERVICE_NOT_ACTIVE.0),
+                HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE),
+            ]
+            .contains(&error.code()) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(failure(error)),
+    };
+    let record = Registration::inspect(scheduler, sid)?;
+    let (Some(current), Some(previous)) = (&record.task, &record.registered_exe) else {
+        return Ok(());
+    };
+    if previous == &record.exe {
+        return Ok(());
+    }
+    let def = unsafe { current.Definition() }.map_err(failure)?;
+    let enabled = unsafe { current.Enabled() }.map_err(failure)?;
+    retarget(&def, &record.exe, enabled).map_err(failure)?;
+    register(&record, sid, &def, TASK_UPDATE)
+}
+
+fn retarget(def: &ITaskDefinition, exe: &Path, enabled: VARIANT_BOOL) -> ComResult<()> {
+    unsafe {
+        let action: IExecAction = def.Actions()?.get_Item(1)?.cast()?;
+        action.SetPath(&wide_path(exe))?;
+        action.SetWorkingDirectory(&wide_path(exe.parent().unwrap()))?;
+        def.Settings()?.SetEnabled(enabled)
+    }
+}
+
+fn register(
+    record: &Registration,
+    sid: &str,
+    task: &ITaskDefinition,
+    mode: TASK_CREATION,
+) -> Result<(), String> {
     let flags = mode.0 | TASK_DONT_ADD_PRINCIPAL_ACE.0 | TASK_IGNORE_REGISTRATION_TRIGGERS.0;
     let empty = VARIANT::default();
     unsafe {
         record.scheduler.root.RegisterTaskDefinition(
             &record.name,
-            &task,
+            task,
             flags,
             &VARIANT::from(sid),
             &empty,
@@ -342,7 +410,7 @@ mod tests {
         let missing = BSTR::from(format!("Rustile.UnitTest.Missing.{}", std::process::id()));
         assert!(scheduler.lookup(&missing).unwrap().is_none());
         let sid = crate::startup::consent::sid().unwrap();
-        let exe = protected::exe_path(&sid).unwrap();
+        let exe = protected::installed_exe().unwrap();
         let task = definition(&scheduler.service, &sid, &exe).unwrap();
         unsafe {
             // VALIDATE_ONLY returns S_OK and a null task. The generated
@@ -385,5 +453,26 @@ mod tests {
         assert!(protected_acl(&acl("BA", "GR")));
         assert!(!protected_acl(&acl("BA", "GW")));
         assert!(!protected_acl(&acl(&sid, "GR")));
+    }
+
+    #[test]
+    fn retargeting_legacy_task_preserves_disabled_task_and_trigger() {
+        let scheduler = Scheduler::connect().unwrap();
+        let sid = crate::startup::consent::sid().unwrap();
+        let legacy = protected::legacy_exe(&sid).unwrap();
+        let exe = protected::installed_exe().unwrap();
+        let def = definition(&scheduler.service, &sid, &legacy).unwrap();
+        unsafe {
+            let trigger = def.Triggers().unwrap().get_Item(1).unwrap();
+            trigger.SetEnabled(false.into()).unwrap();
+            retarget(&def, &exe, false.into()).unwrap();
+            assert!(matches_definition(&def, &sid, &exe).unwrap());
+            assert!(
+                !property(|out| def.Settings()?.Enabled(out))
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(!property(|out| trigger.Enabled(out)).unwrap().as_bool());
+        }
     }
 }

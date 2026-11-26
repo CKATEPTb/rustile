@@ -1,8 +1,11 @@
 //! A process-local message pump owns all application state. The named pipe
 //! carries one bounded UTF-8 request/reply per connection to that pump.
 use crate::cli_error;
+use std::ffi::OsString;
 use std::io;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Weak, mpsc};
 use std::thread;
@@ -15,8 +18,9 @@ use windows_sys::Win32::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             SDDL_REVISION_1,
         },
-        GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenLogonSid,
+        GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_GROUPS,
+        TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+        TokenIntegrityLevel, TokenLogonSid, TokenUser,
     },
     Storage::FileSystem::*,
     System::{
@@ -436,7 +440,73 @@ impl Channel {
     }
 }
 
+fn tray_pid() -> Option<u32> {
+    // FindWindow searches the caller's Win32 desktop. Explorer's virtual
+    // desktops all share the same tray owner.
+    let tray = unsafe { FindWindowW(w!("Rustile.Tray"), w!("Rustile")) };
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(tray, &mut pid) };
+    (pid != 0).then_some(pid)
+}
+
+pub(crate) struct InstallOwner {
+    pub(crate) pid: u32,
+    pub(crate) image: PathBuf,
+    pub(crate) elevated: bool,
+}
+
+pub(crate) fn owner_image() -> Option<InstallOwner> {
+    if !super::instance::Instance::running().ok()? {
+        return None;
+    }
+    let pid = tray_pid()?;
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return None;
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut handle = null_mut();
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut handle) } == 0 {
+        return None;
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let user = token_info(token.as_raw_handle(), TokenUser).ok()?;
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if sid_text(sid).ok()? != crate::startup::consent::sid().ok()? {
+        return None;
+    }
+    let elevation = token_info(token.as_raw_handle(), TokenElevation).ok()?;
+    let elevated = unsafe { (*elevation.as_ptr().cast::<TOKEN_ELEVATION>()).TokenIsElevated != 0 };
+    let mut path = vec![0u16; 32_768];
+    let mut len = path.len() as u32;
+    if unsafe {
+        QueryFullProcessImageNameW(process.as_raw_handle(), 0, path.as_mut_ptr(), &mut len)
+    } == 0
+        || tray_pid() != Some(pid)
+    {
+        return None;
+    }
+    Some(InstallOwner {
+        pid,
+        image: PathBuf::from(OsString::from_wide(&path[..len as usize])),
+        elevated,
+    })
+}
+
 pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -> Reply {
+    send_to(command, grant_foreground, wait_for_exit, None)
+}
+
+pub(crate) fn quit_owner(pid: u32) -> Result<(), String> {
+    send_to(&crate::cli::Command::Quit.to_wire(), false, true, Some(pid)).map(|_| ())
+}
+
+fn send_to(
+    command: &str,
+    grant_foreground: bool,
+    wait_for_exit: bool,
+    expected_owner: Option<u32>,
+) -> Reply {
     if command.is_empty() || command.len() > MAX_COMMAND {
         return Err("A Rustile command must contain between 1 and 4096 bytes.".into());
     }
@@ -445,12 +515,11 @@ pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -
     }
     let start = Instant::now();
     loop {
-        // FindWindow is scoped to the caller's Win32 desktop, unlike named
-        // pipes. Explorer's virtual desktops all share this same owner.
-        let tray = unsafe { FindWindowW(w!("Rustile.Tray"), w!("Rustile")) };
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(tray, &mut pid) };
-        if pid != 0 {
+        let current = tray_pid();
+        if expected_owner.is_some() && current != expected_owner {
+            return Err("The Rustile instance changed before the command could be sent.".into());
+        }
+        if let Some(pid) = current {
             let name = pipe_name(pid);
             match connect(pid, &name) {
                 Ok(pipe) => {

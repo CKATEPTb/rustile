@@ -6,6 +6,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -314,6 +315,59 @@ internal static class DesktopSmoke {
                 "CLI used the wrong output stream for " + args + ": " + stdout + " / " + stderr);
             return success ? stdout : stderr;
         }
+    }
+    static byte[] ImageHash(string path) {
+        using (var image = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (var sha = SHA256.Create()) return sha.ComputeHash(image);
+    }
+    static Process InstalledOwner(string installed, string desktop) {
+        int trayPid = 0;
+        Until("The installed copy should own the tray on the private desktop", () => {
+            GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out trayPid);
+            return trayPid != 0;
+        });
+        var status = Cli(installed, "status", desktop);
+        Require(status.Split('\n').Any(line => line.Trim() == "pid=" + trayPid),
+            "Canonical CLI and tray disagree on the owner: " + status);
+        var process = Process.GetProcessById(trayPid);
+        Require(String.Equals(process.MainModule.FileName, installed, StringComparison.OrdinalIgnoreCase),
+            "Owner is running outside its installation directory: " + process.MainModule.FileName);
+        return process;
+    }
+    static void VerifyInstallation(string portable, string installed, string desktop) {
+        Require(Cli(portable, "--installation-fixture", desktop) == "installation-fixture", "Expected a restricted fixture build");
+        Require(!File.Exists(installed), "The first launch requires an empty installation directory");
+        try {
+            using (var launcher = new Child(portable, "", desktop, true)) {
+                Require(launcher.Exited(15000) && launcher.ExitCode == 0, "External GUI launcher did not hand off");
+            }
+            using (var original = InstalledOwner(installed, desktop)) {
+                IntPtr incumbent = original.Handle;
+                Require(ImageHash(portable).SequenceEqual(ImageHash(installed)), "First installation did not copy the source image");
+                // A PE overlay changes the source bytes without changing its version or executable code.
+                using (var image = new FileStream(portable, FileMode.Append, FileAccess.Write, FileShare.None)) {
+                    var marker = Encoding.ASCII.GetBytes("Rustile installation smoke update");
+                    image.Write(marker, 0, marker.Length);
+                }
+                var updatedHash = ImageHash(portable);
+                Require(!updatedHash.SequenceEqual(ImageHash(installed)), "The incoming build must differ from the running one");
+                Require(Cli(portable, "toggle", desktop) == "off", "Replacement should forward the original CLI command once");
+                uint exitCode;
+                Require(original.WaitForExit(5000) && GetExitCodeProcess(incumbent, out exitCode) && exitCode == 0,
+                    "The incumbent did not shut down cleanly for replacement");
+                using (var updated = InstalledOwner(installed, desktop)) {
+                    Require(updated.Id != original.Id && updatedHash.SequenceEqual(ImageHash(installed)),
+                        "The new owner must run the supplied image even for an identical version");
+                    Require(Cli(installed, "mosaic status", desktop) == "off", "Updated owner did not retain the command result");
+                    Require(Cli(installed, "enable", desktop) == "on", "Updated owner must serve subsequent CLI commands");
+                }
+            }
+            // A well-formed command that fails in the manager must preserve stderr and a failing exit code across handoff.
+            var desktopError = Cli(installed, "desktop current", desktop, false);
+            Require(Cli(portable, "desktop current", desktop, false) == desktopError, "External CLI handoff lost the manager's error");
+            Cli(installed, "quit", desktop);
+        } finally { ReapTestOwner(installed); }
+        Console.WriteLine("PASS  Outside GUI launch installs and starts the canonical owner; same-version replacement forwards CLI output and errors");
     }
     static void VerifyCli(string rustile, string desktop, List<Child> children, IntPtr[] windows,
         Rectangle[] originals, Rectangle area) {
@@ -2224,7 +2278,7 @@ internal static class DesktopSmoke {
         Console.WriteLine("PASS  Tray language choice updates open editors and preserves drafts, English keys and CLI; manual and system choices survive restart");
     }
 
-    static void Run(string rustile, string managerTests, string locales) {
+    static void Run(string portable, string managerTests, string locales) {
         LoadCatalog(locales);
         var desktopName = "rustile-smoke-" + Guid.NewGuid().ToString("N");
         var originalDesktop = GetThreadDesktop(GetCurrentThreadId());
@@ -2233,14 +2287,20 @@ internal static class DesktopSmoke {
         if (desktop == IntPtr.Zero) throw new Win32Exception();
         var children = new List<Child>();
         var oldAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
-        var appData = Path.Combine(Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName), "local-appdata");
+        var testDir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
+        var appData = Path.Combine(testDir, "local-appdata");
+        var programFiles = Path.Combine(testDir, "Program Files");
+        var rustile = Path.Combine(programFiles, "CKATEPTb", "Rustile", "rustile.exe");
         bool ownsShortcut = false;
         const int fixtureShortcut = 0x5119;
         try {
             if (!SetThreadDesktop(desktop)) throw new Win32Exception();
             Directory.CreateDirectory(appData);
+            Directory.CreateDirectory(programFiles);
             Environment.SetEnvironmentVariable("LOCALAPPDATA", appData, EnvironmentVariableTarget.Process);
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_DESKTOP", desktopName);
+            Environment.SetEnvironmentVariable("RUSTILE_FIXTURE_PROGRAM_FILES", programFiles);
+            VerifyInstallation(portable, rustile, desktopName);
             using (var keys = new Child(managerTests, "--exact runtime::tests::isolated_shortcut_ownership --ignored --nocapture", desktopName, false, true)) {
                 Require(keys.Exited(10000) && keys.ExitCode == 0, "Shortcut callback ownership test failed on the empty private desktop");
                 languageIndex = Array.FindIndex(Catalog["UiShortcutTitle"], title => keys.Output.Contains("RUSTILE_TEST_UI=" + title));

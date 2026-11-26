@@ -89,7 +89,32 @@ pub(super) fn launch_background() -> Result<OwnedHandle, String> {
     Ok(unsafe { OwnedHandle::from_raw_handle(child.hProcess) })
 }
 
-pub(super) struct Instance(OwnedHandle);
+pub(crate) struct Instance(OwnedHandle);
+
+// Keep independent external launches from replacing the owner midway through
+// each other's handoff. Installed CLI clients still reach the owner directly.
+pub(crate) fn installation_lock() -> Result<Instance, String> {
+    let mut key = name()?;
+    key.pop();
+    key.extend(".Install".encode_utf16().chain([0]));
+    let raw = unsafe {
+        CreateMutexExW(
+            null(),
+            key.as_ptr(),
+            0,
+            SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+        )
+    };
+    if raw.is_null() {
+        return Err(cli_error::io(io::Error::last_os_error()));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 120_000) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Instance(handle)),
+        WAIT_TIMEOUT => Err("Timed out waiting for another Rustile installation.".into()),
+        _ => Err(cli_error::io(io::Error::last_os_error())),
+    }
+}
 
 impl Instance {
     pub(super) fn acquire() -> Result<Option<Self>, String> {

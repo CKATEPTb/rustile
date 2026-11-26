@@ -14,7 +14,9 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::{
-            ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+            ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SHARING_VIOLATION, GENERIC_ALL,
+            GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
         },
         Security::{self, Authorization::*},
         Storage::FileSystem::*,
@@ -32,15 +34,7 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-pub(super) fn exe_path(sid: &str) -> Result<PathBuf, String> {
-    let fields = sid.strip_prefix("S-1-").ok_or(tr(Msg::SystemBadSid))?;
-    if sid.len() > 184
-        || !fields
-            .split('-')
-            .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return Err(tr(Msg::SystemBadSid).into());
-    }
+fn program_files() -> Result<PathBuf, String> {
     let mut name = null_mut();
     let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, null_mut(), &mut name) };
     if hr < 0 {
@@ -63,7 +57,29 @@ pub(super) fn exe_path(sid: &str) -> Result<PathBuf, String> {
     {
         return Err(tr(Msg::SystemLocalFolder).into());
     }
-    Ok(dir.join("Rustile").join(sid).join("rustile.exe"))
+    Ok(dir)
+}
+
+pub(crate) fn installed_exe() -> Result<PathBuf, String> {
+    Ok(program_files()?
+        .join("CKATEPTb")
+        .join("Rustile")
+        .join("rustile.exe"))
+}
+
+pub(super) fn legacy_exe(sid: &str) -> Result<PathBuf, String> {
+    let fields = sid.strip_prefix("S-1-").ok_or(tr(Msg::SystemBadSid))?;
+    if sid.len() > 184
+        || !fields
+            .split('-')
+            .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(tr(Msg::SystemBadSid).into());
+    }
+    Ok(program_files()?
+        .join("Rustile")
+        .join(sid)
+        .join("rustile.exe"))
 }
 
 struct Local(*mut c_void);
@@ -210,9 +226,92 @@ fn is_running_image(source: &File) -> io::Result<bool> {
     }
 }
 
+fn rename_posix(staging: &Path, exe: &Path) -> io::Result<()> {
+    const REPLACE_IF_EXISTS: u32 = 0x1;
+    const POSIX_SEMANTICS: u32 = 0x2;
+    let name = wide(exe);
+    let bytes = size_of::<FILE_RENAME_INFO>() + size_of_val(name.as_slice());
+    let mut buffer = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let file = OpenOptions::new().access_mode(DELETE).open(staging)?;
+    unsafe {
+        (*rename).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+        (*rename).FileNameLength = ((name.len() - 1) * size_of::<u16>()) as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (&raw mut (*rename).FileName).cast::<u16>(),
+            name.len(),
+        );
+        if SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfoEx,
+            rename.cast(),
+            bytes as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Publish a complete stage without ever unlinking the installed name first.
+pub(crate) fn replace_staged_exe(staging: &Path, exe: &Path) -> io::Result<()> {
+    match rename_posix(staging, exe) {
+        Err(e)
+            if matches!(
+                e.raw_os_error().map(|s| s as u32),
+                Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+            ) =>
+        {
+            // Windows refuses to unlink the *last* name of an executing image.
+            // Keep a second link until its section closes. New opens see the
+            // replacement atomically while the original process keeps running.
+            let mut sequence = 0u32;
+            let old = loop {
+                let old =
+                    exe.with_file_name(format!("{}.{}.retired", std::process::id(), sequence));
+                match fs::hard_link(exe, &old) {
+                    Ok(()) => break old,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => sequence += 1,
+                    Err(_) => return Err(e),
+                }
+            };
+            let published = rename_posix(staging, exe);
+            let _ = fs::remove_file(old);
+            published
+        }
+        Err(e)
+            if matches!(
+                e.raw_os_error().map(|s| s as u32),
+                Some(ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+            ) =>
+        {
+            if unsafe {
+                MoveFileExW(
+                    wide(staging).as_ptr(),
+                    wide(exe).as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn retired_owner(name: &str) -> Option<u32> {
+    let (pid, sequence) = name.strip_suffix(".retired")?.split_once('.')?;
+    sequence.parse::<u32>().ok()?;
+    pid.parse().ok()
+}
+
 fn install_at(exe: &Path) -> io::Result<()> {
-    let user_dir = exe.parent().unwrap();
-    let root = user_dir.parent().unwrap();
+    let install_dir = exe.parent().unwrap();
+    let root = install_dir.parent().unwrap();
     let program_files = root.parent().unwrap();
     let mut installer = null_mut();
     // The Windows servicing account normally owns Program Files.
@@ -238,32 +337,53 @@ fn install_at(exe: &Path) -> io::Result<()> {
         "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)"
     ))?;
     secure_directory(root, &dir_sd, &installer)?;
-    secure_directory(user_dir, &dir_sd, &installer)?;
-    // The scheduler also uses this directory as its working directory. It
-    // contains only our executable and possibly an interrupted staged copy.
-    let staging = user_dir.join(format!("{}.pending", std::process::id()));
-    for entry in fs::read_dir(user_dir)? {
+    secure_directory(install_dir, &dir_sd, &installer)?;
+    // The scheduler uses this directory as its working directory. Accept
+    // only our executable, stages, and previous image links.
+    let staging = install_dir.join(format!("{}.pending", std::process::id()));
+    for entry in fs::read_dir(install_dir)? {
         let path = entry?.path();
-        let pending_pid = path
+        let name = path
             .file_name()
             .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_suffix(".pending"))
+            .unwrap_or_default();
+        let pending_pid = name
+            .strip_suffix(".pending")
             .and_then(|s| s.parse::<u32>().ok());
-        if path != exe && pending_pid.is_none() {
+        let retired = retired_owner(name);
+        if !path.as_os_str().eq_ignore_ascii_case(exe.as_os_str())
+            && pending_pid.is_none()
+            && retired.is_none()
+        {
             return Err(denied());
         }
-        check_path(&path, false, false, &installer)?;
+        if let Err(error) = check_path(&path, false, false, &installer)
+            && !((pending_pid.is_some() || retired.is_some())
+                && error.kind() == io::ErrorKind::NotFound)
+        {
+            return Err(error);
+        }
+        // A live publisher needs its link until the stage takes the target
+        // name. An older process can still be mapped; retry cleanup next time.
+        if let Some(pid) = retired
+            && !install_dir.join(format!("{pid}.pending")).try_exists()?
+        {
+            let _ = fs::remove_file(path);
+        }
     }
+    let source_path = std::env::current_exe()?;
     let mut source = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
-        .open(std::env::current_exe()?)?;
+        .open(&source_path)?;
     if !is_running_image(&source)? {
         return Err(denied());
     }
-    if let Ok(existing) = File::open(exe)
-        && is_running_image(&existing)?
+    if source_path
+        .as_os_str()
+        .eq_ignore_ascii_case(exe.as_os_str())
     {
+        // The immutable source handle already matched the loaded image.
         return Ok(());
     }
 
@@ -278,7 +398,7 @@ fn install_at(exe: &Path) -> io::Result<()> {
         CreateFileW(
             wide(&staging).as_ptr(),
             GENERIC_WRITE,
-            0,
+            FILE_SHARE_READ,
             &attributes(&file_sd),
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
@@ -291,20 +411,11 @@ fn install_at(exe: &Path) -> io::Result<()> {
     let mut staged = unsafe { File::from_raw_handle(temp) };
     let result = (|| {
         io::copy(&mut source, &mut staged)?;
+        drop(source);
         staged.sync_all()?;
         drop(staged);
         check_path(&staging, false, false, &installer)?;
-        if unsafe {
-            MoveFileExW(
-                wide(&staging).as_ptr(),
-                wide(exe).as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        replace_staged_exe(&staging, exe)
     })();
     if result.is_err() {
         let _ = fs::remove_file(staging);
@@ -312,9 +423,14 @@ fn install_at(exe: &Path) -> io::Result<()> {
     result
 }
 
-pub(super) fn install(sid: &str) -> Result<(), String> {
-    let exe = exe_path(sid)?;
-    install_at(&exe).map_err(|e| render(Msg::SystemInstallProtected, &[("detail", &e.to_string())]))
+pub(crate) fn install_current_exe() -> Result<(), String> {
+    let exe = installed_exe()?;
+    install_at(&exe).map_err(|e| {
+        render(
+            Msg::SystemInstallProtected,
+            &[("detail", &format!("{}: {e}", exe.display()))],
+        )
+    })
 }
 
 #[cfg(test)]
@@ -330,8 +446,73 @@ mod tests {
             )
             .unwrap()
         );
-        assert!(exe_path(r"S-1-5-21\..\other").is_err());
-        let exe = exe_path("S-1-5-21-1-2-3-1001").unwrap();
+        assert!(legacy_exe(r"S-1-5-21\..\other").is_err());
+        let exe = legacy_exe("S-1-5-21-1-2-3-1001").unwrap();
         assert!(exe.ends_with(r"Rustile\S-1-5-21-1-2-3-1001\rustile.exe"));
+        assert!(
+            installed_exe()
+                .unwrap()
+                .ends_with(r"CKATEPTb\Rustile\rustile.exe")
+        );
+    }
+
+    #[test]
+    fn atomic_publication_replaces_a_running_executable() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rustile-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("running.exe");
+        let stage = dir.join("staged");
+        fs::write(&stage, b"first image").unwrap();
+        replace_staged_exe(&stage, &target).unwrap();
+        fs::write(&stage, b"replacement").unwrap();
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&stage)
+            .unwrap();
+        assert!(replace_staged_exe(&stage, &target).is_err());
+        drop(exclusive);
+        assert_eq!(fs::read(&target).unwrap(), b"first image");
+        assert_eq!(fs::read(&stage).unwrap(), b"replacement");
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        fs::copy(system.join(r"System32\findstr.exe"), &target).unwrap();
+        let mut child = Command::new(&target)
+            .arg("Rustile")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        fs::write(&stage, b"next image").unwrap();
+        let published = replace_staged_exe(&stage, &target);
+        let running = child.try_wait().unwrap().is_none();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let contents = fs::read(&target).unwrap();
+        if stage.exists() {
+            fs::remove_file(stage).unwrap();
+        }
+        fs::remove_file(target).unwrap();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            assert!(retired_owner(entry.file_name().to_str().unwrap()).is_some());
+            fs::remove_file(entry.path()).unwrap();
+        }
+        fs::remove_dir(dir).unwrap();
+        published.unwrap();
+        assert!(running);
+        assert_eq!(contents, b"next image");
     }
 }

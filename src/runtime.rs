@@ -2,7 +2,9 @@ mod cli_commands;
 mod desktop_watch;
 mod dynamic_desktops;
 mod instance;
+pub(crate) use instance::installation_lock;
 mod ipc;
+pub(crate) use ipc::{InstallOwner, owner_image, quit_owner};
 mod shortcuts;
 #[cfg(test)]
 mod tests;
@@ -1110,6 +1112,14 @@ fn pump(
             drag_timer.schedule(32);
         }
     }
+}
+
+pub(crate) fn stop_for_update() -> Result<bool, String> {
+    let running = instance::Instance::running()?;
+    if running {
+        ipc::send(&cli::Command::Quit.to_wire(), false, true)?;
+    }
+    Ok(running)
 }
 
 pub(crate) fn run_with_args(args: &[String], from_terminal: bool) -> Result<(), String> {

@@ -6,6 +6,8 @@ mod cli_error;
 mod hud;
 #[cfg(windows)]
 mod i18n;
+#[cfg(windows)]
+mod install;
 #[cfg(any(windows, test))]
 mod layout;
 #[cfg(windows)]
@@ -61,14 +63,20 @@ fn main() -> std::process::ExitCode {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let from_terminal = launched_from_terminal();
+    if let Some(exit) = install::handle_helper(&args) {
+        return exit;
+    }
     if let Some(exit) = startup::consent::handle_helper(&args) {
         return exit;
     }
     native::init_dpi();
-    match runtime::run_with_args(&args, from_terminal) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+    match install::launch(&args, from_terminal) {
+        Ok(code) => code,
         Err(message) => {
             eprintln!("Rustile: {message}");
+            if !from_terminal {
+                runtime::show_error(&message);
+            }
             std::process::ExitCode::FAILURE
         }
     }

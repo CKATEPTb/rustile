@@ -24,7 +24,7 @@ use windows_sys::Win32::{
             SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
             ShellExecuteExW,
         },
-        WindowsAndMessaging::SW_SHOWNORMAL,
+        WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL},
     },
 };
 use windows_sys::core::w;
@@ -43,7 +43,7 @@ fn token() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-pub(super) fn sid() -> Result<String, String> {
+pub(crate) fn sid() -> Result<String, String> {
     let token = token().map_err(|e| e.to_string())?;
     let mut bytes = 0;
     unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut bytes) };
@@ -76,7 +76,7 @@ pub(super) fn sid() -> Result<String, String> {
     }
 }
 
-fn elevated() -> Result<bool, String> {
+pub(crate) fn elevated() -> Result<bool, String> {
     let token = token().map_err(|e| e.to_string())?;
     let mut info = TOKEN_ELEVATION::default();
     let mut bytes = 0;
@@ -97,7 +97,7 @@ fn elevated() -> Result<bool, String> {
 
 fn change_task(enable: bool, sid: &str) -> Result<(), String> {
     if enable {
-        protected::install(sid)?;
+        protected::install_current_exe()?;
         scheduler::install(sid)
     } else {
         scheduler::remove(sid)
@@ -140,17 +140,25 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
         change_task(enable, &sid)?;
         return Ok(true);
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let file: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
     let flag = if enable { ENABLE } else { DISABLE };
     // Both sides use this executable. Pass the selected catalog so any Rustile
     // diagnostic in the elevated process follows the language of the tray.
     let language = i18n::current() as usize;
-    let params: Vec<_> = format!("{flag} {sid} {language}")
-        .encode_utf16()
-        .chain([0])
-        .collect();
-    // Called from a dedicated worker; ShellExecute can require an STA.
+    match run_elevated(&format!("{flag} {sid} {language}"), false)? {
+        Some(0) => Ok(true),
+        Some(n) if n == u32::from(ACCOUNT_MISMATCH) => Err(tr(Msg::SystemSameAdmin).into()),
+        None | Some(1) => Ok(false),
+        Some(exit) => Err(render(
+            Msg::SystemSetupStopped,
+            &[("detail", &exit.to_string())],
+        )),
+    }
+}
+
+pub(crate) fn run_elevated(parameters: &str, hidden: bool) -> Result<Option<u32>, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let file: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let params: Vec<_> = parameters.encode_utf16().chain([0]).collect();
     let apartment = unsafe {
         CoInitializeEx(
             null(),
@@ -169,14 +177,14 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
         lpVerb: w!("runas"),
         lpFile: file.as_ptr(),
         lpParameters: params.as_ptr(),
-        nShow: SW_SHOWNORMAL,
+        nShow: if hidden { SW_HIDE } else { SW_SHOWNORMAL },
         ..Default::default()
     };
     let err = (unsafe { ShellExecuteExW(&mut launch) } == 0).then(io::Error::last_os_error);
     unsafe { CoUninitialize() };
     if let Some(err) = err {
         return if err.raw_os_error() == Some(ERROR_CANCELLED as i32) {
-            Ok(false)
+            Ok(None)
         } else {
             Err(render(
                 Msg::SystemAdminRequest,
@@ -194,14 +202,5 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
     {
         return Err(io::Error::last_os_error().to_string());
     }
-    match exit {
-        0 => Ok(true),
-        n if n == u32::from(ACCOUNT_MISMATCH) => Err(tr(Msg::SystemSameAdmin).into()),
-        // The helper displays the specific installation or scheduler error.
-        1 => Ok(false),
-        _ => Err(render(
-            Msg::SystemSetupStopped,
-            &[("detail", &exit.to_string())],
-        )),
-    }
+    Ok(Some(exit))
 }

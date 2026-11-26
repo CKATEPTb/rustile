@@ -1,13 +1,22 @@
-param([string]$Binary = (Join-Path $PSScriptRoot '../target/release/rustile.exe'))
+[CmdletBinding()]
+param()
 $ErrorActionPreference = 'Stop'
-$binaryPath = (Get-Item -LiteralPath $Binary).FullName
 $manifest = Join-Path $PSScriptRoot '../Cargo.toml'
+# Build the desktop-restricted fixture separately from the production executable.
+$fixtureTarget = Join-Path $PSScriptRoot '../target/installation-smoke'
+$artifacts = & cargo build --manifest-path $manifest --bin rustile --release --locked --features installation-fixture --target-dir $fixtureTarget --message-format=json
+if ($LASTEXITCODE -ne 0) { throw 'Unable to build the installation fixture.' }
+$binaryPath = ($artifacts | ForEach-Object { $_ | ConvertFrom-Json } |
+    Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'rustile' -and $_.executable }).executable
+if (-not $binaryPath) { throw 'Missing installation fixture.' }
 $artifacts = & cargo test --manifest-path $manifest --bin rustile --locked --no-run --message-format=json
 if ($LASTEXITCODE -ne 0) { throw 'Unable to build the Manager geometry test.' }
 $managerTests = ($artifacts | ForEach-Object { $_ | ConvertFrom-Json } |
     Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'rustile' }).executable
 if (-not $managerTests) { throw 'Missing Manager test binary.' }
-$testDir = Join-Path ([IO.Path]::GetTempPath()) ('rustile-smoke-' + [Guid]::NewGuid())
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+$testName = 'rustile-smoke-' + [Guid]::NewGuid()
+$testDir = Join-Path $tempRoot $testName
 $testExe = Join-Path $testDir 'desktop-smoke.exe'
 $appDir = Join-Path $testDir 'portable'
 $portableExe = Join-Path $appDir 'rustile.exe'
@@ -21,14 +30,10 @@ try {
     & $testExe $portableExe $managerTests (Join-Path $PSScriptRoot '../locales')
     if ($LASTEXITCODE -ne 0) { throw 'The isolated desktop smoke test failed.' }
 } finally {
-    $localAppData = Join-Path $testDir 'local-appdata'
-    $settingsDir = Join-Path $localAppData 'Rustile'
-    $settings = Join-Path $settingsDir 'settings.toml'
-    if (Test-Path -LiteralPath $settings) { Remove-Item -LiteralPath $settings }
-    if (Test-Path -LiteralPath $settingsDir) { Remove-Item -LiteralPath $settingsDir }
-    if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData }
-    if (Test-Path -LiteralPath $testExe) { Remove-Item -LiteralPath $testExe }
-    if (Test-Path -LiteralPath $portableExe) { Remove-Item -LiteralPath $portableExe }
-    if (Test-Path -LiteralPath $appDir) { Remove-Item -LiteralPath $appDir }
-    Remove-Item -LiteralPath $testDir
+    $resolved = Get-Item -LiteralPath $testDir
+    if ($resolved.Parent.FullName -ne $tempRoot -or $resolved.Name -ne $testName -or
+        ($resolved.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Unexpected fixture directory during cleanup.'
+    }
+    Remove-Item -LiteralPath $resolved.FullName -Recurse -Force
 }

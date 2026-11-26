@@ -2,6 +2,10 @@ pub(crate) mod consent;
 mod protected;
 mod scheduler;
 
+#[cfg(feature = "installation-fixture")]
+pub(crate) use protected::replace_staged_exe;
+pub(crate) use protected::{install_current_exe, installed_exe};
+
 use crate::i18n::{Msg, render, tr};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -10,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS},
+    Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+        ERROR_UNSUPPORTED_TYPE,
+    },
     System::Registry::{
         HKEY_CURRENT_USER, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
         RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
@@ -110,7 +117,13 @@ fn decode(value: &[u16], exe: &Path) -> Result<Entry, String> {
     Ok(Entry { path: stored, flag })
 }
 
-fn registration(subkey: PCWSTR, exe: &Path) -> Result<Option<Entry>, String> {
+enum RunValue {
+    Missing,
+    Command(Vec<u16>),
+    Foreign,
+}
+
+fn run_value(subkey: PCWSTR) -> Result<RunValue, String> {
     let mut data = [0u16; COMMAND_LIMIT + 1];
     let mut bytes = size_of_val(&data) as u32;
     let status = unsafe {
@@ -125,17 +138,27 @@ fn registration(subkey: PCWSTR, exe: &Path) -> Result<Option<Entry>, String> {
         )
     };
     if missing(status) {
-        return Ok(None);
+        return Ok(RunValue::Missing);
+    }
+    if matches!(status, ERROR_MORE_DATA | ERROR_UNSUPPORTED_TYPE) {
+        return Ok(RunValue::Foreign);
     }
     if status != ERROR_SUCCESS {
         return Err(registry_error(status));
     }
     let value = &data[..bytes as usize / 2];
-    decode(
-        value.strip_suffix(&[0]).ok_or(tr(Msg::SystemOccupied))?,
-        exe,
-    )
-    .map(Some)
+    Ok(match value.strip_suffix(&[0]) {
+        Some(command) => RunValue::Command(command.to_vec()),
+        None => RunValue::Foreign,
+    })
+}
+
+fn registration(subkey: PCWSTR, exe: &Path) -> Result<Option<Entry>, String> {
+    match run_value(subkey)? {
+        RunValue::Command(data) => decode(&data, exe).map(Some),
+        RunValue::Missing => Ok(None),
+        RunValue::Foreign => Err(tr(Msg::SystemOccupied).into()),
+    }
 }
 
 // Explorer can independently disable a Run entry in Task Manager. Only read
@@ -171,22 +194,41 @@ struct RunRegistration {
 }
 
 impl RunRegistration {
-    fn for_user(sid: &str) -> Result<Self, String> {
+    fn for_user() -> Result<Self, String> {
         Ok(Self {
             run: RUN,
             approval: APPROVAL,
             exe: current_exe()?,
-            protected: protected::exe_path(sid)?,
+            protected: installed_exe()?,
         })
     }
 
     fn owned(&self, entry: &Entry) -> bool {
         let eq = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
-        // decode already verified the executable's name. The protected copy
-        // also manages the ordinary registration of the portable Rustile.
-        eq(&entry.path, &self.exe)
-            || eq(&entry.path, &self.protected)
-            || eq(&self.exe, &self.protected)
+        eq(&entry.path, &self.exe) || eq(&entry.path, &self.protected)
+    }
+
+    fn migrate(&self, source: &Path, legacy: &Path) -> Result<(), String> {
+        let RunValue::Command(raw) = run_value(self.run)? else {
+            return Ok(());
+        };
+        for path in [source, legacy] {
+            if let Ok(entry) = decode(&raw, path)
+                && entry
+                    .path
+                    .as_os_str()
+                    .eq_ignore_ascii_case(path.as_os_str())
+            {
+                // Keep StartupApproved untouched, including an explicit
+                // disable in Task Manager. Only the command path changes.
+                let next = Entry {
+                    path: self.protected.clone(),
+                    flag: STARTUP_FLAG,
+                };
+                return self.replace(Some(&entry), Some(&next));
+            }
+        }
+        Ok(())
     }
 
     fn read(&self, elevated: bool) -> Result<Startup, String> {
@@ -207,7 +249,8 @@ impl RunRegistration {
         }
         // A second copy or Windows Settings can change the value during UAC.
         // Avoid deleting or rolling back another writer's choice.
-        if registration(self.run, &self.exe)?.as_ref() != previous {
+        let expected_exe = previous.map_or(self.exe.as_path(), |entry| entry.path.as_path());
+        if registration(self.run, expected_exe)?.as_ref() != previous {
             return Err(tr(Msg::SystemStartupChanged).into());
         }
         let data = next.map(command).transpose()?;
@@ -313,6 +356,14 @@ impl RunRegistration {
     }
 }
 
+pub(crate) fn migrate_user_startup(source: &Path) -> Result<(), String> {
+    RunRegistration::for_user()?.migrate(source, &protected::legacy_exe(&consent::sid()?)?)
+}
+
+pub(crate) fn migrate_elevated_startup() -> Result<(), String> {
+    scheduler::migrate(&consent::sid()?)
+}
+
 fn task_installed(sid: &str) -> Result<bool, String> {
     #[cfg(test)]
     if let Some(mock) = SMOKE_TASK.get() {
@@ -338,12 +389,12 @@ fn configure_task(enable: bool) -> Result<bool, String> {
 impl Startup {
     pub fn read() -> Result<Self, String> {
         let sid = consent::sid()?;
-        RunRegistration::for_user(&sid)?.read(task_installed(&sid)?)
+        RunRegistration::for_user()?.read(task_installed(&sid)?)
     }
 
     pub fn apply(self) -> Result<Self, String> {
         let sid = consent::sid()?;
-        RunRegistration::for_user(&sid)?.change(self, || task_installed(&sid), configure_task)
+        RunRegistration::for_user()?.change(self, || task_installed(&sid), configure_task)
     }
 }
 
@@ -351,7 +402,7 @@ impl Startup {
 /// calls runas. A task launches the protected executable without this flag.
 pub(crate) fn run_at_logon() -> Result<bool, String> {
     let sid = consent::sid()?;
-    if RunRegistration::for_user(&sid)?.read(false)? != Startup::Normal {
+    if RunRegistration::for_user()?.read(false)? != Startup::Normal {
         return Ok(false);
     }
     // A disabled or unavailable Task Scheduler must not prevent an ordinary
@@ -531,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_copy_and_project_manage_the_same_startup_after_downgrade() {
+    fn migration_preserves_an_existing_normal_entry_and_ignores_other_copies() {
         let run = TestKey::new("Run");
         let approval = TestKey::new("Approval");
         let project = fixture(&run, &approval, r"C:\Work\rustile.exe");
@@ -539,6 +590,12 @@ mod tests {
         protected.exe = project.protected.clone();
         let tasks = Tasks::new();
         tasks.apply(&project, Startup::Normal).unwrap();
+        assert_eq!(protected.read(false).unwrap(), Startup::Off);
+        protected
+            .migrate(Path::new(r"C:\other\rustile.exe"), &protected.exe)
+            .unwrap();
+        assert_eq!(protected.read(false).unwrap(), Startup::Off);
+        protected.migrate(&project.exe, &protected.exe).unwrap();
         assert_eq!(protected.read(false).unwrap(), Startup::Normal);
         tasks.apply(&project, Startup::Elevated).unwrap();
         tasks.apply(&protected, Startup::Normal).unwrap();
@@ -606,6 +663,12 @@ mod tests {
             tr(Msg::SystemEnableStartup)
         );
         assert_eq!(tasks.calls.get(), 0);
+        store.migrate(&store.exe, &store.protected).unwrap();
+        assert_eq!(
+            registration(run.ptr(), &store.exe).unwrap().unwrap().path,
+            store.protected
+        );
+        assert_eq!(store.read(false).unwrap(), Startup::Off);
         unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, approval.ptr(), NAME) };
         assert_eq!(store.read(false).unwrap(), Startup::Normal);
     }
