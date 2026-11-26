@@ -24,7 +24,8 @@ pub(super) struct Section {
     pub(super) actions: Vec<ActionLines>,
 }
 
-pub(super) struct Placement {
+#[derive(PartialEq, Eq)]
+pub(in crate::tray::shortcut_window) struct Placement {
     pub(super) hwnd: HWND,
     pub(super) x: i32,
     pub(super) y: i32,

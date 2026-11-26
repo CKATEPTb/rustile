@@ -2,8 +2,88 @@ use super::*;
 
 impl ShortcutWindow {
     pub(super) fn draw(&self, item: &DRAWITEMSTRUCT) {
+        let mut cursor = POINT::default();
+        let hovered = item.CtlType == ODT_BUTTON
+            && item.itemState & ODS_DISABLED == 0
+            && unsafe {
+                GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == item.hwndItem
+            };
+        self.draw_cached(item, hovered);
+    }
+
+    pub(super) fn draw_cached(&self, item: &DRAWITEMSTRUCT, hovered: bool) {
         let fonts = self.fonts.borrow();
         let Some(fonts) = fonts.as_ref() else { return };
+        let id = item.CtlID as i32;
+        let control = row_control(id);
+        let mut prefix = *item;
+        let mut cache = self.raster.borrow_mut();
+        if (SECTION..SECTION + view::GROUPS.len() as i32).contains(&id) {
+            let section = (id - SECTION) as usize;
+            let title_width = *cache.section_widths[section].get_or_insert_with(|| {
+                self.p(20)
+                    + self.p(7)
+                    + text_width(item.hDC, fonts.heading, view::GROUPS[section].title)
+                    + self.p(12)
+            });
+            // Only the flat divider to the right of the title changes width
+            // during most drags. Keep the icon and title reusable at full size.
+            let r = item.rcItem;
+            let divider = r.left + title_width;
+            if divider < r.right {
+                prefix.rcItem.right = divider;
+                let tail = RECT { left: divider, ..r };
+                let colors = self.colors.get();
+                paint::background(item.hDC, &tail, colors);
+                let y = (r.top + r.bottom) / 2;
+                paint::fill(
+                    item.hDC,
+                    &RECT {
+                        top: y,
+                        bottom: y + self.p(1),
+                        ..tail
+                    },
+                    colors.border,
+                    0,
+                );
+            }
+        }
+
+        // Identical icon buttons share one bitmap per visual state, even when
+        // an action is edited or rows move to a different page.
+        let content = match control {
+            Some((Control::Row, action)) => raster::Content::Binding {
+                hwnd: item.hwndItem,
+                action: action.index(),
+            },
+            Some((Control::Add, _)) => raster::Content::Control(ADD_ROW),
+            Some((Control::Reset, _)) => raster::Content::Control(RESET_ROW),
+            Some((Control::Remove, _)) => raster::Content::Control(REMOVE_ROW),
+            None if id == PAGE_LABEL => {
+                raster::Content::PageNumber(self.page.get(), self.pages.get())
+            }
+            None => raster::Content::Control(id),
+        };
+        let selected =
+            matches!(control, Some((Control::Row, _))) && item.hwndItem == self.selected_row();
+        let mut state = item.itemState & (ODS_SELECTED | ODS_DISABLED | ODS_FOCUS);
+        if item.itemState & ODS_NOFOCUSRECT != 0 {
+            state &= !ODS_FOCUS;
+        }
+        let key = raster::Key {
+            content,
+            state,
+            hovered: hovered && item.itemState & ODS_DISABLED == 0,
+            selected,
+            recording: selected && self.capture.borrow().is_some(),
+        };
+        let draw = |item: &DRAWITEMSTRUCT| self.paint_control(item, fonts, key);
+        if !cache.blit(&prefix, key, draw) {
+            draw(&prefix);
+        }
+    }
+
+    fn paint_control(&self, item: &DRAWITEMSTRUCT, fonts: &Fonts, key: raster::Key) {
         let colors = self.colors.get();
         let dc = item.hDC;
         let r = item.rcItem;
@@ -39,16 +119,11 @@ impl ShortcutWindow {
         let disabled = item.itemState & ODS_DISABLED != 0;
         let pressed = item.itemState & ODS_SELECTED != 0;
         let focused = item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
-        let mut cursor = POINT::default();
-        let hovered = !disabled
-            && unsafe {
-                GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == item.hwndItem
-            };
+        let hovered = key.hovered;
         let control = row_control(id);
-        let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
         let binding = control.and_then(|(kind, action)| (kind == Control::Row).then_some(action));
-        let selected = binding == Some(self.selected.get()) && slot == self.selected_slot.get();
-        let recording = selected && self.capture.borrow().is_some();
+        let selected = key.selected;
+        let recording = key.recording;
         let active = recording || selected || hovered || pressed;
         let mut ink = colors;
         let highlighted = colors.high_contrast && active;
@@ -101,13 +176,12 @@ impl ShortcutWindow {
                 right: panel.right - self.p(2),
                 ..panel
             };
-            let caps = keycaps::Keycaps::new(
-                self,
-                dc,
-                fonts,
-                self.editor_chord(action, slot),
-                keycaps::Size::Row,
-            );
+            let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
+            let row = self.measured_row(dc, fonts, action);
+            let Some(binding) = row.bindings.get(slot) else {
+                return;
+            };
+            let caps = &binding.caps;
             if caps.width() == 0 {
                 paint::text(
                     dc,
@@ -174,44 +248,6 @@ impl ShortcutWindow {
             colors.text,
             DT_END_ELLIPSIS,
         );
-        let left = label.left + text_width(dc, fonts.heading, title) + self.p(12);
-        if left < r.right {
-            let y = (r.top + r.bottom) / 2;
-            paint::fill(
-                dc,
-                &RECT {
-                    left,
-                    top: y,
-                    right: r.right,
-                    bottom: y + self.p(1),
-                },
-                colors.border,
-                0,
-            );
-        }
-    }
-
-    pub(super) fn binding_width(&self, dc: HDC, action: Shortcut, slot: usize) -> i32 {
-        let fonts = self.fonts.borrow();
-        let Some(fonts) = fonts.as_ref() else {
-            return self.p(90);
-        };
-        let recording = self.selected.get() == action
-            && self.selected_slot.get() == slot
-            && self.capture.borrow().is_some();
-        let width = keycaps::Keycaps::new(
-            self,
-            dc,
-            fonts,
-            self.editor_chord(action, slot),
-            keycaps::Size::Row,
-        )
-        .width();
-        if recording || width == 0 {
-            width.max(text_width(dc, fonts.small, placeholder(recording)) + self.p(8)) + self.p(6)
-        } else {
-            width + self.p(6)
-        }
     }
 }
 

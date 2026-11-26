@@ -6,7 +6,11 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 
 use Topic::{Desktops, Resize, Windows};
 
+mod canvas;
 mod pagination;
+mod position;
+pub(super) use canvas::ResizeCanvas;
+pub(super) use pagination::Placement;
 use pagination::{ActionLines, CellPlacement, Grid, Section};
 
 #[derive(Clone, Copy)]
@@ -137,10 +141,17 @@ impl ShortcutWindow {
             w!("STATIC"),
             "",
             VIEW,
-            WS_CLIPCHILDREN,
+            WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             WS_EX_CONTROLPARENT,
         )?;
         unsafe { SetWindowSubclass(view, Some(view_proc), 1, self as *const Self as usize) };
+        let preview = create(hwnd, w!("STATIC"), "", RESIZE_VIEW, WS_CLIPSIBLINGS, 0)?;
+        hide(preview);
+        if unsafe { SetWindowSubclass(preview, Some(resize_proc), 1, self as *const Self as usize) }
+            == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
         let tooltip = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST,
@@ -215,10 +226,13 @@ impl ShortcutWindow {
             }
         }
         *self.fonts.borrow_mut() = Some(ui);
+        self.row_metrics.borrow_mut().fill_with(|| None);
+        self.raster.borrow_mut().clear();
     }
 
     pub(super) fn apply_theme(&self, hwnd: HWND) {
         let palette = Colors::current();
+        self.raster.borrow_mut().clear();
         self.colors.set(palette);
         let dark = i32::from(palette.dark);
         unsafe {
@@ -270,6 +284,32 @@ impl ShortcutWindow {
     }
 
     pub(super) fn layout(&self, hwnd: HWND) {
+        self.layout_editor(hwnd, false);
+    }
+
+    pub(super) fn layout_on_resize(&self, hwnd: HWND) {
+        self.layout_editor(hwnd, true);
+    }
+
+    pub(super) fn finish_resize(&self, hwnd: HWND) {
+        let preview = child(hwnd, RESIZE_VIEW);
+        if !preview.is_null() && unsafe { IsWindowVisible(preview) } != 0 {
+            // The native controls take over at the exact positions in the last frame.
+            self.layout(hwnd);
+            hide(preview);
+            unsafe {
+                RedrawWindow(
+                    hwnd,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+        }
+        self.resize_canvas.take();
+    }
+
+    fn layout_editor(&self, hwnd: HWND, resizing: bool) {
         let mut client = RECT::default();
         unsafe { GetClientRect(hwnd, &mut client) };
         let width = client.right;
@@ -284,19 +324,23 @@ impl ShortcutWindow {
         let button_height = p(32);
         let reset_y = (header_height - button_height) / 2;
         let preview_width = content - reset_width - p(if compact { 10 } else { 20 });
-        place(
+        position::place_header(
+            hwnd,
             child(hwnd, PREVIEW),
             margin,
             0,
             preview_width,
             header_height,
+            false,
         );
-        place(
+        position::place_header(
+            hwnd,
             child(hwnd, RESET_ALL),
             width - margin - reset_width,
             reset_y,
             reset_width,
             button_height,
+            false,
         );
         let mut top = header_height;
         if count > 0 {
@@ -320,7 +364,7 @@ impl ShortcutWindow {
                 ReleaseDC(hwnd, dc);
             }
             let height = bounds.bottom.max(self.p(18));
-            place(status, margin, top + p(4), content, height);
+            position::place_header(hwnd, status, margin, top + p(4), content, height, false);
             top += height + p(12);
         } else {
             hide(status);
@@ -328,55 +372,68 @@ impl ShortcutWindow {
         top += p(1);
         let height = (client.bottom - top).max(1);
         let view = child(hwnd, VIEW);
-        place(view, 0, top, width, height);
-        self.layout_rows(view, width, height, None);
+        if self.sizing.get() {
+            // Windows owns the input during a nonclient drag. Lay out the same
+            // controls into one paint surface until the native buttons take over.
+            let preview = child(hwnd, RESIZE_VIEW);
+            self.layout_rows(view, width, height, None, resizing);
+            unsafe {
+                // The editor clips both sibling surfaces out of its header paint.
+                // Keep the native viewport below the header even when a compact
+                // header change exposes a strip of its old position.
+                let mut old = RECT::default();
+                GetWindowRect(view, &mut old);
+                MapWindowPoints(null_mut(), hwnd, (&raw mut old).cast(), 2);
+                if old.top != top {
+                    SetWindowPos(view, null_mut(), 0, top, 0, 0, LAYOUT_FLAGS | SWP_NOSIZE);
+                }
+                SetWindowPos(
+                    preview,
+                    HWND_TOP,
+                    0,
+                    top,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW,
+                );
+                InvalidateRect(preview, null(), 0);
+                if old.top != top {
+                    let header = RECT {
+                        bottom: top,
+                        ..client
+                    };
+                    RedrawWindow(
+                        hwnd,
+                        &header,
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN,
+                    );
+                }
+            }
+        } else {
+            let same_origin = position::place_header(hwnd, view, 0, top, width, height, true);
+            self.layout_rows(view, width, height, None, resizing && same_origin);
+        }
     }
 
-    fn action_lines(&self, view: HWND, dc: HDC, action: Shortcut, col: i32) -> ActionLines {
+    fn action_lines(&self, dc: HDC, fonts: &Fonts, action: Shortcut, col: i32) -> ActionLines {
         let p = |n| self.p(n);
-        let id = action.index() as i32;
-        let label = child(view, LABEL_ROW + id);
-        let add = child(view, ADD_ROW + id);
-        let reset = child(view, RESET_ROW + id);
+        let row = self.measured_row(dc, fonts, action);
         let tool_width = p(24);
         let text_area = (col - 2 * tool_width - p(4)).max(1);
-        let label_width = self
-            .fonts
-            .borrow()
-            .as_ref()
-            .map_or(p(120), |fonts| {
-                appearance::text_width(dc, fonts.regular, action.label()) + p(3)
-            })
-            .min(text_area);
+        let label_width = row.label_width.min(text_area);
         let header = [
-            CellPlacement::new(label, 0, label_width),
-            CellPlacement::new(add, col - 2 * tool_width, tool_width),
-            CellPlacement::new(reset, col - tool_width, tool_width),
+            CellPlacement::new(row.label, 0, label_width),
+            CellPlacement::new(row.add, col - 2 * tool_width, tool_width),
+            CellPlacement::new(row.reset, col - tool_width, tool_width),
         ];
-        let removable = self.selected.get() == action
-            && self
-                .capture
-                .borrow()
-                .as_ref()
-                .is_some_and(|c| c.original.is_some());
-        let slots = self.slots.borrow()[action.index()].clone();
-        let bindings: Vec<_> = slots
-            .iter()
-            .enumerate()
-            .map(|(i, slot)| {
-                let trash = (removable && i == self.selected_slot.get()).then_some(slot.remove);
-                let width = self
-                    .binding_width(dc, action, i)
-                    .min((col - i32::from(trash.is_some()) * tool_width).max(1));
-                (slot.row, width, trash)
-            })
-            .collect();
+        let total_width = |binding: &keycaps::BindingMetrics| {
+            let trash = i32::from(binding.remove.is_some()) * tool_width;
+            binding.width.min((col - trash).max(1)) + trash
+        };
         let gap = p(6);
-        let bindings_width: i32 = bindings
-            .iter()
-            .map(|&(_, width, trash)| width + i32::from(trash.is_some()) * tool_width)
-            .sum::<i32>()
-            + bindings.len().saturating_sub(1) as i32 * gap;
+        let bindings_width = row.bindings.iter().map(total_width).sum::<i32>()
+            + row.bindings.len().saturating_sub(1) as i32 * gap;
         // Keep complete alternatives together. When they do not fit beside their
         // label, let the entire group use the full column below it.
         let inline = label_width + p(5) + bindings_width <= text_area;
@@ -389,16 +446,17 @@ impl ShortcutWindow {
         if !inline {
             lines.push(Vec::new());
         }
-        for (row, width, trash) in bindings {
-            let total = width + i32::from(trash.is_some()) * tool_width;
+        for binding in &row.bindings {
+            let total = total_width(binding);
+            let width = total - i32::from(binding.remove.is_some()) * tool_width;
             if !inline && x > 0 && x + total > col {
                 lines.push(Vec::new());
                 x = 0;
             }
             let line = lines.last_mut().unwrap();
-            line.push(CellPlacement::new(row, x, width));
+            line.push(CellPlacement::new(binding.row, x, width));
             x += width;
-            if let Some(remove) = trash {
+            if let Some(remove) = binding.remove {
                 line.push(CellPlacement::new(remove, x, tool_width));
                 x += tool_width;
             }
@@ -407,7 +465,14 @@ impl ShortcutWindow {
         ActionLines { header, lines }
     }
 
-    fn layout_rows(&self, view: HWND, width: i32, height: i32, reveal: Option<HWND>) {
+    fn layout_rows(
+        &self,
+        view: HWND,
+        width: i32,
+        height: i32,
+        reveal: Option<HWND>,
+        resizing: bool,
+    ) {
         let editor = self.hwnd.get();
         if editor.is_null() || view.is_null() {
             return;
@@ -423,20 +488,25 @@ impl ShortcutWindow {
         let margin = self.margin(width);
         let gap = p(20);
         let col = ((width - 2 * margin - (columns - 1) as i32 * gap) / columns as i32).max(1);
-        let dc = unsafe { GetDC(view) };
-        let sections: [_; GROUPS.len()] = std::array::from_fn(|i| {
-            let group = &GROUPS[i];
-            Section {
-                heading: child(view, SECTION + i as i32),
-                topic: group.topic.column(),
-                actions: group
-                    .actions
-                    .iter()
-                    .map(|&a| self.action_lines(view, dc, a, col))
-                    .collect(),
-            }
-        });
-        unsafe { ReleaseDC(view, dc) };
+        let sections: [_; GROUPS.len()] = {
+            let fonts = self.fonts.borrow();
+            let Some(fonts) = fonts.as_ref() else { return };
+            let dc = unsafe { GetDC(view) };
+            let sections = std::array::from_fn(|i| {
+                let group = &GROUPS[i];
+                Section {
+                    heading: child(view, SECTION + i as i32),
+                    topic: group.topic.column(),
+                    actions: group
+                        .actions
+                        .iter()
+                        .map(|&a| self.action_lines(dc, fonts, a, col))
+                        .collect(),
+                }
+            });
+            unsafe { ReleaseDC(view, dc) };
+            sections
+        };
         let grid = Grid {
             columns,
             margin,
@@ -463,8 +533,8 @@ impl ShortcutWindow {
             })
             .unwrap_or_else(|| self.page.get())
             .min(pages.len() - 1);
-        self.page.set(page);
-        self.pages.set(pages.len());
+        let old_page = self.page.replace(page);
+        let old_count = self.pages.replace(pages.len());
         let page_count = pages.len();
         let items = &mut pages[page];
         let prev = child(view, PAGE_PREV);
@@ -494,7 +564,22 @@ impl ShortcutWindow {
                     height: w,
                 });
             }
-            caption(label, &page_text);
+            if !resizing || page != old_page || page_count != old_count {
+                caption(label, &page_text);
+            }
+        }
+        if self.sizing.get() {
+            self.visible_layout.replace(std::mem::take(items));
+            return;
+        }
+        let previous = self.visible_layout.take();
+        if resizing
+            && old_count == page_count
+            && old_page == page
+            && position::resize_visible(view, &previous, items)
+        {
+            self.visible_layout.replace(std::mem::take(items));
+            return;
         }
         // Compute the entire visible set before changing any windows. A page
         // change may hide the currently focused native button.
@@ -519,17 +604,21 @@ impl ShortcutWindow {
             }
             // Focus notifications can re-enter layout. Send them only after
             // applying this page and keep the input session on its own binding.
-            if needs_focus
-                && let Some(target) = recording.or_else(|| {
-                    items
-                        .iter()
-                        .find(|item| {
-                            row_control(GetDlgCtrlID(item.hwnd))
-                                .is_some_and(|(kind, _)| kind == Control::Row)
-                        })
-                        .map(|item| item.hwnd)
+            let target = needs_focus
+                .then(|| {
+                    recording.or_else(|| {
+                        items
+                            .iter()
+                            .find(|item| {
+                                row_control(GetDlgCtrlID(item.hwnd))
+                                    .is_some_and(|(kind, _)| kind == Control::Row)
+                            })
+                            .map(|item| item.hwnd)
+                    })
                 })
-            {
+                .flatten();
+            self.visible_layout.replace(std::mem::take(items));
+            if let Some(target) = target {
                 SetFocus(target);
             }
             // Both containers clip their children. Repaint the final layout as a
@@ -550,7 +639,7 @@ impl ShortcutWindow {
         let view = child(hwnd, VIEW);
         let mut viewport = RECT::default();
         unsafe { GetClientRect(view, &mut viewport) };
-        self.layout_rows(view, viewport.right, viewport.bottom, Some(row));
+        self.layout_rows(view, viewport.right, viewport.bottom, Some(row), false);
     }
 
     pub(super) fn set_page(&self, hwnd: HWND, delta: i32) {
@@ -571,7 +660,13 @@ impl ShortcutWindow {
         if hwnd == self.hwnd.get() {
             paint::fill(dc, &rect, self.header_color(), 0);
             let mut view = RECT::default();
-            if unsafe { GetWindowRect(child(hwnd, VIEW), &mut view) } != 0 {
+            let viewport =
+                if self.sizing.get() && unsafe { IsWindowVisible(child(hwnd, RESIZE_VIEW)) } != 0 {
+                    RESIZE_VIEW
+                } else {
+                    VIEW
+                };
+            if unsafe { GetWindowRect(child(hwnd, viewport), &mut view) } != 0 {
                 unsafe { MapWindowPoints(null_mut(), hwnd, (&raw mut view).cast(), 2) };
                 rect.bottom = view.top;
                 rect.top = rect.bottom - self.p(1);
@@ -614,6 +709,42 @@ fn hide(hwnd: HWND) {
                 0,
                 LAYOUT_FLAGS | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW,
             );
+        }
+    }
+}
+
+unsafe extern "system" fn resize_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    unsafe {
+        let ui = &*(data as *const ShortcutWindow);
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT | WM_PRINTCLIENT => {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = if msg == WM_PAINT {
+                    BeginPaint(hwnd, &mut ps)
+                } else {
+                    wp as HDC
+                };
+                let mut bounds = RECT::default();
+                GetClientRect(hwnd, &mut bounds);
+                canvas::paint(ui, dc, &ui.visible_layout.borrow(), &bounds);
+                if msg == WM_PAINT {
+                    EndPaint(hwnd, &ps);
+                }
+                0
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(resize_proc), id);
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+            _ => DefSubclassProc(hwnd, msg, wp, lp),
         }
     }
 }

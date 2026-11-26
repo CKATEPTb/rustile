@@ -3,6 +3,7 @@ mod capture;
 mod conflict;
 mod header;
 mod keycaps;
+mod raster;
 mod slots;
 mod view;
 
@@ -37,6 +38,7 @@ const PREVIEW: i32 = 511;
 const PAGE_PREV: i32 = 512;
 const PAGE_NEXT: i32 = 513;
 const PAGE_LABEL: i32 = 514;
+const RESIZE_VIEW: i32 = 515;
 const SECTION: i32 = 520;
 const ROW: i32 = 1000;
 const RESET_ROW: i32 = 1100;
@@ -90,6 +92,7 @@ pub(super) struct ShortcutWindow {
     dpi: Cell<u32>,
     settings: RefCell<Settings>,
     slots: RefCell<[Vec<Slot>; Shortcut::ALL.len()]>,
+    row_metrics: RefCell<[Option<keycaps::RowMetrics>; Shortcut::ALL.len()]>,
     tooltip: Cell<HWND>,
     selected_slot: Cell<usize>,
     after_save: Cell<Option<(Shortcut, Chord)>>,
@@ -101,6 +104,10 @@ pub(super) struct ShortcutWindow {
     transfer: Cell<Option<Command>>,
     page: Cell<usize>,
     pages: Cell<usize>,
+    visible_layout: RefCell<Vec<view::Placement>>,
+    sizing: Cell<bool>,
+    resize_canvas: RefCell<view::ResizeCanvas>,
+    raster: RefCell<raster::Cache>,
     colors: Cell<Colors>,
     fonts: RefCell<Option<Fonts>>,
 }
@@ -113,6 +120,7 @@ impl Default for ShortcutWindow {
             dpi: Cell::new(96),
             settings: RefCell::default(),
             slots: RefCell::new(std::array::from_fn(|_| Vec::new())),
+            row_metrics: RefCell::new(std::array::from_fn(|_| None)),
             tooltip: Cell::default(),
             selected_slot: Cell::new(0),
             after_save: Cell::default(),
@@ -124,6 +132,10 @@ impl Default for ShortcutWindow {
             transfer: Cell::default(),
             page: Cell::new(0),
             pages: Cell::new(1),
+            visible_layout: RefCell::default(),
+            sizing: Cell::default(),
+            resize_canvas: RefCell::default(),
+            raster: RefCell::default(),
             colors: Cell::new(Colors::current()),
             fonts: RefCell::default(),
         }
@@ -368,7 +380,10 @@ impl ShortcutWindow {
         if selected && pos >= count {
             self.selected_slot.set(count - 1);
         }
-        if let Err(error) = self.sync_slots(action, count) {
+        let synced = self.sync_slots(action, count);
+        self.row_metrics.borrow_mut()[action.index()] = None;
+        self.raster.borrow_mut().invalidate_action(action);
+        if let Err(error) = synced {
             self.set_status(&error);
             return;
         }
@@ -603,8 +618,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 0
             }
-            WM_SIZE if !child(hwnd, VIEW).is_null() => {
-                ui.layout(hwnd);
+            WM_ENTERSIZEMOVE => {
+                ui.sizing.set(true);
+                0
+            }
+            WM_EXITSIZEMOVE => {
+                ui.sizing.set(false);
+                ui.finish_resize(hwnd);
+                0
+            }
+            WM_SIZE if !child(hwnd, VIEW).is_null() && wp != SIZE_MINIMIZED as usize => {
+                ui.layout_on_resize(hwnd);
                 0
             }
             WM_DPICHANGED => {
@@ -735,12 +759,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_NCDESTROY => {
                 ui.capture.take();
                 ui.slots.borrow_mut().iter_mut().for_each(Vec::clear);
+                ui.row_metrics.borrow_mut().fill_with(|| None);
                 ui.tooltip.set(null_mut());
                 ui.after_save.set(None);
                 ui.selected_slot.set(0);
                 ui.hwnd.set(null_mut());
                 ui.page.set(0);
                 ui.pages.set(1);
+                ui.visible_layout.take();
+                ui.sizing.set(false);
+                ui.resize_canvas.take();
+                ui.raster.borrow_mut().clear();
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }

@@ -188,3 +188,75 @@ impl ShortcutWindow {
             .unwrap_or_default()
     }
 }
+
+pub(super) struct BindingMetrics {
+    pub(super) row: HWND,
+    pub(super) remove: Option<HWND>,
+    pub(super) caps: Keycaps,
+    pub(super) width: i32,
+}
+
+pub(super) struct RowMetrics {
+    pub(super) label: HWND,
+    pub(super) add: HWND,
+    pub(super) reset: HWND,
+    pub(super) label_width: i32,
+    pub(super) bindings: Vec<BindingMetrics>,
+}
+
+impl ShortcutWindow {
+    /// Intrinsic sizes are common to all client widths and both layout and paint.
+    /// A row update or a font change discards the corresponding measurements.
+    pub(super) fn measured_row(
+        &self,
+        dc: HDC,
+        fonts: &Fonts,
+        action: Shortcut,
+    ) -> std::cell::Ref<'_, RowMetrics> {
+        let index = action.index();
+        if self.row_metrics.borrow()[index].is_none() {
+            let assigned = self.settings.borrow().bindings(action);
+            let capture = self.capture.borrow();
+            let bindings = self.slots.borrow()[index]
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let recording = capture
+                        .as_ref()
+                        .filter(|_| self.selected.get() == action && self.selected_slot.get() == i);
+                    let chord = match recording {
+                        Some(rec) => rec.keys.preview(),
+                        None => assigned
+                            .get(i)
+                            .map(|c| (c.mods, Some(c.key)))
+                            .unwrap_or_default(),
+                    };
+                    let caps = Keycaps::new(self, dc, fonts, chord, Size::Row);
+                    let mut width = caps.width();
+                    if recording.is_some() || width == 0 {
+                        let prompt = appearance::placeholder(recording.is_some());
+                        width = width.max(text_width(dc, fonts.small, prompt) + self.p(8));
+                    }
+                    BindingMetrics {
+                        row: slot.row,
+                        remove: recording.and_then(|rec| rec.original).map(|_| slot.remove),
+                        caps,
+                        width: width + self.p(6),
+                    }
+                })
+                .collect();
+            let view = child(self.hwnd.get(), VIEW);
+            let id = index as i32;
+            self.row_metrics.borrow_mut()[index] = Some(RowMetrics {
+                label: child(view, LABEL_ROW + id),
+                add: child(view, ADD_ROW + id),
+                reset: child(view, RESET_ROW + id),
+                label_width: text_width(dc, fonts.regular, action.label()) + self.p(3),
+                bindings,
+            });
+        }
+        std::cell::Ref::map(self.row_metrics.borrow(), |rows| {
+            rows[index].as_ref().unwrap()
+        })
+    }
+}

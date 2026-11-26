@@ -641,7 +641,7 @@ internal static class DesktopSmoke {
             }
         } finally { ReleaseDC(editor, source); }
     }
-    static void VerifyPaintedFrame(IntPtr editor, string transition) {
+    static int[] ReadSettledFrame(IntPtr editor, string transition) {
         // Let naturally queued WM_PAINTs complete before inspecting the frame.
         // GetUpdateRect does not invalidate, validate or render the window.
         Until("Shortcut painting should settle after " + transition, () => {
@@ -653,11 +653,14 @@ internal static class DesktopSmoke {
             return !dirty;
         });
         SendTrayMessage(editor, 0 /* WM_NULL */, IntPtr.Zero, IntPtr.Zero);
-        var before = PaintedPixels(editor);
+        return PaintedPixels(editor);
+    }
+    static void CompareWithNativeRepaint(IntPtr editor, int[] before, string transition) {
         Require(RedrawWindow(editor, IntPtr.Zero, IntPtr.Zero, 0x185 /* INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW */),
             "Could not fully repaint the shortcut editor");
         SendTrayMessage(editor, 0, IntPtr.Zero, IntPtr.Zero);
         var after = PaintedPixels(editor);
+        Require(before.Length == after.Length, "The comparison frames have different sizes after " + transition);
         int changed = 0, content = 0;
         for (int i = 0; i < after.Length; ++i) {
             if (((before[i] ^ after[i]) & 0xffffff) != 0) changed++;
@@ -665,6 +668,24 @@ internal static class DesktopSmoke {
         }
         Require(content > 500, "The client snapshot did not include the shortcut controls after " + transition);
         Require(changed == 0, "A full repaint changed " + changed + " stale pixels after " + transition);
+    }
+    static void VerifyPaintedFrame(IntPtr editor, string transition) {
+        CompareWithNativeRepaint(editor, ReadSettledFrame(editor, transition), transition);
+    }
+    static void VerifyInteractiveResize(IntPtr editor) {
+        int dpi = (int)GetDpiForWindow(editor);
+        foreach (var size in new[] { new Size(1370, 845), new Size(940, 700), new Size(460, 625), new Size(1350, 840) }) {
+            SendTrayMessage(editor, 0x0231 /* WM_ENTERSIZEMOVE */, IntPtr.Zero, IntPtr.Zero);
+            Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, size.Width * dpi / 96, size.Height * dpi / 96, 0x16),
+                "Could not resize inside the sizing loop");
+            string sample = "live resize at " + size;
+            // Allow two display frames at the new size without ending the drag
+            // or asking the editor to paint. Then sample its real client DC.
+            Thread.Sleep(35);
+            var during = ReadSettledFrame(editor, sample);
+            SendTrayMessage(editor, 0x0232 /* WM_EXITSIZEMOVE */, IntPtr.Zero, IntPtr.Zero);
+            CompareWithNativeRepaint(editor, during, sample);
+        }
     }
     static void VerifyShortcutRepaint(IntPtr editor, string file) {
         var original = Bounds(editor);
@@ -681,6 +702,7 @@ internal static class DesktopSmoke {
                 File.ReadAllText(file) != before && IsWindowEnabled(add) && ShortcutLabel(editor, 29).EndsWith(chord));
             VerifyPaintedFrame(editor, "adding " + chord);
         }
+        VerifyInteractiveResize(editor);
         foreach (int width in new[] { 940, 460 }) {
             Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, width * dpi / 96, 650 * dpi / 96, 0x16), "Could not reflow the shortcut editor");
             VerifyPaintedFrame(editor, "narrowing to " + width);
