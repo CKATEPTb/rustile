@@ -116,7 +116,7 @@ impl Default for ShortcutWindow {
             tooltip: Cell::default(),
             selected_slot: Cell::new(0),
             after_save: Cell::default(),
-            selected: Cell::new(Shortcut::MoveLeft),
+            selected: Cell::new(view::GROUPS[0].actions[0]),
             command: Cell::default(),
             saving: Cell::new(false),
             capture: RefCell::default(),
@@ -370,10 +370,7 @@ impl ShortcutWindow {
             legends[pos] = rec.keys.label();
         }
         let slots = self.slots.borrow()[action.index()].clone();
-        let category = view::GROUPS
-            .iter()
-            .find(|(_, actions)| actions.contains(&action))
-            .map_or("", |g| g.0);
+        let category = view::group_title(action);
         let base = format!("{}, {}", action.label(), legends.join(" или "));
         for (i, (&slot, value)) in slots.iter().zip(&legends).enumerate() {
             let detail = format!("{}, {}", action.label(), value);
@@ -414,8 +411,8 @@ impl ShortcutWindow {
     }
 
     fn update_rows(&self) {
-        for (_, actions) in view::GROUPS {
-            for &action in actions {
+        for group in &view::GROUPS {
+            for &action in group.actions {
                 self.update_row(action);
             }
         }

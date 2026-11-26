@@ -72,7 +72,7 @@ shortcuts! {
     QuickReverseDown,      "Сдвинуть от нижнего края",       QuickReverse, VK_DOWN;
     CloseWindow,           "Закрыть окно",                   Window, VK_Q;
     ToggleMaximize,        "Развернуть или восстановить",    Window, VK_F;
-    ToggleMosaic,          "Переключить мозаику",            Window, VK_Y;
+    ToggleMosaic,          "Включить или выключить мозаику", Window, VK_Y;
     PreviousDesktop,       "Предыдущий стол",                Desktop, VK_LEFT;
     NextDesktop,           "Следующий стол",                 Desktop, VK_RIGHT;
     PreviousDesktopAlt,    "Предыдущий стол (вариант 2)",    Desktop, VK_UP;

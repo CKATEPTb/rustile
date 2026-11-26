@@ -81,6 +81,7 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+    [DllImport("user32.dll")] static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
@@ -482,6 +483,12 @@ internal static class DesktopSmoke {
     // former desktop alternative slots no longer have editable rows.
     static readonly int[] RetiredRows = { 17, 18, 32, 33, 34, 35, 48, 49 };
     static readonly int[] EditableRows = Enumerable.Range(0, 50).Except(RetiredRows).ToArray();
+    // Stable action IDs in the order in which a user reads each family.
+    static readonly int[][] ShortcutFamilies = {
+        new[] { 29, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7 },
+        new[] { 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 },
+        new[] { 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 26 }
+    };
     static string[] ShortcutLabels(IntPtr editor) {
         var labels = new string[50];
         foreach (int id in EditableRows) labels[id] = ControlText(EditorControl(editor, 1000 + id));
@@ -553,6 +560,40 @@ internal static class DesktopSmoke {
                 .Any(chord => selected == action + chord);
         }), "The fixed preview must describe the selected action and one of its current alternatives: " + selected);
     }
+    static void VerifyReadingOrder(IntPtr view, int columnCount) {
+        var expected = ShortcutFamilies.SelectMany(family => family).ToArray();
+        var columns = EditableRows.Select(id => new { id, rect = Bounds(GetDlgItem(view, 1000 + id)) })
+            .GroupBy(row => row.rect.Left).OrderBy(column => column.Key)
+            .Select(column => column.OrderBy(row => row.rect.Top).Select(row => row.id).ToArray()).ToArray();
+        Require(columns.Length == columnCount && columns.SelectMany(column => column).SequenceEqual(expected),
+            "Unexpected action order in the " + columnCount + "-column editor");
+        if (columnCount == 3)
+            Require(columns.Select((column, i) => column.SequenceEqual(ShortcutFamilies[i])).All(equal => equal),
+                "Window, desktop and resize actions should each occupy their own column");
+        if (columnCount == 2)
+            Require(columns[1].SequenceEqual(ShortcutFamilies[2]),
+                "Desktop actions should follow window actions on the left, with resize actions on the right");
+
+        var expectedHeadings = new[] {
+            "Управление окнами", "Переключение фокуса", "Перемещение окон", "Смена рабочего стола",
+            "Выбор стола по номеру", "Перенос окна между столами", "Режим изменения размера", "Изменение размера без входа в режим"
+        };
+        var headings = Enumerable.Range(520, expectedHeadings.Length).Select(id => GetDlgItem(view, id))
+            .OrderBy(h => Bounds(h).Left).ThenBy(h => Bounds(h).Top).Select(ControlText);
+        Require(headings.SequenceEqual(expectedHeadings), "Section headings should follow visual reading order");
+    }
+    static void VerifyEditorTabOrder(IntPtr view) {
+        var pencils = new List<int>();
+        var visited = new HashSet<IntPtr>();
+        var control = GetNextDlgTabItem(view, IntPtr.Zero, false);
+        while (control != IntPtr.Zero && visited.Add(control)) {
+            int id = GetDlgCtrlID(control) - 1200;
+            if (id >= 0 && id < 50) pencils.Add(id);
+            control = GetNextDlgTabItem(view, control, false);
+        }
+        Require(pencils.SequenceEqual(ShortcutFamilies.SelectMany(family => family)),
+            "Tab should reach each action's pencil in reading order");
+    }
     static void VerifyEditorLayout(IntPtr editor, Rectangle area) {
         var original = Bounds(editor);
         int dpi = (int)GetDpiForWindow(editor);
@@ -581,7 +622,9 @@ internal static class DesktopSmoke {
                 && edit.Top <= rowMiddle && rowMiddle < edit.Bottom
                 && undo.Top <= rowMiddle && rowMiddle < undo.Bottom, "Edit and reset should sit beside their row: " + label);
         }
+        VerifyEditorTabOrder(view);
         if (area.Width * 96 >= 1260 * dpi && area.Height * 96 >= 910 * dpi) {
+            VerifyReadingOrder(view, 3);
             Require(rows.Select(h => Bounds(h).Left).Distinct().Count() == 3
                 && controls.All(h => Bounds(view).Contains(Bounds(h))),
                 "All shortcut actions should fit in three columns at the default wide size");
@@ -596,8 +639,7 @@ internal static class DesktopSmoke {
             var fixedReset = Bounds(reset);
             Require(fixedPreview.Bottom <= viewport.Top && fixedReset.Bottom <= viewport.Top
                 && IsWindowVisible(reset), "The selected action and reset should sit above the list");
-            Require(rows.Select(h => Bounds(h).Left).Distinct().Count() == (width == 940 ? 2 : 1),
-                "Incorrect column count for an editor " + width + " DIPs wide");
+            VerifyReadingOrder(view, width == 940 ? 2 : 1);
             var reached = new HashSet<int>();
             for (int step = 0; step < 100; ++step) {
                 for (int i = 0; i < rows.Length; ++i)
@@ -971,12 +1013,8 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         VerifyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        var categories = new[] {
-            "Перемещение окон", "Переключение фокуса", "Режим изменения размера", "Изменение размера без входа в режим",
-            "Управление окнами", "Перенос между рабочими столами", "Смена рабочего стола", "Выбор стола по номеру"
-        };
-        Require(Enumerable.Range(520, categories.Length).Select(id => ControlText(GetDlgItem(viewHwnd, id))).SequenceEqual(categories),
-            "Every section should identify the operation it configures");
+        Require(ControlText(EditorControl(editor, 511)) == initial[29],
+            "The first opening should select the mosaic toggle");
         Require(EditableRows.All(id => !String.IsNullOrEmpty(initial[id]))
             && RetiredRows.All(id => GetDlgItem(viewHwnd, 1000 + id) == IntPtr.Zero),
             "Each logical action should appear once, and fixed resize exits must not be editable");

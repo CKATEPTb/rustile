@@ -4,15 +4,78 @@ use Shortcut::*;
 use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
-    ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
-    (
-        "Переключение фокуса",
-        &[FocusLeft, FocusRight, FocusUp, FocusDown],
-    ),
-    (
-        "Режим изменения размера",
-        &[
+use Topic::{Desktops, Resize, Windows};
+
+#[derive(Clone, Copy)]
+enum Topic {
+    Windows,
+    Desktops,
+    Resize,
+}
+
+impl Topic {
+    fn column(self, columns: usize) -> usize {
+        match (columns, self) {
+            (3, Desktops) | (2, Resize) => 1,
+            (3, Resize) => 2,
+            _ => 0,
+        }
+    }
+}
+
+pub(super) struct Group {
+    topic: Topic,
+    pub(super) title: &'static str,
+    pub(super) icon: &'static str,
+    pub(super) actions: &'static [Shortcut],
+}
+
+// Native tab order and the layout both follow this list, top to bottom within each topic.
+pub(super) const GROUPS: [Group; 8] = [
+    Group {
+        topic: Windows,
+        title: "Управление окнами",
+        icon: "\u{e8a9}",
+        actions: &[ToggleMosaic, Shortcut::CloseWindow, ToggleMaximize],
+    },
+    Group {
+        topic: Windows,
+        title: "Переключение фокуса",
+        icon: "\u{e81d}",
+        actions: &[FocusLeft, FocusRight, FocusUp, FocusDown],
+    },
+    Group {
+        topic: Windows,
+        title: "Перемещение окон",
+        icon: "\u{e7c2}",
+        actions: &[MoveLeft, MoveRight, MoveUp, MoveDown],
+    },
+    Group {
+        topic: Desktops,
+        title: "Смена рабочего стола",
+        icon: "\u{e7c4}",
+        actions: &[PreviousDesktop, NextDesktop],
+    },
+    Group {
+        topic: Desktops,
+        title: "Выбор стола по номеру",
+        icon: "\u{ea37}",
+        actions: &[
+            Desktop1, Desktop2, Desktop3, Desktop4, Desktop5, Desktop6, Desktop7, Desktop8,
+            Desktop9, Desktop10,
+        ],
+    },
+    Group {
+        topic: Desktops,
+        title: "Перенос окна между столами",
+        icon: "\u{e8ab}",
+        actions: &[MovePreviousDesktop, MoveNextDesktop],
+    },
+    Group {
+        topic: Resize,
+        title: "Режим изменения размера",
+        icon: "\u{e740}",
+        actions: &[
             StartResize,
             GrowLeft,
             GrowRight,
@@ -23,10 +86,12 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
             ShrinkUp,
             ShrinkDown,
         ],
-    ),
-    (
-        "Изменение размера без входа в режим",
-        &[
+    },
+    Group {
+        topic: Resize,
+        title: "Изменение размера без входа в режим",
+        icon: "\u{e945}",
+        actions: &[
             QuickLeft,
             QuickRight,
             QuickUp,
@@ -36,27 +101,15 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
             QuickReverseUp,
             QuickReverseDown,
         ],
-    ),
-    (
-        "Управление окнами",
-        &[Shortcut::CloseWindow, ToggleMaximize, ToggleMosaic],
-    ),
-    (
-        "Перенос между рабочими столами",
-        &[MovePreviousDesktop, MoveNextDesktop],
-    ),
-    ("Смена рабочего стола", &[PreviousDesktop, NextDesktop]),
-    (
-        "Выбор стола по номеру",
-        &[
-            Desktop1, Desktop2, Desktop3, Desktop4, Desktop5, Desktop6, Desktop7, Desktop8,
-            Desktop9, Desktop10,
-        ],
-    ),
+    },
 ];
 
-// Keep keyboard traversal in reading order at every column count.
-const READING_ORDER: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+pub(super) fn group_title(action: Shortcut) -> &'static str {
+    GROUPS
+        .iter()
+        .find(|group| group.actions.contains(&action))
+        .map_or("", |group| group.title)
+}
 
 impl ShortcutWindow {
     pub(super) fn create_controls(&self, hwnd: HWND) -> Result<(), String> {
@@ -90,8 +143,8 @@ impl ShortcutWindow {
         };
         self.tooltip.set(tooltip);
         self.hint(hwnd, reset_all, w!("Сбросить все сочетания"));
-        for i in READING_ORDER {
-            let (label, actions) = GROUPS[i];
+        for (i, group) in GROUPS.iter().enumerate() {
+            let label = group.title;
             create(
                 view,
                 w!("STATIC"),
@@ -100,7 +153,7 @@ impl ShortcutWindow {
                 SS_OWNERDRAW,
                 0,
             )?;
-            for &action in actions {
+            for &action in group.actions {
                 self.sync_slots(action, self.settings.borrow().bindings(action).len().max(1))?;
                 let add = button(
                     view,
@@ -273,7 +326,8 @@ impl ShortcutWindow {
         let button_w = p(25);
         let tools_gap = p(5);
         let tools_w = 4 * button_w + tools_gap;
-        let column_width = |viewport| (viewport - 2 * margin - (columns - 1) * gap) / columns;
+        let column_width =
+            |viewport| (viewport - 2 * margin - (columns as i32 - 1) * gap) / columns as i32;
         let header_h = p(34);
         let row_gap = |action| {
             if matches!(action, GrowLeft | ShrinkLeft | QuickReverseLeft) {
@@ -287,23 +341,23 @@ impl ShortcutWindow {
             let col = column_width(viewport);
             let heights = Shortcut::ALL.map(|a| self.action_row_height(dc, a, col - tools_w));
             let mut starts = [(0, 0); GROUPS.len()];
-            let mut ends = [p(12); 3];
-            for (order, &i) in READING_ORDER.iter().enumerate() {
-                let column = match columns {
-                    3 if order >= 6 => 2,
-                    3 if order >= 4 => 1,
-                    2 if order >= 5 => 1,
-                    _ => 0,
+            let mut ends = [0; 3];
+            for (i, group) in GROUPS.iter().enumerate() {
+                let column = group.topic.column(columns);
+                let top = if ends[column] == 0 {
+                    p(12)
+                } else {
+                    ends[column] + p(15)
                 };
-                starts[i] = (column, ends[column]);
-                let rows: i32 = GROUPS[i]
-                    .1
+                starts[i] = (column, top);
+                let rows: i32 = group
+                    .actions
                     .iter()
                     .map(|&a| heights[a.index()] + row_gap(a) + self.extra_height(a))
                     .sum();
-                ends[column] += header_h + rows + p(15);
+                ends[column] = top + header_h + rows;
             }
-            (heights, starts, *ends.iter().max().unwrap())
+            (heights, starts, ends.into_iter().max().unwrap() + p(8))
         };
         // Measure without the scrollbar first so rows can return to one line
         // when the user widens the window or assigns a shorter chord.
@@ -331,13 +385,13 @@ impl ShortcutWindow {
             GetClientRect(view, &mut client)
         };
         let col = column_width(client.right);
-        for (i, &(_, actions)) in GROUPS.iter().enumerate() {
+        for (i, group) in GROUPS.iter().enumerate() {
             let (column, start) = starts[i];
             let x = margin + column as i32 * (col + gap);
             let mut y = start - self.scroll.get();
             place(child(view, SECTION + i as i32), x, y, col, header_h);
             y += header_h;
-            for &action in actions {
+            for &action in group.actions {
                 y += row_gap(action);
                 let row_h = heights[action.index()];
                 let label_width = col - tools_w;

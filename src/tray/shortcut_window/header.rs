@@ -25,10 +25,7 @@ impl ShortcutWindow {
         let category = if recording {
             "Запись сочетания"
         } else {
-            view::GROUPS
-                .iter()
-                .find_map(|&(title, actions)| actions.contains(&action).then_some(title))
-                .unwrap_or("")
+            view::group_title(action)
         };
         let placeholder = if recording {
             "Нажмите клавиши"

@@ -1,10 +1,5 @@
 use super::*;
 
-// Move, Location, FullScreen, LightningBolt, ViewAll, Switch, TaskView, List.
-const SECTION_ICONS: [&str; 8] = [
-    "\u{e7c2}", "\u{e81d}", "\u{e740}", "\u{e945}", "\u{e8a9}", "\u{e8ab}", "\u{e7c4}", "\u{ea37}",
-];
-
 impl ShortcutWindow {
     pub(super) fn draw(&self, item: &DRAWITEMSTRUCT) {
         let fonts = self.fonts.borrow();
@@ -115,7 +110,8 @@ impl ShortcutWindow {
         let dc = item.hDC;
         let r = item.rcItem;
         let colors = self.colors.get();
-        let title = view::GROUPS[section].0;
+        let group = &view::GROUPS[section];
+        let title = group.title;
         let glyph = RECT {
             right: r.left + self.p(20),
             ..r
@@ -123,7 +119,7 @@ impl ShortcutWindow {
         paint::text(
             dc,
             glyph,
-            SECTION_ICONS[section],
+            group.icon,
             fonts.symbol,
             colors.secondary,
             DT_CENTER,
