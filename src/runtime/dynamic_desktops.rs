@@ -255,6 +255,10 @@ impl Workspaces {
         self.shell.is_some()
     }
 
+    pub(super) fn current_desktop(&self) -> Option<DesktopId> {
+        self.shell.as_ref()?.current()
+    }
+
     pub(super) fn activity(&mut self) -> bool {
         self.incomplete = 0;
         self.supported && (self.available() || Instant::now() >= self.reconnect_at)
@@ -298,47 +302,40 @@ impl Workspaces {
         }
     }
 
-    pub(super) fn navigate(&mut self, next: bool) -> bool {
-        let Some(shell) = &self.shell else {
-            return false;
-        };
-        let Some((current, order)) = shell.current().zip(shell.list()) else {
-            return false;
-        };
+    pub(super) fn navigate(&mut self, next: bool) -> Option<(DesktopId, DesktopId)> {
+        let shell = self.shell.as_ref()?;
+        let current = shell.current()?;
+        let order = shell.list()?;
+        let switch_to = |id| shell.switch(id).then_some((current, id));
         if !next {
-            return neighbor(&order, current, false).is_some_and(|id| shell.switch(id));
+            return switch_to(neighbor(&order, current, false)?);
         }
-        let Some(tail) = from_current(&order, current) else {
-            return false;
-        };
+        let tail = from_current(&order, current)?;
         if tail.len() > 1 {
-            let target = forward_neighbor(tail, |ids| occupancy::any_occupied(&order, ids));
-            return target.is_some_and(|id| {
-                shell.current() == Some(current)
-                    && shell.list().as_ref() == Some(&order)
-                    && shell.switch(id)
-            });
+            let target = forward_neighbor(tail, |ids| occupancy::any_occupied(&order, ids))?;
+            if shell.current()? != current || shell.list()? != order {
+                return None;
+            }
+            return switch_to(target);
         }
-        let Some(inventory) = Inventory::for_order(shell, current, order) else {
-            return false;
-        };
+        let inventory = Inventory::for_order(shell, current, order)?;
         if !inventory.occupied.contains(&current) {
-            return false;
+            return None;
         }
-        let Some(change) =
-            Change::position_spare(&inventory.order, inventory.empty_spare(self.policy.spare))
-        else {
-            return false;
-        };
+        let change =
+            Change::position_spare(&inventory.order, inventory.empty_spare(self.policy.spare))?;
         let proposal = (inventory, change);
         if self.policy.issued.as_ref() == Some(&proposal) {
-            return false;
+            return None;
         }
         self.policy.issued = Some(proposal);
         self.policy.pending = None;
         self.policy.retry_at = None;
         self.policy.failures = 0;
-        self.policy.apply(shell, change) && self.policy.spare.is_some_and(|id| shell.switch(id))
+        if self.policy.apply(shell, change) {
+            return switch_to(self.policy.spare?);
+        }
+        None
     }
 }
 

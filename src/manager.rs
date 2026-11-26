@@ -189,6 +189,10 @@ impl Manager {
         self.windows.contains_key(&id)
     }
 
+    pub(crate) fn layout_desktop(&self) -> Option<DesktopId> {
+        self.current
+    }
+
     fn drag_target(&self) -> Option<Id> {
         self.dragging.as_ref().map(|drag| drag.target)
     }
@@ -951,12 +955,75 @@ impl Manager {
             self.finish_mode();
         }
         if eligible {
+            self.workspace.last_foreground = Some(id);
+            self.remember_tile(id);
             self.outline
                 .show(id, self.settings.outline, self.settings.gap == 0);
         } else {
             self.outline.hide();
         }
         target
+    }
+
+    /// Called only during a confirmed desktop transition. A false result asks
+    /// the event loop to check again as Explorer finishes activating the desktop.
+    pub(crate) fn restore_desktop_focus(&self, desktop: DesktopId) -> bool {
+        self.restore_desktop_focus_with(desktop, native::foreground, |id, previous| {
+            native::focus_desktop_tile(id, previous, || self.can_act_on(id))
+        })
+    }
+
+    fn restore_desktop_focus_with(
+        &self,
+        desktop: DesktopId,
+        foreground: impl Fn() -> Id,
+        activate: impl FnOnce(Id, Id) -> bool,
+    ) -> bool {
+        if !self.settings.enabled {
+            return true;
+        }
+        if self.current != Some(desktop) {
+            return false;
+        }
+        let previous = foreground();
+        match native::desktop_foreground(previous) {
+            native::DesktopForeground::Transient => return false,
+            native::DesktopForeground::Preserve => {
+                // The outgoing app may still own foreground during the animation.
+                // A dialog, floating app or pinned window on the new desktop can
+                // legitimately own it even when it has no tile or desktop ID.
+                return match self.desktops.membership(previous) {
+                    DesktopMembership::Current(home) => home == desktop,
+                    DesktopMembership::Other(_) => false,
+                    DesktopMembership::Unknown => self
+                        .windows
+                        .get(&previous)
+                        .is_none_or(|window| window.desktop == desktop),
+                };
+            }
+            native::DesktopForeground::Vacant => {}
+        }
+        let eligible = |&id: &Id| native::window_enabled(id) && self.can_act_on(id);
+        let candidate = self
+            .workspace
+            .focus_history
+            .iter()
+            .rev()
+            .copied()
+            .find(eligible)
+            .or_else(|| {
+                self.workspace
+                    .layout
+                    .placements(self.area?)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .find(eligible)
+            });
+        candidate.is_some_and(|id| {
+            // Membership and window identity can change during COM calls, and
+            // the user may have focused another window while we chose a tile.
+            foreground() == previous && activate(id, previous) && foreground() == id
+        })
     }
 
     pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {

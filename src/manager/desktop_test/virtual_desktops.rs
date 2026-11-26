@@ -188,6 +188,65 @@ fn first_show_after_all_hide(
     set_visible(fresh, true);
 }
 
+// A non-input Win32 desktop cannot legally acquire system foreground. Use
+// the real fixture HWNDs and desktop memberships, substituting only the
+// foreground reads and the final activation so the user's desktop stays active.
+fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], floating: Id) {
+    use std::cell::Cell;
+    let [other, remembered] = tiles;
+    let foreground = Cell::new(0);
+    let activate = |id, previous| {
+        assert_eq!(foreground.get(), previous);
+        foreground.set(id);
+        true
+    };
+    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
+    assert_eq!(foreground.get(), remembered);
+    assert!(manager.shortcut_target(remembered).is_some());
+    let history = std::mem::take(&mut manager.workspace.focus_history);
+    let first_tile = manager.workspace.layout.placements(manager.area.unwrap())[0].0;
+    foreground.set(0);
+    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
+    assert_eq!(
+        foreground.get(),
+        first_tile,
+        "first visit follows layout order"
+    );
+    manager.workspace.focus_history = history;
+    assert!(
+        !manager.restore_desktop_focus_with(desktop, || 0, |_, _| false),
+        "Windows can decline foreground activation during a switch"
+    );
+
+    assert!(manager.restore_desktop_focus_with(
+        desktop,
+        || floating,
+        |_, _| panic!("floating app lost focus")
+    ));
+    let first_read = Cell::new(true);
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || if first_read.replace(false) {
+            0
+        } else {
+            floating
+        },
+        |_, _| panic!("overrode a user click during candidate selection"),
+    ));
+    set_visible(remembered, false);
+    foreground.set(0);
+    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
+    assert_eq!(foreground.get(), other);
+    set_visible(other, false);
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || 0,
+        |_, _| panic!("activated a hidden tile")
+    ));
+    set_visible(other, true);
+    set_visible(remembered, true);
+}
+
 pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     let mut a = [windows[0], windows[1]];
     let b = [windows[2], windows[3]];
@@ -216,6 +275,8 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     assert_ne!(shared[0].y, shared[1].y);
     let a_changes = a.map(geometry_changes);
     assert!(a_changes.iter().all(|count| *count > 0));
+    manager.event(EVENT_SYSTEM_FOREGROUND, a[0]);
+    manager.event(EVENT_SYSTEM_FOREGROUND, a[1]);
 
     // A late cloak, a temporary membership failure and a new foreground can
     // arrive in one burst. Neither inaccessible A window relinquishes its tile.
@@ -246,9 +307,9 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     manager.event(EVENT_OBJECT_SHOW, a[1]);
 
     // The shell now reports all A handles as current while DWM still cloaks
-    // the first one. Drawing its sibling at full width would visibly flicker.
+    // the first one. No foreground event arrives for a window on A.
     select_desktop(manager, &homes, A, None);
-    manager.event(EVENT_SYSTEM_FOREGROUND, a[1]);
+    manager.event(EVENT_OBJECT_SHOW, a[1]);
     manager.event(EVENT_OBJECT_UNCLOAKED, a[1]);
     manager.event(EVENT_OBJECT_LOCATIONCHANGE, b[1]);
     manager.reconcile_desktop();
@@ -266,6 +327,12 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
         b_changes,
         "an inactive B window moved"
     );
+    focus_on_return(manager, A, a, spare[0]);
+    assert!(!manager.restore_desktop_focus_with(
+        B,
+        || 0,
+        |_, _| panic!("activated an outgoing tile")
+    ));
 
     manager.move_window(a[0], Direction::Right);
     settle(manager, a.len());

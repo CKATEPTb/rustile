@@ -3,7 +3,7 @@ pub(crate) mod desktops;
 
 use crate::layout::{Id, Rect};
 use std::mem::size_of;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
@@ -113,6 +113,101 @@ pub fn foreground() -> Id {
     unsafe { GetForegroundWindow() as Id }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopForeground {
+    Vacant,
+    Transient,
+    Preserve,
+}
+
+// Called only during a confirmed desktop change. A floating app, dialog or
+// taskbar control can own legitimate input even though it is not a tile.
+pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
+    use DesktopForeground::*;
+    let hwnd = id as HWND;
+    if hwnd.is_null() {
+        return Vacant;
+    }
+    let Some(class) = window_class(hwnd) else {
+        return Transient;
+    };
+    let shell = unsafe { GetShellWindow() };
+    let shell_process = !shell.is_null() && pid(shell as Id) == pid(id);
+    if shell_process
+        && matches!(
+            class.as_str(),
+            "MultitaskingViewFrame" | "TaskSwitcherWnd" | "XamlExplorerHostIslandWindow"
+        )
+    {
+        return Transient;
+    }
+    let wallpaper = hwnd == shell
+        || hwnd == unsafe { GetDesktopWindow() }
+        || (shell_process && is_desktop_view(hwnd, shell, &class));
+    let taskbar =
+        shell_process && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
+    if !wallpaper && !taskbar {
+        if !hidden_or_minimized(id) && cloak_flags(id).is_none_or(|flags| flags == 0) {
+            return Preserve;
+        }
+        // A menu or dialog can become hidden before the Shell finishes
+        // activating its owner. Let the new foreground settle on its own.
+        if matches!(class.as_str(), "#32770" | "#32768") || class.starts_with("Rustile.") {
+            return Transient;
+        }
+    }
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, null_mut()) };
+    let mut gui = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if thread == 0 || unsafe { GetGUIThreadInfo(thread, &mut gui) } == 0 {
+        return Transient;
+    }
+    if shell_input_in_use(&gui, taskbar)
+        || (wallpaper
+            && !gui.hwndFocus.is_null()
+            && window_class(gui.hwndFocus).as_deref() == Some("Edit"))
+    {
+        return Preserve;
+    }
+    Vacant
+}
+
+fn shell_input_in_use(gui: &GUITHREADINFO, taskbar: bool) -> bool {
+    let interacting = GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE | GUI_INMOVESIZE;
+    gui.flags & interacting != 0
+        || !gui.hwndCapture.is_null()
+        || !gui.hwndMenuOwner.is_null()
+        // Win+T and keyboard navigation within the tray own a focused
+        // control. A bare taskbar with no keyboard focus can yield it.
+        || (taskbar && !gui.hwndFocus.is_null())
+}
+
+fn is_desktop_view(hwnd: HWND, shell: HWND, class: &str) -> bool {
+    if !matches!(class, "SHELLDLL_DefView" | "WorkerW") {
+        return false;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if root == shell {
+        return true;
+    }
+    // File Explorer also hosts SHELLDLL_DefView. Only its desktop WorkerW
+    // has the desktop icon view directly beneath the top-level worker.
+    if window_class(root).as_deref() != Some("WorkerW") {
+        return false;
+    }
+    let view = unsafe {
+        FindWindowExW(
+            root,
+            null_mut(),
+            windows_sys::w!("SHELLDLL_DefView"),
+            null(),
+        )
+    };
+    !view.is_null() && (hwnd == root || hwnd == view)
+}
+
 pub fn cursor_position() -> Option<(i32, i32)> {
     let mut point = POINT::default();
     (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
@@ -200,14 +295,18 @@ fn ordinary_process(owner: u32) -> bool {
     }
 }
 
-fn shell_or_dialog(hwnd: HWND) -> bool {
+fn window_class(hwnd: HWND) -> Option<String> {
     let mut class = [0u16; 256];
     let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-    if len <= 0 {
+    (len > 0).then(|| String::from_utf16_lossy(&class[..len as usize]))
+}
+
+fn shell_or_dialog(hwnd: HWND) -> bool {
+    let Some(class) = window_class(hwnd) else {
         return true;
-    }
+    };
     matches!(
-        String::from_utf16_lossy(&class[..len as usize]).as_str(),
+        class.as_str(),
         "#32770"
             | "#32768"
             | "Progman"
@@ -267,7 +366,7 @@ pub(crate) enum Cloak {
     Other,
 }
 
-pub(crate) fn cloak_state(id: Id) -> Cloak {
+fn cloak_flags(id: Id) -> Option<u32> {
     let mut cloak = 0u32;
     let result = unsafe {
         DwmGetWindowAttribute(
@@ -277,9 +376,13 @@ pub(crate) fn cloak_state(id: Id) -> Cloak {
             size_of::<u32>() as u32,
         )
     };
-    match (result >= 0, cloak) {
-        (true, 0) => Cloak::None,
-        (true, DWM_CLOAKED_APP) => Cloak::Application,
+    (result >= 0).then_some(cloak)
+}
+
+pub(crate) fn cloak_state(id: Id) -> Cloak {
+    match cloak_flags(id) {
+        Some(0) => Cloak::None,
+        Some(DWM_CLOAKED_APP) => Cloak::Application,
         // Shell, inherited or mixed flags can belong to a desktop switch.
         // A failed DWM query also gives no evidence of an application hide.
         _ => Cloak::Other,
@@ -741,12 +844,45 @@ pub fn focus(id: Id) -> bool {
         && (foreground() == id || unsafe { SetForegroundWindow(id as HWND) } != 0)
 }
 
+pub(crate) fn focus_desktop_tile(id: Id, previous: Id, current_tile: impl Fn() -> bool) -> bool {
+    let hwnd = id as HWND;
+    let can_activate = || {
+        current_tile()
+            && window_enabled(id)
+            && desktop_foreground(previous) == DesktopForeground::Vacant
+            && foreground() == previous
+    };
+    // Explorer can activate its own application view during a desktop change.
+    // Recheck after RPC: input or desktop membership may already have changed.
+    if let Some(view) = desktops::shell::ApplicationView::lookup(hwnd) {
+        if !can_activate() {
+            return false;
+        }
+        if view.request_focus() {
+            return true;
+        }
+    }
+    can_activate() && unsafe { SetForegroundWindow(hwnd) } != 0
+}
+
 #[cfg(test)]
 mod work_area_tests {
     use super::*;
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn desktop_recovery_respects_taskbar_keyboard_focus_and_desktop_context_menus() {
+        let mut gui = GUITHREADINFO::default();
+        assert_eq!(desktop_foreground(0), DesktopForeground::Vacant);
+        assert!(!shell_input_in_use(&gui, true));
+        gui.hwndFocus = std::ptr::dangling_mut();
+        assert!(shell_input_in_use(&gui, true));
+        assert!(!shell_input_in_use(&gui, false));
+        gui.flags = GUI_POPUPMENUMODE;
+        assert!(shell_input_in_use(&gui, false));
     }
 
     #[test]

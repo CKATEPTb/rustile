@@ -37,8 +37,7 @@ unsafe impl Interface for ShellDesktop {
 
 type Out<T> = unsafe extern "system" fn(*mut c_void, *mut Option<T>) -> HRESULT;
 
-// IApplicationViewCollection and IApplicationView from the same gated Shell
-// ABI. Only consult them when the public desktop ID of a packaged HWND is null.
+// IApplicationViewCollection and IApplicationView from the same gated Shell ABI.
 #[repr(transparent)]
 #[derive(Clone)]
 pub(super) struct ApplicationViews(IUnknown);
@@ -58,7 +57,7 @@ pub(super) struct ViewsVtable {
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct ApplicationView(IUnknown);
+pub(in crate::native) struct ApplicationView(IUnknown);
 
 unsafe impl Interface for ApplicationView {
     type Vtable = ViewVtable;
@@ -66,9 +65,11 @@ unsafe impl Interface for ApplicationView {
 }
 
 #[repr(C)]
-struct ViewVtable {
+pub(in crate::native) struct ViewVtable {
     base: IUnknown_Vtbl,
-    inspectable_through_get_monitor: [usize; 8],
+    inspectable: [usize; 3],
+    set_focus: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+    switch_to_through_get_monitor: [usize; 4],
     visibility: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     set_cloak_through_set_activation_timestamp: [usize; 13],
     desktop_id: unsafe extern "system" fn(*mut c_void, *mut GUID) -> HRESULT,
@@ -76,21 +77,36 @@ struct ViewVtable {
     show_in_switchers: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
 }
 
+impl ApplicationView {
+    pub(in crate::native) fn lookup(hwnd: HWND) -> Option<Self> {
+        ApplicationViews::connect()?.for_window(hwnd)
+    }
+
+    pub(in crate::native) fn request_focus(&self) -> bool {
+        unsafe { (self.vtable().set_focus)(self.as_raw()) }.0 == 0
+    }
+}
+
 impl ApplicationViews {
     pub(super) fn connect() -> Option<Self> {
-        // Occupancy queries on unsupported Windows builds must not use this ABI.
         if !DesktopShell::supported() {
             return None;
         }
         unsafe { shell_provider()?.QueryService(&Self::IID).ok() }
     }
 
-    pub(super) fn is_hidden_unassigned_view(&self, hwnd: HWND) -> bool {
+    fn for_window(&self, hwnd: HWND) -> Option<ApplicationView> {
         let mut view = None;
         if unsafe { (self.vtable().for_window)(self.as_raw(), hwnd, &mut view) }.0 != 0 {
-            return false;
+            return None;
         }
-        let Some(view) = view else { return false };
+        view
+    }
+
+    pub(super) fn is_hidden_unassigned_view(&self, hwnd: HWND) -> bool {
+        let Some(view) = self.for_window(hwnd) else {
+            return false;
+        };
         let mut visible = 1;
         let mut switchable = 1;
         let mut id = GUID::zeroed();
@@ -358,6 +374,18 @@ impl DesktopShell {
 mod tests {
     use super::super::occupancy::occupied;
     use super::*;
+
+    #[test]
+    fn application_view_entries_match_the_supported_abi() {
+        let slot = size_of::<usize>();
+        assert_eq!(std::mem::offset_of!(ViewVtable, set_focus), 6 * slot);
+        assert_eq!(std::mem::offset_of!(ViewVtable, visibility), 11 * slot);
+        assert_eq!(std::mem::offset_of!(ViewVtable, desktop_id), 25 * slot);
+        assert_eq!(
+            std::mem::offset_of!(ViewVtable, show_in_switchers),
+            27 * slot
+        );
+    }
 
     fn move_for_test(shell: &DesktopShell, id: DesktopId, index: u32) -> bool {
         shell

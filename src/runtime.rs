@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
+use crate::native::desktops::DesktopId;
 use crate::settings::{Command, Modifier, Settings};
 use crate::startup;
 use crate::tray::Tray;
@@ -48,6 +49,7 @@ pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
 pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
 const DESKTOP_LIST_CHANGED: u32 = WM_APP + 5;
 const DESKTOP_SETTLE_MS: u32 = 160;
+const FOCUS_SETTLE_MS: u32 = 40;
 
 // GetMessage dispatches out-of-context WinEvents on the hook's installing thread.
 // Defer all application work until the callback returns, including Win32 calls
@@ -323,6 +325,49 @@ impl Drop for MessageTimer {
     }
 }
 
+// Registry and window notifications also fire for renames, reorders, and
+// creating the spare. Only a change of desktop identity arms focus recovery.
+struct DesktopFocus {
+    observed: Option<DesktopId>,
+    pending: Option<(DesktopId, usize)>,
+}
+
+impl DesktopFocus {
+    fn requested(&mut self, from: DesktopId, to: DesktopId) {
+        self.observed = Some(from);
+        self.pending = Some((to, 0));
+    }
+
+    fn observe(&mut self, actual: Option<DesktopId>) -> bool {
+        let Some(actual) = actual else { return false };
+        let previous = self.observed.replace(actual);
+        if previous.is_none_or(|old| old == actual)
+            || self.pending.is_some_and(|(target, _)| target == actual)
+        {
+            return false;
+        }
+        self.pending = Some((actual, 0));
+        true
+    }
+
+    fn settle(
+        &mut self,
+        actual: Option<DesktopId>,
+        restore: impl FnOnce(DesktopId) -> bool,
+    ) -> Option<u32> {
+        let (target, attempt) = self.pending?;
+        if actual == Some(target) && restore(target) {
+            self.pending = None;
+            return None;
+        }
+        // The target's layouts, foreground and DWM cloak can settle on
+        // different messages. Stop entirely on a genuinely empty desktop.
+        let delay = [50, 80, 130, 200, 320].get(attempt).copied();
+        self.pending = delay.map(|_| (target, attempt + 1));
+        delay
+    }
+}
+
 fn pump(
     manager: &mut Manager,
     hook: &shortcuts::Hook,
@@ -334,6 +379,13 @@ fn pump(
     let mut desktop_timer = MessageTimer::default();
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
+    let mut focus_timer = MessageTimer::default();
+    let mut desktop_focus = DesktopFocus {
+        observed: workspaces
+            .current_desktop()
+            .or_else(|| manager.layout_desktop()),
+        pending: None,
+    };
     let mut drag_timer = MessageTimer::default();
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -365,6 +417,7 @@ fn pump(
         let has_events = !events.is_empty();
         let timer_fired = desktop_timer.take(&message);
         let inventory_due = inventory_timer.take(&message);
+        let focus_due = focus_timer.take(&message);
         let desktops_changed = message.message == DESKTOP_LIST_CHANGED;
         let mut inventory_changed = desktops_changed;
         let work_area_changed = tray.take_work_area_change();
@@ -436,6 +489,30 @@ fn pump(
         } else if needs_scan {
             inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
         }
+        if desktops_changed
+            || timer_fired
+            || focus_due
+            || (desktop_watch.is_none()
+                && (inventory_due || (has_events && !workspaces.available())))
+        {
+            let actual = if workspaces.available() {
+                workspaces.current_desktop()
+            } else {
+                manager.layout_desktop()
+            };
+            if desktop_focus.observe(actual) {
+                if actual != manager.layout_desktop() {
+                    desktop_timer.schedule_within(FOCUS_SETTLE_MS);
+                }
+                focus_timer.schedule(FOCUS_SETTLE_MS);
+            } else if focus_due {
+                let delay = desktop_focus.settle(actual, |id| manager.restore_desktop_focus(id));
+                if let Some(delay) = delay {
+                    focus_timer.schedule(delay);
+                }
+                refresh(manager, 0);
+            }
+        }
         if drag_timer.matches(&message) {
             manager.refresh_drop_preview(false);
         }
@@ -452,10 +529,12 @@ fn pump(
             if command == TOGGLE_MOSAIC && target == 0 {
                 shortcut_command = Some((Command::Toggle, ticket));
             } else if target == 0 && matches!(command, DESKTOP_PREVIOUS | DESKTOP_NEXT) {
-                if workspaces.navigate(command == DESKTOP_NEXT) {
+                if let Some((from, to)) = workspaces.navigate(command == DESKTOP_NEXT) {
                     manager.finish_mode();
                     manager.cancel_mouse_move();
-                    desktop_timer.schedule(DESKTOP_SETTLE_MS);
+                    desktop_focus.requested(from, to);
+                    desktop_timer.schedule_within(FOCUS_SETTLE_MS);
+                    focus_timer.schedule(FOCUS_SETTLE_MS);
                 }
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 refresh(manager, ticket);
