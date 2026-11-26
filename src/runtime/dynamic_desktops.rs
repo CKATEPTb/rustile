@@ -245,6 +245,25 @@ fn numbered_target(
     Some(order[to])
 }
 
+fn stationary_index(
+    order: &[DesktopId],
+    current: DesktopId,
+    destination: DesktopDestination,
+    occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
+) -> Option<usize> {
+    let index = order.iter().position(|&id| id == current)?;
+    let empty_tail = || occupied(&order[index..]).map(|value| !value);
+    let stationary = match destination {
+        DesktopDestination::Relative { next: false } => index == 0,
+        DesktopDestination::Relative { next: true } => empty_tail()?,
+        DesktopDestination::Number(number) => {
+            let target = number.checked_sub(1)?.min(order.len() - 1);
+            target == index || (target > index && empty_tail()?)
+        }
+    };
+    stationary.then_some(index + 1)
+}
+
 pub(super) const EVENT_BATCH_MS: u32 = 40;
 const CONFIRM_MS: u32 = 60;
 const RETRY_MS: u32 = 350;
@@ -303,6 +322,20 @@ impl Workspaces {
 
     pub(super) fn current_desktop(&self) -> Option<DesktopId> {
         self.shell.as_ref()?.current()
+    }
+
+    pub(super) fn snapshot(&self) -> Option<(DesktopId, Vec<DesktopId>)> {
+        let shell = self.shell.as_ref()?;
+        let current = shell.current()?;
+        let order = shell.list()?;
+        (order.contains(&current) && shell.current()? == current).then_some((current, order))
+    }
+
+    pub(super) fn stationary_index(&self, destination: DesktopDestination) -> Option<usize> {
+        let (current, order) = self.snapshot()?;
+        stationary_index(&order, current, destination, |tail| {
+            occupancy::any_occupied(&order, tail)
+        })
     }
 
     pub(super) fn activity(&mut self) -> bool {
@@ -632,6 +665,45 @@ mod tests {
         assert_eq!(neighbor(&order, DesktopId(3), true), None);
         assert_eq!(neighbor(&order, DesktopId(7), false), None);
         assert_eq!(neighbor(&order, DesktopId(404), true), None);
+    }
+
+    #[test]
+    fn cli_recognizes_only_proven_noop_desktop_moves_and_transfers() {
+        use crate::cli::Destination;
+
+        let order = [0x33, 0x55, 0x11].map(DesktopId);
+        let no_scan = |_: &[DesktopId]| panic!("position is sufficient");
+        let stationary = |from, destination: Destination, occupancy| {
+            stationary_index(&order, from, destination.into(), |tail| {
+                assert_eq!(tail.first(), Some(&from));
+                occupancy
+            })
+        };
+        assert_eq!(
+            stationary_index(&order, order[2], Destination::Number(50).into(), no_scan),
+            Some(3)
+        );
+        assert_eq!(
+            stationary_index(&order, order[0], Destination::Previous.into(), no_scan),
+            Some(1)
+        );
+        assert_eq!(
+            stationary_index(&order, order[0], DesktopDestination::Number(0), no_scan),
+            None
+        );
+        assert_eq!(
+            stationary_index(&order, DesktopId(999), Destination::Next.into(), no_scan),
+            None
+        );
+        for destination in [Destination::Next, Destination::Number(99)] {
+            assert_eq!(stationary(order[1], destination, Some(false)), Some(2));
+            assert_eq!(stationary(order[1], destination, Some(true)), None);
+            assert_eq!(stationary(order[1], destination, None), None);
+        }
+        // Next can create a spare on an occupied last desktop. An uncertain
+        // inventory cannot be reported as a successful no-op, either.
+        assert_eq!(stationary(order[2], Destination::Next, Some(true)), None);
+        assert_eq!(stationary(order[2], Destination::Next, None), None);
     }
 
     #[test]

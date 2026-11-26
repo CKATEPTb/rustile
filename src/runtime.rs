@@ -1,6 +1,8 @@
+mod cli_commands;
 mod desktop_watch;
 mod dynamic_desktops;
 mod instance;
+mod ipc;
 mod shortcuts;
 #[cfg(test)]
 mod tests;
@@ -23,7 +25,6 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::Manager;
 use crate::layout::Direction;
 use crate::manager::Mode;
 use crate::native::desktops::DesktopId;
@@ -31,6 +32,7 @@ use crate::native::{self, TransferIdentity, WindowControl};
 use crate::settings::{Command, Modifier, Settings};
 use crate::startup;
 use crate::tray::Tray;
+use crate::{Manager, cli};
 
 pub(crate) const START_RESIZE: i32 = 1;
 pub(crate) const CLOSE_WINDOW: i32 = 2;
@@ -100,6 +102,41 @@ fn is_desktop_move(command: i32) -> bool {
 struct DesktopStep {
     destination: DesktopDestination,
     window: Option<Rc<TransferIdentity>>,
+}
+
+struct QueuedStep {
+    step: DesktopStep,
+    client: Option<ipc::Request>,
+    explicit_window: bool,
+}
+
+struct CliArrival {
+    client: ipc::Request,
+    desktop: DesktopId,
+}
+
+// A successful switch RPC can precede Explorer's active-desktop change.
+// Only acknowledge when a subsequent "desktop current" would see the target.
+fn confirm_cli_arrival(
+    pending: &mut Option<CliArrival>,
+    workspaces: &dynamic_desktops::Workspaces,
+    stopped: bool,
+) {
+    let Some(arrival) = pending.take() else {
+        return;
+    };
+    if let Some((current, order)) = workspaces.snapshot()
+        && current == arrival.desktop
+        && let Some(index) = order.iter().position(|id| *id == current)
+    {
+        arrival.client.respond(Ok((index + 1).to_string()));
+    } else if stopped || arrival.client.expired() {
+        arrival.client.respond(Err(
+            "Windows не подтвердила переход на выбранный рабочий стол.".into(),
+        ));
+    } else {
+        *pending = Some(arrival);
+    }
 }
 
 impl DesktopStep {
@@ -519,14 +556,16 @@ fn pump(
     hook: &shortcuts::Hook,
     tray: &mut Tray,
     preferences: &mut Preferences<'_>,
-) -> Result<(), String> {
+    server: &ipc::Server,
+) -> Result<Option<ipc::Request>, String> {
     let mut message = MSG::default();
     let mut events = Vec::new();
     let mut desktop_timer = MessageTimer::default();
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
     let mut focus_timer = MessageTimer::default();
-    let mut navigation = VecDeque::new();
+    let mut navigation: VecDeque<QueuedStep> = VecDeque::new();
+    let mut cli_arrival = None;
     let mut following: Option<Rc<TransferIdentity>> = None;
     let mut desktop_focus = DesktopFocus {
         observed: workspaces
@@ -557,7 +596,7 @@ fn pump(
                     io::Error::last_os_error()
                 ));
             }
-            0 => return Ok(()),
+            0 => return Ok(None),
             _ => {}
         }
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
@@ -658,7 +697,7 @@ fn pump(
         if !shortcuts::transfer_focus_uninterrupted()
             && let Some(window) = following.take()
         {
-            navigation.retain(|step: &DesktopStep| !step.continues_transfer(&window));
+            navigation.retain(|entry| !entry.step.continues_transfer(&window));
         }
         if !preferences.live.enabled || !shortcuts::desktop_focus_uninterrupted() {
             desktop_focus.stop_watching();
@@ -740,17 +779,46 @@ fn pump(
                     if let Some(window) = following.take() {
                         shortcuts::end_transfer_focus_watch();
                         if native::foreground() != window.id() || !window.matches() {
-                            navigation.retain(|step| !step.continues_transfer(&window));
+                            navigation.retain(|entry| !entry.step.continues_transfer(&window));
                         }
                     }
                 }
                 refresh(manager, 0);
             }
+            confirm_cli_arrival(
+                &mut cli_arrival,
+                &workspaces,
+                !desktop_focus.awaiting_switch(),
+            );
         }
         if drag_timer.matches(&message) {
             manager.refresh_drop_preview(false);
         }
         let mut shortcut_command = None;
+        // A native modal loop can consume the IPC wake message. Check the
+        // channel on return to the normal pump as well.
+        if let Some(request) = server.try_recv() {
+            let outcome = cli::Command::from_wire(&request.command).and_then(|command| {
+                cli_commands::execute(command, manager, &workspaces, preferences, hook, tray)
+            });
+            match outcome {
+                Ok(cli_commands::Outcome::Done(value)) => request.respond(Ok(value)),
+                Ok(cli_commands::Outcome::Quit) => return Ok(Some(request)),
+                Ok(cli_commands::Outcome::Navigate {
+                    step,
+                    explicit_window,
+                }) => {
+                    navigation.push_back(QueuedStep {
+                        step,
+                        explicit_window,
+                        client: Some(request),
+                    });
+                    inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
+                }
+                Err(error) => request.respond(Err(error)),
+            }
+            refresh(manager, 0);
+        }
         if message.message == OUTLINE_SETTINGS_CHANGED {
             refresh(manager, 0);
         } else if message.message == RESIZE_HINT_CHANGED {
@@ -766,11 +834,18 @@ fn pump(
                 if matches!(destination.destination, DesktopDestination::Number(_)) {
                     // A direct jump supersedes queued navigation. Preserve any
                     // window moves and the steps on which their destinations depend.
-                    while navigation.back().is_some_and(|step| step.window.is_none()) {
+                    while navigation
+                        .back()
+                        .is_some_and(|entry| entry.step.window.is_none() && entry.client.is_none())
+                    {
                         navigation.pop_back();
                     }
                 }
-                navigation.push_back(destination);
+                navigation.push_back(QueuedStep {
+                    step: destination,
+                    explicit_window: false,
+                    client: None,
+                });
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 if ticket != 0 {
                     refresh(manager, ticket);
@@ -809,19 +884,59 @@ fn pump(
         // A wheel can send several detents before Explorer reports the first
         // switch. Resolve the next step against its confirmed destination.
         while !desktop_focus.awaiting_switch()
+            && cli_arrival.is_none()
             && !following.as_ref().is_some_and(|window| {
                 navigation
                     .front()
-                    .is_some_and(|step| step.continues_transfer(window))
+                    .is_some_and(|entry| entry.step.continues_transfer(window))
             })
-            && let Some(DesktopStep {
-                destination,
-                window,
+            && let Some(QueuedStep {
+                step:
+                    DesktopStep {
+                        destination,
+                        window,
+                    },
+                client,
+                explicit_window,
             }) = navigation.pop_front()
         {
+            let valid_target = |window: &TransferIdentity, from| {
+                window.matches()
+                    && if explicit_window {
+                        manager.transferable_on(window.id(), from)
+                    } else {
+                        manager.transfer_target_is_valid(window.id(), from)
+                    }
+            };
+            let client = if let Some(request) = client {
+                if request.expired() {
+                    continue;
+                }
+                if let Some(window) = &window
+                    && !workspaces
+                        .current_desktop()
+                        .is_some_and(|from| valid_target(window, from))
+                {
+                    request.respond(Err("Выбранное окно больше недоступно для переноса.".into()));
+                    continue;
+                }
+                if let Some(index) = workspaces.stationary_index(destination) {
+                    request.respond(Ok(index.to_string()));
+                    continue;
+                }
+                shortcuts::watch_desktop_focus();
+                Some(request)
+            } else {
+                None
+            };
             let (from, to, followed) = match &window {
                 None => {
                     let Some((from, to)) = workspaces.navigate(destination) else {
+                        if let Some(request) = client {
+                            request.respond(Err(
+                                "Не удалось переключить рабочий стол Windows.".into()
+                            ));
+                        }
                         continue;
                     };
                     (from, to, true)
@@ -831,13 +946,16 @@ fn pump(
                     let moved = workspaces.transfer(
                         window.id(),
                         destination,
-                        |from| {
-                            window.matches() && manager.transfer_target_is_valid(window.id(), from)
-                        },
+                        |from| valid_target(window, from),
                         shortcuts::transfer_focus_uninterrupted,
                     );
                     let Some(moved) = moved else {
                         shortcuts::end_transfer_focus_watch();
+                        if let Some(request) = client {
+                            request.respond(Err(
+                                "Windows не выполнила перенос окна на рабочий стол.".into(),
+                            ));
+                        }
                         continue;
                     };
                     if window.matches() {
@@ -858,6 +976,19 @@ fn pump(
                 desktop_focus.requested(from, to);
                 focus_timer.schedule(FOCUS_SETTLE_MS);
             }
+            if let Some(request) = client {
+                if followed {
+                    cli_arrival = Some(CliArrival {
+                        client: request,
+                        desktop: to,
+                    });
+                    confirm_cli_arrival(&mut cli_arrival, &workspaces, false);
+                } else {
+                    request.respond(Err(
+                        "Окно перенесено, но Windows не переключила текущий рабочий стол.".into(),
+                    ));
+                }
+            }
             refresh(manager, 0);
         }
         if let Ok(result) = startup_rx.try_recv() {
@@ -874,7 +1005,7 @@ fn pump(
             .or_else(|| tray.take_command().map(|command| (command, 0)))
         {
             match command {
-                Command::Exit => return Ok(()),
+                Command::Exit => return Ok(None),
                 Command::SetStartup(mode) => {
                     if !tray.begin_startup_change() {
                         continue;
@@ -920,37 +1051,95 @@ fn pump(
     }
 }
 
-const USAGE: &str = "rustile [--resize-shortcut win+enter|ctrl+alt+enter]\nПо умолчанию размер изменяется через Win+Enter.";
-
 pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
-    let resize_override = match args {
-        [] => None,
-        [flag]
-            if matches!(
-                flag.as_str(),
-                startup::STARTUP_FLAG | startup::LEGACY_ELEVATED_FLAG
-            ) =>
-        {
-            if !startup::run_at_logon()? {
-                return Ok(());
-            }
-            None
-        }
-        [flag] if flag == "--help" || flag == "-h" => {
-            println!("{USAGE}");
+    let from_console_client = args.first().is_some_and(|arg| arg == "--cli");
+    let args = if from_console_client {
+        &args[1..]
+    } else {
+        args
+    };
+    let logon = !from_console_client
+        && matches!(args, [flag] if matches!(flag.as_str(), startup::STARTUP_FLAG | startup::LEGACY_ELEVATED_FLAG));
+    let background = !from_console_client && matches!(args, [flag] if flag == "--background");
+    let invocation = if background {
+        cli::Invocation::Start(None)
+    } else if logon {
+        if !startup::run_at_logon()? {
             return Ok(());
         }
-        [flag, value] if flag == "--resize-shortcut" && value.eq_ignore_ascii_case("win+enter") => {
-            Some(Modifier::Win)
-        }
-        [flag, value]
-            if flag == "--resize-shortcut" && value.eq_ignore_ascii_case("ctrl+alt+enter") =>
-        {
-            Some(Modifier::CtrlAlt)
-        }
-        _ => return Err(USAGE.to_owned()),
+        cli::Invocation::Start(None)
+    } else {
+        cli::parse(args)?
     };
-    let _instance = instance::Instance::acquire()?;
+    match invocation {
+        cli::Invocation::Print(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        cli::Invocation::Request(command) => client_command(command),
+        cli::Invocation::Start(modifier)
+            if from_console_client || args.first().is_some_and(|a| a == "start") =>
+        {
+            start_background(modifier)
+        }
+        cli::Invocation::Start(modifier) => match instance::Instance::acquire()? {
+            Some(_owner) => run_primary(modifier),
+            None if logon || background => Ok(()),
+            None => {
+                client_command(modifier.map_or(cli::Command::Status, cli::Command::ResizeShortcut))
+            }
+        },
+    }
+}
+
+fn client_command(command: cli::Command) -> Result<(), String> {
+    let grant_foreground = matches!(
+        command,
+        cli::Command::DesktopGo(_)
+            | cli::Command::Window {
+                action: cli::WindowAction::Focus(_) | cli::WindowAction::ToDesktop(_),
+                ..
+            }
+    );
+    let output = ipc::send(
+        &command.to_wire(),
+        grant_foreground,
+        command == cli::Command::Quit,
+    )?;
+    println!("{output}");
+    Ok(())
+}
+
+fn start_background(modifier: Option<Modifier>) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    if !instance::Instance::running()? {
+        let child = instance::launch_background()?;
+        let start = Instant::now();
+        while !instance::Instance::running()? {
+            if start.elapsed() >= Duration::from_secs(5) {
+                return Err("Rustile не подтвердил запуск за 5 секунд.".into());
+            }
+            match unsafe { WaitForSingleObject(child.as_raw_handle(), 20) } {
+                WAIT_TIMEOUT => {}
+                WAIT_OBJECT_0 if instance::Instance::running()? => break,
+                WAIT_OBJECT_0 => return Err("Rustile завершился при запуске.".into()),
+                _ => return Err(io::Error::last_os_error().to_string()),
+            }
+        }
+    }
+    if let Some(modifier) = modifier {
+        ipc::send(
+            &cli::Command::ResizeShortcut(modifier).to_wire(),
+            false,
+            false,
+        )?;
+    }
+    client_command(cli::Command::Status)
+}
+
+fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
     let path = Settings::path()?;
     let (saved, load_warning) = match Settings::load(&path) {
         Ok(value) => (value, None),
@@ -973,6 +1162,7 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
         Ok(_) => println!("Ctrl+C в консоли Rustile — выйти и восстановить окна."),
     }
     let mut tray = Tray::new(live.clone())?;
+    let server = ipc::Server::start()?;
     let keyboard = shortcuts::Hook::install(&live)?;
     let hooks = EventHooks::install()?;
     let mut manager = Manager::with_settings(live);
@@ -981,10 +1171,19 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
     if let Some(warning) = load_warning {
         show_error(&format!("Применены настройки по умолчанию.\n\n{warning}"));
     }
-    let result = pump(&mut manager, &keyboard, &mut tray, &mut preferences);
+    let result = pump(
+        &mut manager,
+        &keyboard,
+        &mut tray,
+        &mut preferences,
+        &server,
+    );
     drop(keyboard);
     drop(hooks);
     manager.shutdown();
     drop(console);
-    result
+    if let Some(request) = result? {
+        request.respond(Ok("ok".into()));
+    }
+    Ok(())
 }

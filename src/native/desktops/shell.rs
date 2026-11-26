@@ -12,7 +12,6 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows_sys::core::w;
 
 use super::{DesktopId, Service, object_name, shell_window};
@@ -360,7 +359,7 @@ impl DesktopShell {
         validate: impl FnOnce() -> bool,
     ) -> bool {
         let hwnd = id as HWND;
-        if from == to || hwnd.is_null() || unsafe { GetForegroundWindow() } != hwnd {
+        if from == to || hwnd.is_null() {
             return false;
         }
         self.with_manager(|manager| {
@@ -377,10 +376,9 @@ impl DesktopShell {
             }
             // The public API returns a special GUID for app and window pins.
             // A pinned HWND or a window already moved by Explorer has no match.
-            if Service::connect()?.desktop_id(hwnd).ok()? != from
-                || !validate()
-                || unsafe { GetForegroundWindow() } != hwnd
-            {
+            // The caller validates the exact identity here, including foreground
+            // ownership for hotkeys and implicit CLI targets.
+            if Service::connect()?.desktop_id(hwnd).ok()? != from || !validate() {
                 return Some(false);
             }
             let moved =
@@ -414,6 +412,7 @@ impl DesktopShell {
 mod tests {
     use super::super::occupancy::occupied;
     use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     #[test]
     fn application_view_entries_match_the_supported_abi() {

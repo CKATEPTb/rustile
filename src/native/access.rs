@@ -9,10 +9,7 @@ use windows_sys::Win32::{
         TokenIntegrityLevel, TokenUser,
     },
     System::{
-        SystemServices::{
-            SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_MEDIUM_RID,
-            SECURITY_MANDATORY_SYSTEM_RID,
-        },
+        SystemServices::{SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_SYSTEM_RID},
         Threading::{
             GetCurrentProcess, GetProcessInformation, OpenProcessToken,
             PROCESS_PROTECTION_LEVEL_INFORMATION, PROTECTION_LEVEL_NONE,
@@ -22,7 +19,6 @@ use windows_sys::Win32::{
 };
 
 const HIGH: u32 = SECURITY_MANDATORY_HIGH_RID as u32;
-const MEDIUM: u32 = SECURITY_MANDATORY_MEDIUM_RID as u32;
 const SYSTEM: u32 = SECURITY_MANDATORY_SYSTEM_RID as u32;
 type UserSid = [u8; SECURITY_MAX_SID_SIZE as usize];
 
@@ -105,17 +101,13 @@ impl ProcessAccess {
             && target.integrity < SYSTEM
             && (target.integrity < HIGH || self.user == target.user)
     }
-
-    pub(crate) fn can_replace(&self, other: &Self) -> bool {
-        (HIGH..SYSTEM).contains(&self.integrity)
-            && (MEDIUM..HIGH).contains(&other.integrity)
-            && self.user == other.user
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
+    const MEDIUM: u32 = SECURITY_MANDATORY_MEDIUM_RID as u32;
 
     fn process(integrity: u32, account: u8) -> ProcessAccess {
         ProcessAccess {
@@ -134,17 +126,6 @@ mod tests {
         assert!(admin.can_tile(&admin));
         assert!(!admin.can_tile(&process(HIGH, 2)));
         assert!(!admin.can_tile(&process(SYSTEM, 1)));
-    }
-
-    #[test]
-    fn only_an_elevated_launch_can_replace_its_own_ordinary_instance() {
-        let normal = process(MEDIUM, 1);
-        let admin = process(HIGH, 1);
-        assert!(admin.can_replace(&normal));
-        assert!(!normal.can_replace(&admin));
-        assert!(!normal.can_replace(&normal));
-        assert!(!admin.can_replace(&admin));
-        assert!(!admin.can_replace(&process(MEDIUM, 2)));
     }
 
     #[test]

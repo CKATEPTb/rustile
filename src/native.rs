@@ -256,6 +256,14 @@ pub fn pid(id: Id) -> u32 {
     owner
 }
 
+pub(crate) fn window_title(id: Id) -> String {
+    let hwnd = id as HWND;
+    let capacity = unsafe { GetWindowTextLengthW(hwnd) }.clamp(0, 32_767) + 1;
+    let mut title = vec![0u16; capacity as usize];
+    let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), capacity) };
+    String::from_utf16_lossy(&title[..length as usize])
+}
+
 fn ordinary_process(owner: u32) -> bool {
     if owner == 0 || owner == std::process::id() {
         return false;
@@ -411,14 +419,14 @@ pub fn can_maximize(id: Id) -> bool {
     unsafe { GetWindowLongW(id as HWND, GWL_STYLE) as u32 & WS_MAXIMIZEBOX != 0 }
 }
 
-pub fn close_window(id: Id) {
+pub fn close_window(id: Id) -> bool {
     // The owning UI thread handles save prompts and may cancel or hide to tray.
-    unsafe { PostMessageW(id as HWND, WM_CLOSE, 0, 0) };
+    unsafe { PostMessageW(id as HWND, WM_CLOSE, 0, 0) != 0 }
 }
 
-pub fn set_maximized(id: Id, maximize: bool) {
+pub fn set_maximized(id: Id, maximize: bool) -> bool {
     let command = if maximize { SC_MAXIMIZE } else { SC_RESTORE };
-    unsafe { PostMessageW(id as HWND, WM_SYSCOMMAND, command as usize, 0) };
+    unsafe { PostMessageW(id as HWND, WM_SYSCOMMAND, command as usize, 0) != 0 }
 }
 
 pub fn hidden_or_minimized(id: Id) -> bool {

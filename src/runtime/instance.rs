@@ -1,62 +1,133 @@
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, GetCurrentThreadId, OpenProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-    ReleaseMutex, WaitForSingleObject,
+    CREATE_MUTEX_INITIAL_OWNER, CREATE_NO_WINDOW, CreateMutexExW, CreateProcessW,
+    GetCurrentThreadId, MUTEX_MODIFY_STATE, OpenMutexW, PROCESS_INFORMATION, ReleaseMutex,
+    STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, PostThreadMessageW, WM_QUIT,
-};
-use windows_sys::core::w;
 
-use crate::native::{access::ProcessAccess, desktops::object_name};
+use crate::native::desktops::object_name;
 
-const DUPLICATE: &str = "Rustile уже работает в этом сеансе Windows.";
+fn desktop_names() -> Result<(String, String), String> {
+    let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) })?;
+    let station = object_name(unsafe { GetProcessWindowStation() })?;
+    Ok((station, desktop))
+}
+
+// Keep the existing mutex name, including across an upgrade from a pre-CLI build.
+fn name() -> Result<Vec<u16>, String> {
+    let (station, desktop) = desktop_names()?;
+    let name = if desktop.eq_ignore_ascii_case("Default") && station.eq_ignore_ascii_case("WinSta0")
+    {
+        "Local\\RustileWM".to_owned()
+    } else {
+        format!("Local\\RustileWM.{}.{station}.{desktop}", station.len())
+    };
+    Ok(name.encode_utf16().chain([0]).collect())
+}
+
+pub(super) fn launch_background() -> Result<OwnedHandle, String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let path: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let mut args: Vec<_> = "rustile.exe --background"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let (station, desktop) = desktop_names()?;
+    let mut desktop: Vec<_> = format!("{station}\\{desktop}")
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: desktop.as_mut_ptr(),
+        ..Default::default()
+    };
+    let mut child = PROCESS_INFORMATION::default();
+    // A long-lived manager must never keep the calling shell's output pipes
+    // open. The parent uses the local command channel to confirm readiness.
+    if unsafe {
+        CreateProcessW(
+            path.as_ptr(),
+            args.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW,
+            null(),
+            null(),
+            &startup,
+            &mut child,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Не удалось запустить Rustile: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    drop(unsafe { OwnedHandle::from_raw_handle(child.hThread) });
+    Ok(unsafe { OwnedHandle::from_raw_handle(child.hProcess) })
+}
 
 pub(super) struct Instance(OwnedHandle);
 
 impl Instance {
-    pub(super) fn acquire() -> Result<Self, String> {
-        let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) })?;
-        let name = if desktop.eq_ignore_ascii_case("Default") {
-            "Local\\RustileWM".to_owned()
-        } else {
-            let station = object_name(unsafe { GetProcessWindowStation() })?;
-            format!("Local\\RustileWM.{}.{station}.{desktop}", station.len())
+    pub(super) fn acquire() -> Result<Option<Self>, String> {
+        Self::elect(&name()?).map_err(|e| format!("Проверка экземпляра Rustile: {e}"))
+    }
+
+    fn elect(name: &[u16]) -> io::Result<Option<Self>> {
+        let mutex = unsafe {
+            CreateMutexExW(
+                null(),
+                name.as_ptr(),
+                CREATE_MUTEX_INITIAL_OWNER,
+                SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+            )
         };
-        let name: Vec<_> = name.encode_utf16().chain([0]).collect();
-        let (mutex, exists) = open_mutex(&name)?;
+        if mutex.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+                // A differently elevated primary is still the owner.
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let mutex = unsafe { OwnedHandle::from_raw_handle(mutex) };
         if exists {
-            let (process, thread) = lower_instance().ok_or(DUPLICATE)?;
-            // The normal message-loop exit unregisters hooks and restores the
-            // windows before we enumerate them. Also works with older builds.
-            if unsafe { PostThreadMessageW(thread, WM_QUIT, 0, 0) } == 0 {
-                return Err(format!(
-                    "Не удалось закрыть Rustile: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            match unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) } {
-                WAIT_OBJECT_0 => {}
-                WAIT_TIMEOUT => {
-                    return Err("Предыдущий экземпляр Rustile ещё завершает работу.".into());
-                }
-                _ => return Err(format!("Ожидание Rustile: {}", io::Error::last_os_error())),
-            }
-            // Keep the named object alive through the handoff. If two
-            // elevated launches observed the old process, only one can own it.
-            if !try_own(&mutex) {
-                return Err(DUPLICATE.into());
+            match unsafe { WaitForSingleObject(mutex.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+                WAIT_TIMEOUT => return Ok(None),
+                _ => return Err(io::Error::last_os_error()),
             }
         }
-        Ok(Self(mutex))
+        Ok(Some(Self(mutex)))
+    }
+
+    pub(super) fn running() -> Result<bool, String> {
+        let name = name()?;
+        let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_FILE_NOT_FOUND) => Ok(false),
+                Some(ERROR_ACCESS_DENIED) => Ok(true),
+                _ => Err(format!("Проверка экземпляра Rustile: {error}")),
+            };
+        }
+        drop(unsafe { OwnedHandle::from_raw_handle(handle) });
+        Ok(true)
     }
 }
 
@@ -66,96 +137,30 @@ impl Drop for Instance {
     }
 }
 
-fn open_mutex(name: &[u16]) -> Result<(OwnedHandle, bool), String> {
-    let handle = unsafe { CreateMutexW(null(), 1, name.as_ptr()) };
-    if handle.is_null() {
-        return Err(format!(
-            "Проверка экземпляра Rustile: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    Ok((unsafe { OwnedHandle::from_raw_handle(handle) }, exists))
-}
-
-fn try_own(mutex: &OwnedHandle) -> bool {
-    matches!(
-        unsafe { WaitForSingleObject(mutex.as_raw_handle(), 0) },
-        WAIT_OBJECT_0 | WAIT_ABANDONED
-    )
-}
-
-fn image_path(process: HANDLE) -> Option<Vec<u16>> {
-    let mut path = vec![0; 32_768];
-    let mut len = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len) } == 0 {
-        return None;
-    }
-    path.truncate(len as usize);
-    Some(path)
-}
-
-fn lower_instance() -> Option<(OwnedHandle, u32)> {
-    // FindWindow sees the caller's interactive desktop. Verify the owning
-    // process as well: any application can register a window of this class.
-    let tray = unsafe { FindWindowW(w!("Rustile.Tray"), w!("Rustile")) };
-    let mut pid = 0;
-    let thread = unsafe { GetWindowThreadProcessId(tray, &mut pid) };
-    if thread == 0 {
-        return None;
-    }
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        )
-    };
-    if handle.is_null() {
-        return None;
-    }
-    let process = unsafe { OwnedHandle::from_raw_handle(handle) };
-    let incumbent = ProcessAccess::query(handle)?;
-    if !ProcessAccess::current()?.can_replace(&incumbent)
-        || image_path(handle)? != image_path(unsafe { GetCurrentProcess() })?
-    {
-        return None;
-    }
-    let mut verified_pid = 0;
-    let verified_thread = unsafe { GetWindowThreadProcessId(tray, &mut verified_pid) };
-    (verified_pid == pid && verified_thread == thread).then_some((process, thread))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn concurrent_replacements_can_claim_the_incumbents_mutex_only_once() {
-        let name: Vec<_> = format!("Local\\Rustile.handoff.test.{}", std::process::id())
+    fn additional_launches_leave_the_primary_running_until_it_exits() {
+        let name: Vec<_> = format!("Local\\Rustile.test.{}", std::process::id())
             .encode_utf16()
             .chain([0])
             .collect();
-        let (original, existed) = open_mutex(&name).unwrap();
-        assert!(!existed);
-        let incumbent = Instance(original);
-        let (first, existed) = open_mutex(&name).unwrap();
-        assert!(existed);
-        let (second, existed) = open_mutex(&name).unwrap();
-        assert!(existed);
-        assert!(!std::thread::scope(|s| s
-            .spawn(|| try_own(&first))
-            .join()
-            .unwrap()));
-        drop(incumbent);
-        assert!(try_own(&first));
-        let winner = Instance(first);
-        assert!(!std::thread::scope(|s| s
-            .spawn(|| try_own(&second))
-            .join()
-            .unwrap()));
-        drop(winner);
-        assert!(try_own(&second));
-        drop(Instance(second));
+        let primary = Instance::elect(&name).unwrap().unwrap();
+        std::thread::scope(|scope| {
+            let launches: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        assert!(Instance::elect(&name).unwrap().is_none());
+                    })
+                })
+                .collect();
+            for launch in launches {
+                launch.join().unwrap();
+            }
+        });
+        drop(primary);
+        assert!(Instance::elect(&name).unwrap().is_some());
     }
 }

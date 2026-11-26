@@ -65,6 +65,7 @@ internal static class DesktopSmoke {
         bool inherit, uint flags, IntPtr env, string workingDir, ref StartupInfo startup, out ProcessInfo process);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow visit, IntPtr arg);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string className, string title);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumWindow visit, IntPtr arg);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out int pid);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
@@ -207,14 +208,33 @@ internal static class DesktopSmoke {
 
     sealed class Child : IDisposable {
         readonly IntPtr process;
+        readonly string capturePath;
         public readonly int Pid;
         public readonly int ThreadId;
-        public Child(string exe, string args, string desktop, bool launchHidden = false) {
+        public Child(string exe, string args, string desktop, bool launchHidden = false, bool capture = false) {
             var startup = new StartupInfo { cb = Marshal.SizeOf(typeof(StartupInfo)), desktop = desktop,
                 flags = launchHidden ? 1 /* STARTF_USESHOWWINDOW */ : 0, show = 0 /* SW_HIDE */ };
             ProcessInfo info;
             var line = new StringBuilder("\"" + exe + "\" " + args);
-            if (!CreateProcess(exe, line, IntPtr.Zero, IntPtr.Zero, false, 0x08000000,
+            if (capture) {
+                capturePath = Path.Combine(Path.GetTempPath(), "rustile-cli-" + Guid.NewGuid().ToString("N"));
+                var share = FileShare.ReadWrite | FileShare.Delete | FileShare.Inheritable;
+                try {
+                    using (var input = new FileStream(capturePath + ".in", FileMode.CreateNew, FileAccess.ReadWrite, share))
+                    using (var output = new FileStream(capturePath + ".out", FileMode.CreateNew, FileAccess.Write, share))
+                    using (var error = new FileStream(capturePath + ".err", FileMode.CreateNew, FileAccess.Write, share)) {
+                        startup.flags |= 0x100 /* STARTF_USESTDHANDLES */;
+                        startup.input = input.SafeFileHandle.DangerousGetHandle();
+                        startup.output = output.SafeFileHandle.DangerousGetHandle();
+                        startup.error = error.SafeFileHandle.DangerousGetHandle();
+                        if (!CreateProcess(exe, line, IntPtr.Zero, IntPtr.Zero, true, 0x08000000,
+                            IntPtr.Zero, null, ref startup, out info)) throw new Win32Exception();
+                    }
+                } catch {
+                    DeleteCapture();
+                    throw;
+                }
+            } else if (!CreateProcess(exe, line, IntPtr.Zero, IntPtr.Zero, false, 0x08000000,
                 IntPtr.Zero, null, ref startup, out info)) throw new Win32Exception();
             process = info.process;
             Pid = info.pid;
@@ -235,17 +255,138 @@ internal static class DesktopSmoke {
         public uint ExitCode {
             get { uint code; if (!GetExitCodeProcess(process, out code)) throw new Win32Exception(); return code; }
         }
+        public string Output { get { return File.ReadAllText(capturePath + ".out").Trim(); } }
+        public string Error { get { return File.ReadAllText(capturePath + ".err").Trim(); } }
+        void DeleteCapture() {
+            if (capturePath == null) return;
+            File.Delete(capturePath + ".in");
+            File.Delete(capturePath + ".out");
+            File.Delete(capturePath + ".err");
+        }
         public void Send(uint message, int id, IntPtr target = default(IntPtr)) {
             if (!PostThreadMessage(ThreadId, message, (IntPtr)id, target)) throw new Win32Exception();
         }
         public void Dispose() {
             if (!Exited(0)) { TerminateProcess(process, 1); Exited(5000); }
             CloseHandle(process);
+            DeleteCapture();
         }
     }
 
     static void Require(bool condition, string message) {
         if (!condition) throw new InvalidOperationException(message);
+    }
+    static string Cli(string exe, string args, string desktop, bool success = true) {
+        using (var client = new Child(exe, args, desktop, true, true)) {
+            Require(client.Exited(15000), "CLI did not complete: " + args);
+            var code = client.ExitCode;
+            var stdout = client.Output;
+            var stderr = client.Error;
+            Require((code == 0) == success, "Unexpected CLI exit " + code + " for " + args + ": " + stdout + " " + stderr);
+            Require(success ? stderr.Length == 0 : stdout.Length == 0 && stderr.Length != 0,
+                "CLI used the wrong output stream for " + args + ": " + stdout + " / " + stderr);
+            return stdout;
+        }
+    }
+    static void VerifyCli(string rustile, string desktop, List<Child> children, IntPtr[] windows,
+        Rectangle[] originals, Rectangle area) {
+        var client = Path.Combine(Path.GetDirectoryName(rustile), "rustilectl.exe");
+        Require(File.Exists(client), "Build rustilectl.exe alongside rustile.exe for CLI checks");
+        Require(Cli(client, "--help", desktop).Contains("desktop current"), "CLI help should work without a manager");
+        Cli(client, "status", desktop, false);
+        Cli(client, "desktop go 0", desktop, false);
+
+        // Compete for ownership from a cold start. A second tray must never
+        // install its hooks or displace the winner during the other launches.
+        var candidates = new List<Child>();
+        for (int i = 0; i < 4; i++) {
+            var process = new Child(rustile, "", desktop, true, true);
+            children.Add(process);
+            candidates.Add(process);
+        }
+        Until("Concurrent launches must settle on one manager", () => candidates.Count(c => !c.Exited(0)) == 1);
+        var manager = candidates.Single(c => !c.Exited(0));
+        foreach (var secondary in candidates.Where(c => c != manager)) {
+            Require(secondary.ExitCode == 0, "Secondary launch exited " + secondary.ExitCode + ": " + secondary.Error);
+            Require(secondary.Output.Split('\n').Any(line => line.Trim() == "pid=" + manager.Pid),
+                "Secondary launch did not report elected owner: " + secondary.Output);
+        }
+        var tray = TrayWindow(manager);
+        Until("The primary should tile both fixtures", () => Tiled(area, windows));
+        var status = Cli(client, "status", desktop);
+        Require(status.Split('\n').Any(line => line.Trim() == "pid=" + manager.Pid), "CLI did not report the elected owner: " + status);
+        Require(Cli(client, "start", desktop) == status, "Starting again must return the incumbent's status");
+        Require(Cli(rustile, "status", desktop) == status, "The GUI executable must forward requests to the same instance");
+        Require(Cli(client, "mosaic status", desktop) == "on", "Expected mosaic to be enabled");
+        var list = Cli(client, "window list", desktop).Split('\n');
+        foreach (var hwnd in windows) {
+            int pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            var prefix = "0x" + hwnd.ToInt64().ToString("X") + "\t" + pid + "\t";
+            Require(list.Any(line => line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)), "The window list omitted " + prefix);
+        }
+        // Virtual desktops belong to the real interactive Shell; an isolated
+        // Win32 desktop must return an error without switching the user's desktop.
+        Cli(client, "desktop current", desktop, false);
+        Cli(client, "desktop next", desktop, false);
+        var before = windows.Select(VisibleFrame).ToArray();
+        var names = new[] { "left", "right", "up", "down" };
+        var dir = names[NeighborDirection(before[0], before[1])];
+        var handle = " --hwnd 0x" + windows[0].ToInt64().ToString("X");
+        Cli(client, "window resize " + dir + handle, desktop);
+        Until("The explicit CLI target must grow toward its neighbor", () => {
+            var current = VisibleFrame(windows[0]);
+            return (long)current.Width * current.Height > (long)before[0].Width * before[0].Height;
+        });
+        Cli(client, "window resize " + dir + " --shrink" + handle, desktop);
+        Until("The inverse CLI resize must restore both tiles", () => windows.Select(VisibleFrame).SequenceEqual(before));
+        Cli(client, "window move " + dir + handle, desktop);
+        Until("CLI move must enter the adjacent tile", () => VisibleFrame(windows[0]).IntersectsWith(before[1]));
+
+        Require(Cli(client, "mosaic off", desktop) == "off" && Cli(client, "mosaic off", desktop) == "off",
+            "Repeated mosaic off must leave it off");
+        var paused = windows.Select(VisibleFrame).ToArray();
+        Cli(client, "window move " + dir + handle, desktop, false);
+        Cli(client, "window resize " + dir + handle, desktop, false);
+        Require(windows.Select(VisibleFrame).SequenceEqual(paused), "CLI tile commands moved a paused layout");
+        Require(Cli(client, "mosaic toggle", desktop) == "on" && Cli(client, "mosaic on", desktop) == "on",
+            "Toggle and explicit enable must control the incumbent");
+        Require(TrayWindow(manager) == tray, "Running client commands changed the tray owner");
+        Cli(client, "quit", desktop);
+        Require(manager.Exited(5000) && manager.ExitCode == 0, "CLI quit must close the manager cleanly");
+        Until("CLI quit must restore both original windows", () => windows.Select(Bounds).SequenceEqual(originals));
+        Cli(client, "status", desktop, false);
+        try {
+            var started = Cli(client, "start", desktop);
+            var pidLine = started.Split('\n').Single(line => line.StartsWith("pid="));
+            int restartPid = int.Parse(pidLine.Substring(4).Trim());
+            int trayPid;
+            GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out trayPid);
+            Require(trayPid == restartPid, "The detached manager must run on its CLI client's private desktop");
+            using (var restarted = Process.GetProcessById(restartPid)) {
+                IntPtr handleBeforeQuit = restarted.Handle;
+                Require(Cli(client, "status", desktop) == started, "The new owner must outlive its start command");
+                Require(Cli(client, "mosaic status", desktop) == "on", "A new owner should accept commands after restart");
+                Cli(client, "quit", desktop);
+                uint code;
+                Require(restarted.WaitForExit(5000) && GetExitCodeProcess(handleBeforeQuit, out code) && code == 0,
+                    "Restarted CLI owner failed to quit");
+            }
+        } finally {
+            // Also reap the test owner if a broken client never returns its PID.
+            int survivor;
+            GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out survivor);
+            if (survivor != 0) {
+                using (var process = Process.GetProcessById(survivor)) {
+                    if (String.Equals(process.MainModule.FileName, rustile, StringComparison.OrdinalIgnoreCase)) {
+                        process.Kill();
+                        process.WaitForExit(5000);
+                    }
+                }
+            }
+        }
+        Until("Restarted owner must also restore both windows", () => windows.Select(Bounds).SequenceEqual(originals));
+        Console.WriteLine("PASS  Concurrent launches share one owner; console and GUI clients return results, change tiles and release the instance on quit");
     }
     static void Until(string description, Func<bool> condition) {
         var timer = Stopwatch.StartNew();
@@ -1781,6 +1922,7 @@ internal static class DesktopSmoke {
             };
             Action<int> launch = index => launchFixture(index, false);
             launch(0); launch(1);
+            VerifyCli(rustile, desktopName, children, windows.Take(2).ToArray(), originals.Take(2).ToArray(), Screen.PrimaryScreen.WorkingArea);
             FullscreenRoundTrips(rustile, desktopName, children, windows[0], windows[1], originals);
             // Exercise the default Windows modifier even when another application
             // has already registered Win+Enter on this desktop.

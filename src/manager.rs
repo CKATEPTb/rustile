@@ -278,9 +278,19 @@ impl Manager {
         self.current == Some(old)
     }
 
-    fn transferable_on(&self, id: Id, desktop: DesktopId) -> bool {
+    pub(crate) fn transferable_on(&self, id: Id, desktop: DesktopId) -> bool {
         native::can_close_or_transfer(id)
             && self.desktops.membership(id) == DesktopMembership::Current(desktop)
+    }
+
+    pub(crate) fn current_control_targets(&self) -> Vec<Id> {
+        native::enumerate()
+            .into_iter()
+            .filter(|&id| {
+                native::can_close_or_transfer(id)
+                    && matches!(self.desktops.membership(id), DesktopMembership::Current(_))
+            })
+            .collect()
     }
 
     pub(crate) fn transfer_target_is_valid(&self, id: Id, source: DesktopId) -> bool {
@@ -936,6 +946,23 @@ impl Manager {
             && native::eligible(target)
     }
 
+    pub(crate) fn cli_tile_available(&mut self, target: Id) -> bool {
+        if !self.settings.enabled || !native::window_enabled(target) {
+            return false;
+        }
+        // The client can address a window before its show or desktop-switch
+        // notification has reached the owner thread.
+        if (!self.workspace.layout.contains(target) || !self.on_current(target))
+            && matches!(
+                self.desktops.membership(target),
+                DesktopMembership::Current(_)
+            )
+        {
+            self.reconcile_desktop();
+        }
+        self.can_act_on(target)
+    }
+
     fn shortcut_target(&self, id: Id) -> Option<ShortcutTarget> {
         if !self.settings.enabled || !native::window_enabled(id) {
             return None;
@@ -979,30 +1006,40 @@ impl Manager {
         control: WindowControl,
         foreground: impl Fn() -> Id,
     ) {
+        self.request_window_control(target, control, || foreground() == target);
+    }
+
+    pub(crate) fn request_window_control(
+        &mut self,
+        target: Id,
+        control: WindowControl,
+        still_target: impl Fn() -> bool,
+    ) -> bool {
         // A paused layout may have never seen this window. Validate the HWND
         // from the physical press against Windows, independently of tile state.
-        if target == 0 || target != foreground() {
-            return;
+        if target == 0 || !still_target() {
+            return false;
         }
         let Some(window) = native::WindowMarker::for_window_control(target, control) else {
-            return;
+            return false;
         };
-        if !matches!(
-            self.desktops.membership(target),
-            DesktopMembership::Current(_)
-        ) {
-            return;
-        }
+        let DesktopMembership::Current(desktop) = self.desktops.membership(target) else {
+            return false;
+        };
         let maximized = native::maximized(target);
         if control == WindowControl::ToggleMaximize && !maximized && !native::can_maximize(target) {
-            return;
+            return false;
         }
         self.finish_mode();
-        if window.matches() && foreground() == target {
-            match control {
-                WindowControl::Close => native::close_window(target),
-                WindowControl::ToggleMaximize => native::set_maximized(target, !maximized),
-            }
+        if self.desktops.membership(target) != DesktopMembership::Current(desktop)
+            || !window.matches()
+            || !still_target()
+        {
+            return false;
+        }
+        match control {
+            WindowControl::Close => native::close_window(target),
+            WindowControl::ToggleMaximize => native::set_maximized(target, !maximized),
         }
     }
 
@@ -1261,9 +1298,9 @@ impl Manager {
         }
     }
 
-    pub fn quick_resize(&mut self, active: Id, dir: Direction, reverse: bool) {
+    pub fn quick_resize(&mut self, active: Id, dir: Direction, reverse: bool) -> bool {
         if self.mode() != Mode::Normal || self.dragging.is_some() {
-            return;
+            return false;
         }
         if self.session.as_ref().is_none_or(|s| s.target != active) {
             self.session = Some(ResizeSession {
@@ -1272,18 +1309,18 @@ impl Manager {
                 stops: None,
             });
         }
-        self.resize_step(active, dir, reverse);
+        self.resize_step(active, dir, reverse)
     }
 
-    fn resize_step(&mut self, active: Id, dir: Direction, reverse: bool) {
+    fn resize_step(&mut self, active: Id, dir: Direction, reverse: bool) -> bool {
         let eligible = self.can_act_on(active);
         let (Some(session), Some(area)) = (&mut self.session, self.area) else {
-            return;
+            return false;
         };
         let target = session.target;
         if active != target || !eligible {
             self.finish_mode();
-            return;
+            return false;
         }
         let show_hint = session.mode == Mode::Resize;
         if let Some(edge) =
@@ -1302,7 +1339,9 @@ impl Manager {
             {
                 self.hud.show(target, rect, Some(edge), &self.settings);
             }
+            return true;
         }
+        false
     }
 
     pub fn finish_mode(&mut self) {
@@ -1311,7 +1350,7 @@ impl Manager {
         }
     }
 
-    pub fn move_window(&mut self, target: Id, direction: Direction) {
+    pub fn move_window(&mut self, target: Id, direction: Direction) -> bool {
         if let Some(area) = self.area
             && self.mode() == Mode::Normal
             && self.dragging.is_none()
@@ -1320,18 +1359,30 @@ impl Manager {
         {
             self.finish_mode();
             self.apply();
+            return true;
         }
+        false
     }
 
     pub fn focus(&mut self, from: Id, direction: Direction) {
-        let Some(area) = self.area else { return };
+        self.focus_neighbor(from, direction, || native::foreground() == from);
+    }
+
+    pub(crate) fn focus_neighbor(
+        &self,
+        from: Id,
+        direction: Direction,
+        still_target: impl Fn() -> bool,
+    ) -> bool {
+        let Some(area) = self.area else { return false };
         if self.can_act_on(from)
             && let Some(id) = self.workspace.layout.neighbor(from, direction, area)
             && self.can_act_on(id)
-            && native::foreground() == from
+            && still_target()
         {
-            native::focus(id);
+            return native::focus(id);
         }
+        false
     }
 
     pub fn shutdown(&mut self) {
