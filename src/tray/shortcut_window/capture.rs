@@ -18,8 +18,8 @@ pub(super) struct Capture {
 }
 
 impl Capture {
-    pub(super) fn start(hwnd: HWND, single_key: bool) -> Result<Self, String> {
-        // A modifier can already be held when the row is double-clicked.
+    pub(super) fn start(hwnd: HWND) -> Result<Self, String> {
+        // A modifier can already be held when recording starts.
         let held = [
             VK_LCONTROL,
             VK_RCONTROL,
@@ -31,7 +31,7 @@ impl Capture {
             VK_RWIN,
         ]
         .into_iter()
-        .filter(|&key| !single_key && unsafe { GetAsyncKeyState(i32::from(key)) } < 0)
+        .filter(|&key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0)
         .collect();
         let module = unsafe { GetModuleHandleW(null()) };
         let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) };
@@ -138,7 +138,6 @@ pub(super) enum Event {
     Changed,
     Cancel,
     Complete(Chord),
-    Single(u16),
     Ambiguous,
 }
 
@@ -153,50 +152,6 @@ fn modifier(key: u16) -> u32 {
 }
 
 impl Keys {
-    pub(super) fn single_label(&self) -> String {
-        if self.held.is_empty() {
-            return "Нажмите клавишу".into();
-        }
-        self.held
-            .iter()
-            .map(|&key| Chord::key_label(key))
-            .collect::<Vec<_>>()
-            .join("+")
-    }
-
-    // Role inputs bind one physical key, including a bare modifier. Wait for
-    // release just as the chord editor does, so repeated messages never rebind.
-    pub(super) fn single(&mut self, key: u16, down: bool) -> Event {
-        if key == VK_ESCAPE && down {
-            return Event::Cancel;
-        }
-        if modifier(key) == 0 && !Chord::supports_key(key) {
-            return Event::Unchanged;
-        }
-        if down {
-            if self.held.contains(&key) {
-                return Event::Unchanged;
-            }
-            self.ambiguous |= !self.held.is_empty();
-            self.held.push(key);
-            if matches!(key, WHEEL_UP | WHEEL_DOWN) {
-                return self.single(key, false);
-            }
-        } else if let Some(index) = self.held.iter().position(|&held| held == key) {
-            self.held.swap_remove(index);
-            if self.held.is_empty() {
-                return if self.ambiguous {
-                    Event::Ambiguous
-                } else {
-                    Event::Single(key)
-                };
-            }
-        } else {
-            return Event::Unchanged;
-        }
-        Event::Changed
-    }
-
     pub(super) fn preview(&self) -> (u32, Option<u16>) {
         self.chord.map_or_else(
             || (self.modifiers(), None),
@@ -276,20 +231,6 @@ impl Keys {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn one_role_key_commits_on_release_and_rejects_a_chord() {
-        let mut keys = Keys::default();
-        assert_eq!(keys.single(VK_RSHIFT, true), Event::Changed);
-        assert_eq!(keys.single(VK_RSHIFT, true), Event::Unchanged);
-        assert_eq!(keys.single(VK_RSHIFT, false), Event::Single(VK_RSHIFT));
-        let mut keys = Keys::default();
-        assert_eq!(keys.single(VK_LWIN, true), Event::Changed);
-        assert_eq!(keys.single(VK_LEFT, true), Event::Changed);
-        assert_eq!(keys.single(VK_LWIN, false), Event::Changed);
-        assert_eq!(keys.single(VK_LEFT, false), Event::Ambiguous);
-        assert_eq!(keys.single(VK_ESCAPE, true), Event::Cancel);
-    }
 
     #[test]
     fn commits_only_after_all_keys_are_released_in_either_order() {

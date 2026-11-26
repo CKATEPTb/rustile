@@ -125,10 +125,10 @@ impl Shortcut {
 
     fn inherited(self, settings: &Settings) -> Chord {
         let (_, group, key) = self.spec();
-        let base = settings.scheme_modifier(SchemeKey::Base);
-        let grab = settings.scheme_modifier(SchemeKey::Grab);
-        let desktop = settings.scheme_modifier(SchemeKey::Desktop);
-        let quick = settings.scheme_modifier(SchemeKey::Resize);
+        let base = settings.scheme.modifier(SchemeKey::Base);
+        let grab = settings.scheme.modifier(SchemeKey::Grab);
+        let desktop = settings.scheme.modifier(SchemeKey::Desktop);
+        let quick = settings.scheme.modifier(SchemeKey::Resize);
         let direction = match key {
             VK_LEFT => Some(SchemeKey::Left),
             VK_RIGHT => Some(SchemeKey::Right),
@@ -147,7 +147,7 @@ impl Shortcut {
             Group::Desktop if direction.is_some() => base | desktop,
             Group::Desktop => base,
         };
-        let key = direction.map_or(key, |role| settings.scheme_key(role));
+        let key = direction.map_or(key, |role| settings.scheme.key(role));
         Chord { mods, key }
     }
 }
@@ -470,25 +470,12 @@ impl From<Overrides> for BTreeMap<Shortcut, Binding> {
 }
 
 impl Settings {
-    pub fn inherited_chord(&self, action: Shortcut) -> Chord {
-        action.inherited(self)
-    }
-
-    pub fn has_shortcut_override(&self, action: Shortcut) -> bool {
-        self.shortcuts.0[action.index()].is_some()
-    }
-
     pub fn with_resize_override(self, modifier: Modifier) -> Result<Self, String> {
-        let opener = Shortcut::StartResize;
         let chord = Chord {
             mods: modifier.bits(),
             key: VK_RETURN,
         };
-        let mut live = self.changed(Command::Shortcut(opener, chord))?;
-        // Even if the command line matches today's scheme, keep that explicit
-        // launch choice when the user edits a shared role later in this session.
-        live.shortcuts.0[opener.index()] = Some(Binding::Assigned(chord));
-        Ok(live)
+        self.changed(Command::Shortcut(Shortcut::StartResize, chord))
     }
 
     pub fn binding(&self, action: Shortcut) -> Option<Chord> {
@@ -560,12 +547,12 @@ impl Settings {
     // modifiers remain held. An explicit modal binding replaces those aliases.
     pub fn resize_alias(&self, action: Shortcut, input: Chord) -> bool {
         let (_, group, _) = action.spec();
-        let key = self.inherited_chord(action).key;
+        let key = action.inherited(self).key;
         if key != input.key || self.shortcuts.0[action.index()].is_some() {
             return false;
         }
-        let base = self.scheme_modifier(SchemeKey::Base);
-        let grab = self.scheme_modifier(SchemeKey::Grab);
+        let base = self.scheme.modifier(SchemeKey::Base);
+        let grab = self.scheme.modifier(SchemeKey::Grab);
         let opener = self.binding(Shortcut::StartResize).map(|chord| chord.mods);
         match group {
             Group::Grow | Group::Shrink => {

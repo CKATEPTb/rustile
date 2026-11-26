@@ -31,8 +31,13 @@ impl ShortcutWindow {
             };
         let action = row_action(id);
         let selected = action == Some(self.selected.get());
-        let reset =
-            (reset_action(id).is_some() || scheme::reset_from_id(id).is_some()) && !disabled;
+        let icon = if edit_action(id).is_some() {
+            Some("\u{e70f}")
+        } else if reset_action(id).is_some() {
+            Some("\u{e777}")
+        } else {
+            None
+        };
         let recording = action.is_some_and(|a| self.recording(a));
         let highlighted = colors.high_contrast && (selected || hovered || pressed);
         let surface = if highlighted {
@@ -45,8 +50,6 @@ impl ShortcutWindow {
             blend(colors.background, colors.accent, 10)
         } else if hovered {
             colors.hover
-        } else if reset {
-            colors.control
         } else {
             colors.background
         };
@@ -58,10 +61,10 @@ impl ShortcutWindow {
         }
 
         let mut panel = inset(r, self.p(1));
-        if reset {
+        if icon.is_some() {
             let mid = (r.top + r.bottom) / 2;
-            panel.top = mid - self.p(11);
-            panel.bottom = mid + self.p(11);
+            panel.top = mid - self.p(13);
+            panel.bottom = mid + self.p(13);
         }
         if focused || recording {
             let edge = if recording {
@@ -70,8 +73,6 @@ impl ShortcutWindow {
                 row_colors.text
             };
             fill_outlined(dc, panel, surface, edge, self.p(5), self.p(1));
-        } else if reset {
-            fill_outlined(dc, panel, surface, colors.border, self.p(5), self.p(1));
         } else if selected || hovered || pressed {
             paint::fill(dc, &panel, surface, self.p(5));
         }
@@ -88,13 +89,17 @@ impl ShortcutWindow {
                 paint::fill(dc, &rail, row_colors.accent, self.p(1));
             }
             self.draw_action(item, action, recording, fonts, row_colors);
-        } else if reset {
+        } else if let Some(glyph) = icon {
             paint::text(
                 dc,
                 r,
-                "\u{e777}",
+                glyph,
                 fonts.symbol,
-                row_colors.secondary,
+                if disabled {
+                    colors.disabled
+                } else {
+                    row_colors.secondary
+                },
                 DT_CENTER,
             );
         }

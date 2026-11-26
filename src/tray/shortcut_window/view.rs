@@ -1,7 +1,6 @@
 use super::*;
-use crate::settings::SchemeKey;
 use Shortcut::*;
-use windows_sys::Win32::System::SystemServices::{SS_NOTIFY, SS_OWNERDRAW};
+use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
 pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
@@ -101,12 +100,18 @@ impl ShortcutWindow {
             }
         };
         let button = |parent: HWND, label: &str, id: i32| -> Result<HWND, String> {
+            // The pencil is the row's primary keyboard action.
+            let tab_stop = if row_action(id).is_some() {
+                0
+            } else {
+                WS_TABSTOP
+            };
             let hwnd = create(
                 parent,
                 w!("BUTTON"),
                 label,
                 id,
-                WS_TABSTOP | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
+                tab_stop | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
                 0,
             )?;
             unsafe { SetWindowSubclass(hwnd, Some(button_proc), 1, 0) };
@@ -114,8 +119,7 @@ impl ShortcutWindow {
         };
 
         create(hwnd, w!("STATIC"), "", STATUS, 0, 0)?;
-        let preview = create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW | SS_NOTIFY, 0)?;
-        button(hwnd, "Все действия", scheme::PAGE_SWITCH)?;
+        create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW, 0)?;
         let reset_all = button(hwnd, "Сбросить всё", RESET_ALL)?;
         let view = create(
             hwnd,
@@ -155,42 +159,7 @@ impl ShortcutWindow {
                 unsafe { SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize) };
             }
         };
-        hint(
-            hwnd,
-            preview,
-            w!("Дважды щёлкните, чтобы изменить сочетание"),
-        );
         hint(hwnd, reset_all, w!("Сбросить все сочетания"));
-        for (i, name) in scheme::GROUP_LABELS.iter().enumerate() {
-            create(
-                view,
-                w!("STATIC"),
-                name,
-                scheme::HEADING + i as i32,
-                SS_OWNERDRAW,
-                0,
-            )?;
-        }
-        for role in SchemeKey::ALL {
-            let row = button(view, role.label(), scheme::role_id(role))?;
-            let reset = button(
-                view,
-                &format!("Сбросить клавишу «{}»", role.label()),
-                scheme::reset_id(role),
-            )?;
-            hint(view, row, w!("Изменить клавишу двойным щелчком или F2"));
-            hint(view, reset, w!("Вернуть стандартную клавишу"));
-        }
-        for (i, name) in scheme::EXAMPLES.iter().enumerate() {
-            create(
-                view,
-                w!("STATIC"),
-                name,
-                scheme::EXAMPLE + i as i32,
-                SS_OWNERDRAW,
-                0,
-            )?;
-        }
         for i in READING_ORDER {
             let (label, actions) = GROUPS[i];
             create(
@@ -202,14 +171,19 @@ impl ShortcutWindow {
                 0,
             )?;
             for &action in actions {
-                let row = button(view, action.label(), row_id(action))?;
+                button(view, action.label(), row_id(action))?;
+                let edit = button(
+                    view,
+                    &format!("Изменить сочетание для «{}» — {label}", action.label()),
+                    EDIT_ROW + action.index() as i32,
+                )?;
                 let reset = button(
                     view,
-                    &format!("Сбросить сочетание для «{}»", action.label()),
+                    &format!("Сбросить сочетание для «{}» — {label}", action.label()),
                     RESET_ROW + action.index() as i32,
                 )?;
-                hint(view, row, w!("Изменить сочетание двойным щелчком или F2"));
-                hint(view, reset, w!("Сбросить сочетание"));
+                hint(view, edit, w!("Изменить сочетание"));
+                hint(view, reset, w!("Вернуть сочетание по умолчанию"));
             }
         }
         Ok(())
@@ -268,10 +242,9 @@ impl ShortcutWindow {
         }
     }
 
-    pub(super) fn margin(&self, width: i32) -> i32 {
+    fn margin(&self, width: i32) -> i32 {
         let edge = if width < self.p(620) { 14 } else { 24 };
-        let limit = if self.advanced.get() { 1460 } else { 924 };
-        self.p(edge).max((width - self.p(limit)) / 2)
+        self.p(edge).max((width - self.p(1460)) / 2)
     }
 
     pub(super) fn set_status(&self, message: &str) {
@@ -294,25 +267,11 @@ impl ShortcutWindow {
         let p = |n| self.p(n);
         let compact = width < p(620);
         let content = width - 2 * margin;
-        let reset_width = p(if width < p(800) { 34 } else { 133 });
-        let page_width = p(if self.advanced.get() { 167 } else { 137 });
-        let header_height = p(if compact { 87 } else { 86 });
+        let reset_width = p(if compact { 34 } else { 133 });
+        let header_height = p(if compact { 92 } else { 86 });
         let button_height = p(32);
-        let reset_y = if compact {
-            header_height
-        } else {
-            (header_height - button_height) / 2
-        };
-        let page_x = if compact {
-            margin
-        } else {
-            width - margin - reset_width - p(8) - page_width
-        };
-        let preview_width = if compact {
-            content
-        } else {
-            page_x - margin - p(18)
-        };
+        let reset_y = (header_height - button_height) / 2;
+        let preview_width = content - reset_width - p(if compact { 10 } else { 20 });
         place(
             child(hwnd, PREVIEW),
             margin,
@@ -321,24 +280,13 @@ impl ShortcutWindow {
             header_height,
         );
         place(
-            child(hwnd, scheme::PAGE_SWITCH),
-            page_x,
-            reset_y,
-            page_width,
-            button_height,
-        );
-        place(
             child(hwnd, RESET_ALL),
             width - margin - reset_width,
             reset_y,
             reset_width,
             button_height,
         );
-        let mut top = if compact {
-            reset_y + button_height + p(10)
-        } else {
-            header_height
-        };
+        let mut top = header_height;
         if count > 0 {
             let mut text = vec![0; count as usize + 1];
             let mut bounds = RECT {
@@ -382,10 +330,6 @@ impl ShortcutWindow {
     }
 
     fn layout_rows(&self, view: HWND, width: i32, height: i32) {
-        if !self.advanced.get() {
-            self.layout_scheme(view, width, height);
-            return;
-        }
         let p = |n| self.p(n);
         let columns = if width >= p(1140) {
             3
@@ -417,33 +361,6 @@ impl ShortcutWindow {
                 header_h + GROUPS[i].1.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(15);
         }
         let total = *ends.iter().max().unwrap();
-        let client_width = self.scroll_extent(view, total, height);
-        let margin = self.margin(width);
-        let gap = p(24);
-        let col = (client_width - 2 * margin - (columns - 1) * gap) / columns;
-        let reset_w = p(25);
-        for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let (column, start) = starts[i];
-            let x = margin + column as i32 * (col + gap);
-            let mut y = start - self.scroll.get();
-            place(child(view, SECTION + i as i32), x, y, col, header_h);
-            y += header_h;
-            for &action in actions {
-                y += row_gap(action);
-                place(self.row(action), x, y, col - reset_w, row_h);
-                place(
-                    child(view, RESET_ROW + action.index() as i32),
-                    x + col - reset_w,
-                    y,
-                    reset_w,
-                    row_h,
-                );
-                y += row_h;
-            }
-        }
-    }
-
-    pub(super) fn scroll_extent(&self, view: HWND, total: i32, height: i32) -> i32 {
         self.scroll
             .set(self.scroll.get().clamp(0, (total - height).max(0)));
         let scroll = SCROLLINFO {
@@ -460,7 +377,37 @@ impl ShortcutWindow {
             SetScrollInfo(view, SB_VERT, &scroll, 1);
             GetClientRect(view, &mut client)
         };
-        client.right
+        let margin = self.margin(width);
+        let gap = p(24);
+        let col = (client.right - 2 * margin - (columns - 1) * gap) / columns;
+        let button_w = p(28);
+        for (i, &(_, actions)) in GROUPS.iter().enumerate() {
+            let (column, start) = starts[i];
+            let x = margin + column as i32 * (col + gap);
+            let mut y = start - self.scroll.get();
+            place(child(view, SECTION + i as i32), x, y, col, header_h);
+            y += header_h;
+            for &action in actions {
+                y += row_gap(action);
+                let label_width = col - 2 * button_w;
+                place(self.row(action), x, y, label_width, row_h);
+                place(
+                    child(view, EDIT_ROW + action.index() as i32),
+                    x + label_width,
+                    y,
+                    button_w,
+                    row_h,
+                );
+                place(
+                    child(view, RESET_ROW + action.index() as i32),
+                    x + col - button_w,
+                    y,
+                    button_w,
+                    row_h,
+                );
+                y += row_h;
+            }
+        }
     }
 
     pub(super) fn reveal_row(&self, hwnd: HWND, row: HWND) {
@@ -517,7 +464,7 @@ impl ShortcutWindow {
     }
 }
 
-pub(super) fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe {
         SetWindowPos(
             hwnd,
@@ -591,15 +538,6 @@ unsafe extern "system" fn button_proc(
 ) -> LRESULT {
     unsafe {
         match msg {
-            WM_LBUTTONDBLCLK
-                if row_action(GetDlgCtrlID(hwnd)).is_some()
-                    || scheme::role_from_id(GetDlgCtrlID(hwnd)).is_some() =>
-            {
-                SetFocus(hwnd);
-                let command = GetDlgCtrlID(hwnd) as usize | ((BN_DOUBLECLICKED as usize) << 16);
-                SendMessageW(GetParent(hwnd), WM_COMMAND, command, hwnd as isize);
-                return 0;
-            }
             WM_MOUSEMOVE => {
                 let mut tracking = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,

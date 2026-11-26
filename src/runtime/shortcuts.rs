@@ -643,7 +643,7 @@ impl Drop for Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Command, Modifier, SchemeKey};
+    use crate::settings::{Command, Modifier};
 
     const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
@@ -709,19 +709,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_roles_rebuild_normal_modal_and_wheel_routes_together() {
+    fn a_saved_scheme_preserves_normal_modal_and_wheel_routes() {
         let mut keyboard = Keyboard::new();
-        keyboard.assign(Shortcut::MoveRight, MOD_CONTROL, VK_F9);
-        for (role, key) in [
-            (SchemeKey::Base, VK_MENU),
-            (SchemeKey::Grab, VK_CONTROL),
-            (SchemeKey::Left, VK_H),
-        ] {
-            keyboard.settings = keyboard
-                .settings
-                .changed(Command::SchemeKey(role, key))
+        keyboard.settings =
+            toml::from_str("[scheme]\nbase = 18\ngrab = 17\ndesktop = 16\nresize = 91\nleft = 72")
                 .unwrap();
-        }
+        keyboard.assign(Shortcut::MoveRight, MOD_CONTROL, VK_F9);
         let routes = Routes::new(keyboard.settings);
         let command = |mode, key: u16, mods| {
             let state = Snapshot {

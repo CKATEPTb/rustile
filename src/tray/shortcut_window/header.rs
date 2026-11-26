@@ -286,7 +286,7 @@ impl ShortcutWindow {
     }
 }
 
-pub(super) fn windows_mark(dc: HDC, bounds: RECT, side: i32, gutter: i32, ink: COLORREF) {
+fn windows_mark(dc: HDC, bounds: RECT, side: i32, gutter: i32, ink: COLORREF) {
     let pane = ((side - gutter) / 2).max(1);
     let span = 2 * pane + gutter;
     let x = (bounds.left + bounds.right - span) / 2;
@@ -308,7 +308,7 @@ pub(super) fn windows_mark(dc: HDC, bounds: RECT, side: i32, gutter: i32, ink: C
     }
 }
 
-pub(super) fn buffered(item: &DRAWITEMSTRUCT, paint: impl FnOnce(HDC, RECT)) {
+fn buffered(item: &DRAWITEMSTRUCT, paint: impl FnOnce(HDC, RECT)) {
     let r = item.rcItem;
     let (width, height) = (r.right - r.left, r.bottom - r.top);
     if width <= 0 || height <= 0 {

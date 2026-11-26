@@ -4,8 +4,7 @@ mod scheme;
 use crate::profile_io;
 use bindings::Overrides;
 pub(crate) use bindings::{BindingOwners, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
-use scheme::Scheme;
-pub(crate) use scheme::SchemeKey;
+use scheme::{Scheme, SchemeKey};
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
 
@@ -61,7 +60,6 @@ pub(crate) enum Command {
     Outline(u8),
     Gap(u8),
     Padding(u8),
-    SchemeKey(SchemeKey, u16),
     Shortcut(Shortcut, Chord),
     ReassignShortcut(Shortcut, Chord, BindingOwners),
     ResetShortcut(Shortcut),
@@ -73,8 +71,7 @@ impl Command {
     pub fn changes_shortcuts(self) -> bool {
         matches!(
             self,
-            Self::SchemeKey(..)
-                | Self::Shortcut(..)
+            Self::Shortcut(..)
                 | Self::ReassignShortcut(..)
                 | Self::ResetShortcut(_)
                 | Self::ResetShortcuts
@@ -176,7 +173,6 @@ impl Settings {
             Command::Outline(value) => self.outline = value,
             Command::Gap(value) => self.gap = value,
             Command::Padding(value) => self.padding = value,
-            Command::SchemeKey(role, key) => self.set_scheme_key(role, key)?,
             Command::Shortcut(action, chord) => self.assign(action, chord)?,
             Command::ReassignShortcut(action, chord, owner) => {
                 if self.conflict(action, chord) != Some(owner) {
@@ -184,7 +180,7 @@ impl Settings {
                 }
                 self.transfer_confirmed(action, chord, owner)?;
             }
-            Command::ResetShortcut(action) => self.assign(action, self.inherited_chord(action))?,
+            Command::ResetShortcut(action) => self.assign(action, action.default_chord())?,
             Command::ResetShortcuts => {
                 let defaults = Self::default();
                 self.scheme = defaults.scheme;
