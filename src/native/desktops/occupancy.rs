@@ -1,15 +1,17 @@
 use std::cell::OnceCell;
 use std::collections::HashSet;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, TYPE_E_ELEMENTNOTFOUND};
 use windows_sys::Win32::Graphics::Dwm::{DWM_CLOAKED_SHELL, DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW, GetWindowLongW,
-    IsIconic, IsWindow, IsWindowVisible, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_MINIMIZE,
+    IsIconic, IsWindow, IsWindowVisible, WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MINIMIZE,
 };
+use windows_sys::core::HRESULT;
 
 use super::shell::ApplicationViews;
 use super::{DesktopId, Service, shell_window};
@@ -82,7 +84,8 @@ fn window_desktop(
     if !task_window(hwnd).ok_or(())? {
         return Ok(None);
     }
-    let mut desktop = service.desktop_id(hwnd).ok();
+    let view_desktop = service.desktop_id(hwnd);
+    let mut desktop = view_desktop.ok();
     if desktop.is_none_or(|d| d.0 == 0) {
         // A modal window may belong to the shell view of a hidden owner.
         let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
@@ -92,6 +95,14 @@ fn window_desktop(
                 Ok(_) => desktop,
                 Err(_) => None,
             };
+        } else if owner == hwnd
+            && unassigned_overlay(
+                view_desktop,
+                unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32,
+                unsafe { IsIconic(hwnd) } != 0,
+            )
+        {
+            return Ok(None);
         }
     }
     if unsafe { IsWindow(hwnd) } == 0 {
@@ -104,6 +115,16 @@ fn window_desktop(
                 .as_ref()
                 .is_some_and(|views| views.is_hidden_unassigned_view(hwnd))
     })
+}
+
+// An unowned, click-through overlay can be visible without having a Shell
+// application view. An assigned, minimized or temporarily unavailable app
+// must still protect its desktop even if it happens to use the same styles.
+fn unassigned_overlay(desktop: Result<DesktopId, HRESULT>, extended: u32, minimized: bool) -> bool {
+    const OVERLAY: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    !minimized
+        && desktop == Err(TYPE_E_ELEMENTNOTFOUND)
+        && extended & (OVERLAY | WS_EX_APPWINDOW) == OVERLAY
 }
 
 fn class_name(hwnd: HWND) -> Option<String> {
@@ -237,7 +258,29 @@ fn core_window_shell_host(process_id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_POPUP, WS_VISIBLE};
+
+    #[test]
+    fn only_unassigned_click_through_overlays_can_be_ignored() {
+        let overlay = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+        let absent = Err(TYPE_E_ELEMENTNOTFOUND);
+        assert!(unassigned_overlay(absent, overlay, false));
+        assert!(!unassigned_overlay(Ok(DesktopId(1)), overlay, false));
+        assert!(!unassigned_overlay(Ok(DesktopId(0)), overlay, false));
+        assert!(!unassigned_overlay(Err(-1), overlay, false));
+        assert!(!unassigned_overlay(absent, overlay, true));
+        assert!(!unassigned_overlay(
+            absent,
+            overlay | WS_EX_APPWINDOW,
+            false
+        ));
+        assert!(!unassigned_overlay(
+            absent,
+            overlay & !WS_EX_TRANSPARENT,
+            false
+        ));
+        assert!(!unassigned_overlay(absent, WS_EX_TOOLWINDOW, false));
+    }
 
     #[test]
     fn minimized_dialogs_and_fullscreen_or_floating_apps_count() {
