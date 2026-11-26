@@ -89,7 +89,7 @@ impl Default for Editor {
             hwnd: Cell::default(),
             owner: Cell::default(),
             dpi: Cell::new(96),
-            colors: Cell::new(Colors::current()),
+            colors: Cell::new(Colors::themed(false)),
             fonts: RefCell::default(),
             rules: RefCell::default(),
             selected: Cell::new(None),
@@ -626,6 +626,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 ui.hwnd.set(null_mut());
                 ui.fonts.take();
+                ui.rules.take();
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),

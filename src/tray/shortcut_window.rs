@@ -94,8 +94,8 @@ pub(super) struct ShortcutWindow {
     dpi: Cell<u32>,
     reset_button_width: Cell<i32>,
     settings: RefCell<Settings>,
-    slots: RefCell<[Vec<Slot>; Shortcut::ALL.len()]>,
-    row_metrics: RefCell<[Option<keycaps::RowMetrics>; Shortcut::ALL.len()]>,
+    slots: RefCell<Vec<Vec<Slot>>>,
+    row_metrics: RefCell<Vec<Option<keycaps::RowMetrics>>>,
     tooltip: Cell<HWND>,
     selected_slot: Cell<usize>,
     after_save: Cell<Option<(Shortcut, Chord)>>,
@@ -123,8 +123,8 @@ impl Default for ShortcutWindow {
             dpi: Cell::new(96),
             reset_button_width: Cell::new(0),
             settings: RefCell::default(),
-            slots: RefCell::new(std::array::from_fn(|_| Vec::new())),
-            row_metrics: RefCell::new(std::array::from_fn(|_| None)),
+            slots: RefCell::default(),
+            row_metrics: RefCell::default(),
             tooltip: Cell::default(),
             selected_slot: Cell::new(0),
             after_save: Cell::default(),
@@ -140,7 +140,7 @@ impl Default for ShortcutWindow {
             sizing: Cell::default(),
             resize_canvas: RefCell::default(),
             raster: RefCell::default(),
-            colors: Cell::new(Colors::current()),
+            colors: Cell::new(Colors::themed(false)),
             fonts: RefCell::default(),
         }
     }
@@ -243,7 +243,13 @@ impl ShortcutWindow {
         Ok(())
     }
 
-    pub(super) fn set_settings(&self, settings: Settings) {
+    pub(super) fn sync_settings(&self, settings: &Settings) {
+        if !self.hwnd.get().is_null() {
+            self.set_settings(settings.clone());
+        }
+    }
+
+    fn set_settings(&self, settings: Settings) {
         if *self.settings.borrow() == settings {
             return;
         }
@@ -597,9 +603,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if msg == WM_NCCREATE {
             let create = &*(lp as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-            (*(create.lpCreateParams as *const ShortcutWindow))
-                .hwnd
-                .set(hwnd);
+            let ui = &*(create.lpCreateParams as *const ShortcutWindow);
+            ui.slots
+                .borrow_mut()
+                .resize_with(Shortcut::ALL.len(), Vec::new);
+            ui.row_metrics
+                .borrow_mut()
+                .resize_with(Shortcut::ALL.len(), || None);
+            ui.hwnd.set(hwnd);
         }
         let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ShortcutWindow).as_ref()
         else {
@@ -761,8 +772,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_MOUSEWHEEL => 0,
             WM_NCDESTROY => {
                 ui.capture.take();
-                ui.slots.borrow_mut().iter_mut().for_each(Vec::clear);
-                ui.row_metrics.borrow_mut().fill_with(|| None);
+                ui.slots.take();
+                ui.row_metrics.take();
+                ui.settings.take();
+                ui.fonts.take();
                 ui.tooltip.set(null_mut());
                 ui.after_save.set(None);
                 ui.selected_slot.set(0);

@@ -151,7 +151,13 @@ pub(crate) fn current() -> Language {
 }
 
 pub(crate) fn tr(message: Msg) -> &'static str {
-    MESSAGES[message as usize][current() as usize]
+    translation(message, current() as usize)
+}
+
+fn translation(message: Msg, language: usize) -> &'static str {
+    let (text, offsets) = CATALOGS[language];
+    let index = message as usize;
+    &text[offsets[index] as usize..offsets[index + 1] as usize]
 }
 
 type WideCatalog = Vec<OnceLock<Box<[u16]>>>;
@@ -161,10 +167,10 @@ static WIDE: [OnceLock<WideCatalog>; 12] = [const { OnceLock::new() }; 12];
 pub(crate) fn wide(message: Msg) -> *const u16 {
     let language = current() as usize;
     let catalog =
-        WIDE[language].get_or_init(|| (0..MESSAGES.len()).map(|_| OnceLock::new()).collect());
+        WIDE[language].get_or_init(|| (0..MESSAGE_COUNT).map(|_| OnceLock::new()).collect());
     catalog[message as usize]
         .get_or_init(|| {
-            MESSAGES[message as usize][language]
+            translation(message, language)
                 .encode_utf16()
                 .chain([0])
                 .collect()

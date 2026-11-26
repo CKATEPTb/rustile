@@ -37,6 +37,7 @@ use shortcut_window::ShortcutWindow;
 use stepper::{EDIT_ID, EndEdit, Inline, arrow_info};
 
 const CALLBACK: u32 = WM_APP + 20;
+const RELEASE_HIDDEN_CONTROLS: u32 = WM_APP + 21;
 const ICON_ID: u32 = 1;
 const HEADER_ICON_DIP: i32 = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -144,7 +145,7 @@ impl Tray {
                 icon_pressed: Cell::new(false),
                 dismiss_pending: Cell::new(false),
                 dpi: Cell::new(dpi),
-                colors: Cell::new(Colors::current()),
+                colors: Cell::new(Colors::themed(false)),
                 fonts: RefCell::default(),
                 entries: RefCell::default(),
                 buttons: RefCell::default(),
@@ -180,7 +181,7 @@ impl Tray {
     pub fn set_settings(&self, settings: Settings) {
         self.state.applying.set(None);
         let language_changed = self.state.settings.borrow().language != settings.language;
-        self.state.shortcuts.set_settings(settings.clone());
+        self.state.shortcuts.sync_settings(&settings);
         if language_changed {
             self.state.exclusions.language_changed();
         }
@@ -263,6 +264,12 @@ impl Tray {
     }
 
     pub fn pre_translate(&self, message: &MSG) -> bool {
+        if message.hwnd == self.hwnd && message.message == RELEASE_HIDDEN_CONTROLS {
+            if unsafe { IsWindowVisible(self.hwnd) } == 0 {
+                self.state.release_hidden_controls(self.hwnd);
+            }
+            return true;
+        }
         self.state.exclusions.pre_translate(message) || self.state.shortcuts.pre_translate(message)
     }
 
@@ -702,6 +709,28 @@ impl State {
         }
         self.cancel_deferred_dismissal(hwnd);
         self.hot.set(null_mut());
+        // A button's native BM_CLICK still uses its HWND after BN_CLICKED
+        // returns. Reclaim the controls from the outer message loop instead.
+        unsafe { PostMessageW(hwnd, RELEASE_HIDDEN_CONTROLS, 0, 0) };
+    }
+
+    fn release_hidden_controls(&self, hwnd: HWND) {
+        // Keep the shell notification window, but release the controls and
+        // graphics that were only needed while the flyout was on screen.
+        unsafe {
+            let mut child = GetWindow(hwnd, GW_CHILD);
+            while !child.is_null() {
+                let next = GetWindow(child, GW_HWNDNEXT);
+                DestroyWindow(child);
+                child = next;
+            }
+            if let Some((_, icon)) = self.header_icon.take() {
+                DestroyIcon(icon);
+            }
+        }
+        self.buttons.take();
+        self.entries.take();
+        self.fonts.take();
     }
 
     fn focus(&self, hwnd: HWND, index: usize) {

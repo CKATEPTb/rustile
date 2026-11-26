@@ -69,9 +69,21 @@ fn compile_messages() {
     for key in catalog.keys() {
         code.push_str(&format!("    {key},\n"));
     }
-    code.push_str("}\nconst MESSAGES: &[[&str; 12]] = &[\n");
-    for values in catalog.values() {
-        code.push_str(&format!("    {values:?},\n"));
+    // Group each language's bytes together. Byte offsets keep the catalog
+    // read-only when Windows relocates the executable at load time.
+    code.push_str(&format!(
+        "}}\nconst MESSAGE_COUNT: usize = {};\n",
+        catalog.len()
+    ));
+    code.push_str("const CATALOGS: [(&str, &[u32; MESSAGE_COUNT + 1]); 12] = [\n");
+    for language in 0..12 {
+        let mut text = String::new();
+        let mut offsets = vec![0u32];
+        for values in catalog.values() {
+            text.push_str(&values[language]);
+            offsets.push(u32::try_from(text.len()).expect("language catalog exceeds 4 GiB"));
+        }
+        code.push_str(&format!("    ({text:?}, &{offsets:?}),\n"));
     }
     code.push_str("];\n");
     fs::write(

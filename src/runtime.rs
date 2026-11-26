@@ -10,7 +10,7 @@ mod shortcuts;
 mod tests;
 
 use crate::i18n::{Msg, render};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
@@ -61,7 +61,6 @@ const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
 pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
-const DESKTOP_LIST_CHANGED: u32 = WM_APP + 5;
 const DESKTOP_SETTLE_MS: u32 = 160;
 const FOCUS_SETTLE_MS: u32 = 40;
 const FOCUS_CONFIRM_MS: u32 = 450;
@@ -192,7 +191,6 @@ impl DesktopStep {
 // that may themselves deliver more events.
 thread_local! {
     static PENDING: RefCell<Vec<(u32, isize)>> = const { RefCell::new(Vec::new()) };
-    static WATCH_TITLES: Cell<bool> = const { Cell::new(false) };
 }
 
 const ARROWS: [Direction; 4] = [
@@ -217,16 +215,15 @@ unsafe extern "system" fn on_window_event(
 ) {
     if (hwnd.is_null() && !matches!(event, EVENT_SYSTEM_DESKTOPSWITCH | EVENT_SYSTEM_FOREGROUND))
         || (event >= EVENT_OBJECT_CREATE && (object != OBJID_WINDOW || child != 0))
-        || (event == EVENT_OBJECT_NAMECHANGE && !WATCH_TITLES.get())
     {
         return;
     }
-    // Controls can emit LOCATIONCHANGE at scroll/animation rates. Never query
-    // the parent of a destroyed HWND; the manager still needs its removal.
-    if matches!(
-        event,
-        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_STATECHANGE | EVENT_OBJECT_NAMECHANGE
-    ) && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
+    // Scroll, render and control lifecycle events can arrive in separate
+    // batches. Only top-level windows affect tiling or desktop occupancy.
+    // A destroyed HWND may no longer resolve, but must still be forgotten.
+    if event >= EVENT_OBJECT_CREATE
+        && event != EVENT_OBJECT_DESTROY
+        && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
     {
         return;
     }
@@ -245,51 +242,54 @@ unsafe extern "system" fn on_window_event(
     }
 }
 
-#[derive(Default)]
-struct EventHooks(Vec<HWINEVENTHOOK>);
+struct EventHook(HWINEVENTHOOK);
 
-impl EventHooks {
-    fn install() -> Result<Self, String> {
-        let mut hooks = Self::default();
-        for (first, last) in [
+impl EventHook {
+    fn subscribe(first: u32, last: u32) -> Result<Self, String> {
+        let handle = unsafe {
+            SetWinEventHook(
+                first,
+                last,
+                null_mut(),
+                Some(on_window_event),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if handle.is_null() {
+            return Err(format!(
+                "Could not subscribe to window events {first:#x}–{last:#x}: {}",
+                crate::cli_error::io(io::Error::last_os_error())
+            ));
+        }
+        Ok(Self(handle))
+    }
+
+    fn titles() -> Result<Self, String> {
+        Self::subscribe(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE)
+    }
+
+    fn install() -> Result<Vec<Self>, String> {
+        [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
             (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
             (EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
             (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
-            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
-        ] {
-            let handle = unsafe {
-                SetWinEventHook(
-                    first,
-                    last,
-                    null_mut(),
-                    Some(on_window_event),
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                )
-            };
-            if handle.is_null() {
-                return Err(format!(
-                    "Could not subscribe to window events {first:#x}–{last:#x}: {}",
-                    crate::cli_error::io(io::Error::last_os_error())
-                ));
-            }
-            hooks.0.push(handle);
-        }
-        Ok(hooks)
+        ]
+        .into_iter()
+        .map(|(first, last)| Self::subscribe(first, last))
+        .collect()
     }
 }
 
-impl Drop for EventHooks {
+impl Drop for EventHook {
     fn drop(&mut self) {
-        for handle in self.0.drain(..) {
-            unsafe { UnhookWinEvent(handle) };
-        }
+        unsafe { UnhookWinEvent(self.0) };
     }
 }
 
@@ -403,6 +403,7 @@ struct Preferences<'a> {
     live: Settings,
     saved: Settings,
     path: &'a Path,
+    title_events: Option<EventHook>,
 }
 
 impl Preferences<'_> {
@@ -445,6 +446,19 @@ impl Preferences<'_> {
         let write = (saved != self.saved)
             .then(|| saved.prepare(self.path))
             .transpose()?;
+        // Arm before the rescan so a rename during Apply cannot be missed.
+        // A rejected edit drops its provisional hook and keeps the old one.
+        let title_events = if self.title_events.is_none()
+            && next.enabled
+            && next
+                .exclusions
+                .iter()
+                .any(|rule| !rule.title.trim().is_empty())
+        {
+            Some(EventHook::titles()?)
+        } else {
+            None
+        };
         manager.apply_settings_with(next.clone(), || {
             if let Some(pending) = write {
                 pending.commit()?;
@@ -454,7 +468,11 @@ impl Preferences<'_> {
             }
             Ok(())
         })?;
-        WATCH_TITLES.set(manager.watches_titles());
+        if !manager.watches_titles() {
+            self.title_events = None;
+        } else if self.title_events.is_none() {
+            self.title_events = title_events;
+        }
         tray.set_settings(next.clone());
         self.live = next;
         self.saved = saved;
@@ -605,6 +623,11 @@ fn pump(
     let mut navigation: VecDeque<QueuedStep> = VecDeque::new();
     let mut cli_arrival = None;
     let mut following: Option<Rc<TransferIdentity>> = None;
+    let mut desktop_watch = None;
+    if workspaces.supported {
+        desktop_watch = desktop_watch::DesktopWatch::start();
+        inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
+    }
     let mut desktop_focus = DesktopFocus {
         observed: workspaces
             .current_desktop()
@@ -614,11 +637,6 @@ fn pump(
     let mut drag_timer = MessageTimer::default();
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
     let thread_id = unsafe { GetCurrentThreadId() };
-    let mut desktop_watch = None;
-    if workspaces.supported {
-        desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
-        inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
-    }
     let mut retries = 0;
     if manager.take_desktop_retry() {
         retries = 2;
@@ -627,23 +645,20 @@ fn pump(
         }
     }
     loop {
-        match unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } {
-            -1 => {
-                return Err(format!(
-                    "Windows message loop failed: {}",
-                    crate::cli_error::io(io::Error::last_os_error())
-                ));
-            }
-            0 => return Ok(None),
-            _ => {}
+        let desktops_changed = desktop_watch::next_message(&mut desktop_watch, &mut message)
+            .map_err(|err| format!("Windows message loop failed: {}", crate::cli_error::io(err)))?;
+        if message.message == WM_QUIT {
+            return Ok(None);
         }
+        let watching_desktops = desktop_watch
+            .as_ref()
+            .is_some_and(|w| w.watching_desktops());
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
         let has_events = !events.is_empty();
         let opening_due = opening_timer.take(&message);
         let timer_fired = desktop_timer.take(&message);
         let inventory_due = inventory_timer.take(&message);
         let focus_due = focus_timer.take(&message);
-        let desktops_changed = message.message == DESKTOP_LIST_CHANGED;
         let mut inventory_changed = desktops_changed;
         let work_area_changed = tray.take_work_area_change();
         // Some appbars reserve their edge without a settings broadcast. Read
@@ -658,19 +673,18 @@ fn pump(
         for (event, id) in events.drain(..) {
             // Child controls and focus changes don't change which desktops have
             // windows. A destroyed HWND can no longer be checked for a parent.
-            let changed_window = match event {
-                EVENT_OBJECT_DESTROY | EVENT_SYSTEM_DESKTOPSWITCH => true,
-                EVENT_OBJECT_CREATE
-                | EVENT_OBJECT_SHOW
-                | EVENT_OBJECT_HIDE
-                | EVENT_OBJECT_CLOAKED
-                | EVENT_OBJECT_UNCLOAKED => {
-                    (unsafe { GetAncestor(id as HWND, GA_ROOT) }) == id as HWND
-                }
-                _ => false,
-            };
+            let changed_window = matches!(
+                event,
+                EVENT_SYSTEM_DESKTOPSWITCH
+                    | EVENT_OBJECT_DESTROY
+                    | EVENT_OBJECT_CREATE
+                    | EVENT_OBJECT_SHOW
+                    | EVENT_OBJECT_HIDE
+                    | EVENT_OBJECT_CLOAKED
+                    | EVENT_OBJECT_UNCLOAKED
+            );
             inventory_changed |=
-                changed_window || (event == EVENT_SYSTEM_FOREGROUND && desktop_watch.is_none());
+                changed_window || (event == EVENT_SYSTEM_FOREGROUND && !watching_desktops);
             focus_event |= changed_window
                 || matches!(
                     event,
@@ -687,7 +701,7 @@ fn pump(
             if event == EVENT_SYSTEM_DESKTOPSWITCH || id == 0 {
                 manager.finish_mode();
                 manager.cancel_mouse_move();
-            } else if event != EVENT_OBJECT_CREATE || changed_window {
+            } else {
                 manager.event(event, id);
             }
         }
@@ -738,7 +752,7 @@ fn pump(
                 inventory_timer.schedule(delay);
             }
             if workspaces.supported && desktop_watch.is_none() {
-                desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
+                desktop_watch = desktop_watch::DesktopWatch::start();
             }
         } else if needs_scan {
             inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
@@ -774,8 +788,7 @@ fn pump(
             || timer_fired
             || focus_due
             || (destination.is_some() && desktop_focus.awaiting_switch())
-            || (desktop_watch.is_none()
-                && (inventory_due || (has_events && !workspaces.available())))
+            || (!watching_desktops && (inventory_due || (has_events && !workspaces.available())))
         {
             let actual = if workspaces.available() {
                 workspaces.current_desktop()
@@ -1231,6 +1244,7 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
         live: live.clone(),
         saved,
         path: &path,
+        title_events: None,
     };
     let console = ConsoleHandler::install();
     match &console {
@@ -1240,9 +1254,11 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
     let mut tray = Tray::new(live.clone())?;
     let server = ipc::Server::start()?;
     let keyboard = shortcuts::Hook::install(&live)?;
-    let hooks = EventHooks::install()?;
+    let hooks = EventHook::install()?;
     let (mut manager, exclusion_warning) = Manager::from_saved(live);
-    WATCH_TITLES.set(manager.watches_titles());
+    if manager.watches_titles() {
+        preferences.title_events = Some(EventHook::titles()?);
+    }
     manager.sync();
     refresh(&mut manager, 0);
     if let Some(warning) = load_warning {

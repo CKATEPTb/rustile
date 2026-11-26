@@ -126,13 +126,32 @@ impl KeyRoutes {
 }
 
 const INPUT_SLOTS: usize = crate::settings::WHEEL_DOWN as usize + 1;
-struct Routes([Option<KeyRoutes>; INPUT_SLOTS]);
+struct Routes {
+    indices: [u16; INPUT_SLOTS],
+    rows: Vec<KeyRoutes>,
+}
 
 impl Routes {
-    const EMPTY: Self = Self([None; INPUT_SLOTS]);
+    const EMPTY: Self = Self {
+        indices: [u16::MAX; INPUT_SLOTS],
+        rows: Vec::new(),
+    };
+
+    fn get(&self, slot: usize) -> Option<KeyRoutes> {
+        self.rows.get(usize::from(self.indices[slot])).copied()
+    }
+
+    fn row_mut(&mut self, key: u16) -> &mut KeyRoutes {
+        let index = &mut self.indices[usize::from(key)];
+        if *index == u16::MAX {
+            *index = self.rows.len() as u16;
+            self.rows.push(KeyRoutes::default());
+        }
+        &mut self.rows[usize::from(*index)]
+    }
 
     fn new(settings: &Settings) -> Self {
-        let mut keys = [None; INPUT_SLOTS];
+        let mut keys = Self::EMPTY;
         let bindings: Vec<_> = Shortcut::ALL
             .into_iter()
             .flat_map(|action| {
@@ -147,7 +166,7 @@ impl Routes {
                 continue;
             }
             let id = command_id(action);
-            let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
+            let row = keys.row_mut(chord.key);
             for mods in 0..16 {
                 if settings.resize_alias(
                     action,
@@ -163,10 +182,10 @@ impl Routes {
         // An explicitly assigned modal chord wins over the implicit variants
         // that let a user keep the opener's modifiers held in resize mode.
         for (action, chord) in bindings {
-            let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
+            let row = keys.row_mut(chord.key);
             row.bind(action, chord.mods);
         }
-        Self(keys)
+        keys
     }
 }
 
@@ -376,7 +395,9 @@ impl Pending {
 
 thread_local! {
     static OWNER: Cell<u32> = const { Cell::new(0) };
-    static HELD: [Cell<Press>; 256] = const { [const { Cell::new(Press::Up) }; 256] };
+    // Only the input thread tracks key presses. A large inline TLS array
+    // would also be committed for every Shell, COM and IPC thread.
+    static HELD: Box<[Cell<Press>]> = (0..256).map(|_| Cell::new(Press::Up)).collect();
     static PENDING: Cell<Pending> = const { Cell::new(Pending::NEW) };
 }
 
@@ -465,7 +486,7 @@ impl BoundCommand {
 
 fn route_snapshot(slot: usize) -> (Snapshot, Option<KeyRoutes>, usize) {
     let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
-    (routing.focus, routing.keys.0[slot], routing.revision)
+    (routing.focus, routing.keys.get(slot), routing.revision)
 }
 
 fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
@@ -741,7 +762,8 @@ mod tests {
         ) -> Action {
             let slot = usize::from(key);
             let routes = Routes::new(&self.settings);
-            let binding = routes.0[slot]
+            let binding = routes
+                .get(slot)
                 .and_then(|route| route.binding(self.state, self.pending, mods, || active));
             let action = self.held[slot].route(down, binding);
             if let Action::Command(_) = action
@@ -766,7 +788,9 @@ mod tests {
                 mode,
                 ..keyboard.state
             };
-            let bound = routes.0[usize::from(key)]?.binding(state, Pending::NEW, mods, || 100)?;
+            let bound = routes
+                .get(usize::from(key))?
+                .binding(state, Pending::NEW, mods, || 100)?;
             bound.target.map(|_| bound.id)
         };
         for (key, mods, id) in [
@@ -843,7 +867,8 @@ mod tests {
             .enumerate()
             {
                 let binding = |mods, active| {
-                    routes.0[usize::from(key)]?
+                    routes
+                        .get(usize::from(key))?
                         .binding(keyboard.state, Pending::NEW, mods, || active)
                         .map(|b| (b.id, b.target))
                 };
@@ -948,7 +973,8 @@ mod tests {
                 let key = VK_0 + number % 10;
                 let offset = i32::from(number) - 1;
                 let binding = |mods| {
-                    routes.0[usize::from(key)]?
+                    routes
+                        .get(usize::from(key))?
                         .binding(keyboard.state, Pending::NEW, mods, || foreground)
                         .map(|b| (b.id, b.target))
                 };
@@ -1003,7 +1029,8 @@ mod tests {
             for mode in [Mode::Normal, Mode::Resize] {
                 keyboard.state.mode = mode;
                 let command = |key: u16, mods| {
-                    routes.0[key as usize]?
+                    routes
+                        .get(key as usize)?
                         .binding(keyboard.state, Pending::NEW, mods, || 100)
                         .map(|b| (b.id, b.target))
                 };
@@ -1049,7 +1076,8 @@ mod tests {
         for mode in [Mode::Normal, Mode::Resize] {
             keyboard.state.mode = mode;
             let command = |key: u16, mods| {
-                routes.0[key as usize]?
+                routes
+                    .get(key as usize)?
                     .binding(keyboard.state, Pending::NEW, mods, || 999)
                     .map(|b| (b.id, b.target))
             };
@@ -1085,7 +1113,8 @@ mod tests {
         let routes = Routes::new(&keyboard.settings);
         for (slot, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
             let binding = |mods| {
-                routes.0[key as usize]?
+                routes
+                    .get(key as usize)?
                     .binding(keyboard.state, Pending::NEW, mods, || 0)
                     .map(|b| (b.id, b.target))
             };
@@ -1180,7 +1209,8 @@ mod tests {
             keyboard.settings.enabled = false;
             keyboard.state.target = None;
             let binding = |keyboard: &Keyboard, key: u16, mods, active| {
-                Routes::new(&keyboard.settings).0[key as usize]?
+                Routes::new(&keyboard.settings)
+                    .get(key as usize)?
                     .binding(keyboard.state, Pending::NEW, mods, || active)
                     .map(|b| (b.id, b.target))
             };
