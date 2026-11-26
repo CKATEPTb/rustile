@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -127,6 +128,7 @@ pub struct Manager {
     // A Shell-selected foreground during the switch must not change which
     // destination tile the transferred window was meant to split.
     transfer_anchor: Option<(Id, DesktopId, Id)>,
+    unconfirmed_focus: Cell<Option<(DesktopId, Id)>>,
     windows: HashMap<Id, TrackedWindow>,
     expanded: HashSet<Id>,
     pending_app_cloaks: HashSet<Id>,
@@ -154,6 +156,7 @@ impl Manager {
             workspace: Workspace::new(native::spacing_px(settings.gap)),
             parked: HashMap::new(),
             transfer_anchor: None,
+            unconfirmed_focus: Cell::default(),
             windows: HashMap::new(),
             expanded: HashSet::new(),
             pending_app_cloaks: HashSet::new(),
@@ -1050,13 +1053,72 @@ impl Manager {
         target
     }
 
-    /// Called only during a confirmed desktop transition. A false result asks
-    /// the event loop to check again as Explorer finishes activating the desktop.
-    pub(crate) fn restore_desktop_focus(&self, desktop: DesktopId) -> bool {
+    fn focusable_on(&self, id: Id, desktop: DesktopId) -> bool {
+        let Some(owner) = native::focus_app_owner(id) else {
+            return false;
+        };
+        if self
+            .windows
+            .get(&owner)
+            .is_some_and(|window| !window.original.matches(owner))
+        {
+            return false;
+        }
+        let membership = match self.desktops.membership(id) {
+            // Owned modal dialogs can inherit the disabled owner's desktop
+            // without a desktop ID of their own. Activate the dialog itself.
+            DesktopMembership::Unknown if id != owner => self.desktops.membership(owner),
+            known => known,
+        };
+        membership == DesktopMembership::Current(desktop)
+    }
+
+    pub(crate) fn desktop_foreground_on(
+        &self,
+        id: Id,
+        desktop: DesktopId,
+    ) -> native::DesktopForeground {
+        use native::DesktopForeground::*;
+        let state = native::desktop_foreground(id);
+        if state != Preserve {
+            return state;
+        }
+        match self.desktops.membership(id) {
+            DesktopMembership::Current(home) | DesktopMembership::Other(home)
+                if native::desktops::occupancy::is_pinned(home) =>
+            {
+                Preserve
+            }
+            // Explorer may leave the outgoing HWND in the foreground after it
+            // already reports that view on a different desktop.
+            DesktopMembership::Other(home) if home != desktop => Vacant,
+            DesktopMembership::Other(_) => Transient,
+            DesktopMembership::Current(home) if home != desktop => Transient,
+            DesktopMembership::Unknown
+                if self.windows.get(&id).is_some_and(|w| w.desktop != desktop) =>
+            {
+                Transient
+            }
+            _ => Preserve,
+        }
+    }
+
+    /// A queued activation needs confirmation from the actual foreground HWND.
+    pub(crate) fn restore_desktop_focus(
+        &self,
+        desktop: DesktopId,
+        uninterrupted: impl Fn() -> bool,
+    ) -> bool {
+        if !uninterrupted() {
+            self.unconfirmed_focus.set(None);
+            return true;
+        }
         self.restore_desktop_focus_with(desktop, native::foreground, |id, previous| {
             native::focus_after_desktop_change(id, previous, || {
-                self.can_act_on(id)
-                    && native::desktop_foreground(previous) == native::DesktopForeground::Vacant
+                self.focusable_on(id, desktop)
+                    && self.desktop_foreground_on(previous, desktop)
+                        == native::DesktopForeground::Vacant
+                    && uninterrupted()
             })
         })
     }
@@ -1082,7 +1144,7 @@ impl Manager {
     }
 
     fn transfer_foreground_can_yield(&self, previous: Id, desktop: DesktopId) -> bool {
-        match native::desktop_foreground(previous) {
+        match self.desktop_foreground_on(previous, desktop) {
             native::DesktopForeground::Vacant => true,
             native::DesktopForeground::Transient => false,
             native::DesktopForeground::Preserve => {
@@ -1106,13 +1168,9 @@ impl Manager {
             return true;
         }
         if !self.transfer_foreground_can_yield(previous, desktop) {
-            // Wait for an outgoing window or the desktop-switch animation.
             // A dialog or menu on the destination may retain legitimate input.
-            return native::desktop_foreground(previous) == native::DesktopForeground::Preserve
-                && !matches!(
-                    self.desktops.membership(previous),
-                    DesktopMembership::Other(_)
-                );
+            return self.desktop_foreground_on(previous, desktop)
+                == native::DesktopForeground::Preserve;
         }
         foreground() == previous && activate(previous) && foreground() == id
     }
@@ -1121,53 +1179,69 @@ impl Manager {
         &self,
         desktop: DesktopId,
         foreground: impl Fn() -> Id,
-        activate: impl FnOnce(Id, Id) -> bool,
+        mut activate: impl FnMut(Id, Id) -> bool,
     ) -> bool {
-        if !self.settings.enabled {
-            return true;
-        }
-        if self.current != Some(desktop) {
-            return false;
-        }
         let previous = foreground();
-        match native::desktop_foreground(previous) {
+        match self.desktop_foreground_on(previous, desktop) {
             native::DesktopForeground::Transient => return false,
             native::DesktopForeground::Preserve => {
-                // The outgoing app may still own foreground during the animation.
-                // A dialog, floating app or pinned window on the new desktop can
-                // legitimately own it even when it has no tile or desktop ID.
-                return match self.desktops.membership(previous) {
-                    DesktopMembership::Current(home) => home == desktop,
-                    DesktopMembership::Other(_) => false,
-                    DesktopMembership::Unknown => self
-                        .windows
-                        .get(&previous)
-                        .is_none_or(|window| window.desktop == desktop),
-                };
+                self.unconfirmed_focus.set(None);
+                return true;
             }
             native::DesktopForeground::Vacant => {}
         }
-        let eligible = |&id: &Id| native::window_enabled(id) && self.can_act_on(id);
-        let candidate = self
-            .workspace
-            .focus_history
-            .iter()
-            .rev()
-            .copied()
-            .find(eligible)
-            .or_else(|| {
-                self.workspace
-                    .layout
-                    .placements(self.area?)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .find(eligible)
-            });
-        candidate.is_some_and(|id| {
-            // Membership and window identity can change during COM calls, and
-            // the user may have focused another window while we chose a tile.
-            foreground() == previous && activate(id, previous) && foreground() == id
-        })
+        let workspace = if self.current == Some(desktop) {
+            Some(&self.workspace)
+        } else {
+            self.parked.get(&desktop)
+        };
+        let mut candidates = Vec::new();
+        if let Some(workspace) = workspace.filter(|_| self.settings.enabled) {
+            candidates.extend(workspace.focus_history.iter().rev().copied());
+            if let Some(area) = self.area {
+                candidates.extend(
+                    workspace
+                        .layout
+                        .placements(area)
+                        .into_iter()
+                        .map(|(id, _)| id),
+                );
+            }
+        }
+        // An all-maximized desktop and a paused mosaic can both have visible
+        // applications with no tiles. Consider their native Z order as well.
+        candidates.extend(native::enumerate().into_iter().rev());
+        let mut seen = HashSet::new();
+        candidates.retain(|&id| seen.insert(id));
+        if let Some((home, last)) = self.unconfirmed_focus.take()
+            && home == desktop
+            && let Some(index) = candidates.iter().position(|&id| id == last)
+        {
+            candidates.rotate_left(index + 1);
+        }
+        for id in candidates {
+            if !self.focusable_on(id, desktop) {
+                continue;
+            }
+            if foreground() != previous {
+                return false;
+            }
+            let submitted = activate(id, previous);
+            let actual = foreground();
+            if actual == id {
+                return true;
+            }
+            if actual != previous {
+                return false;
+            }
+            if submitted {
+                // Let Windows deliver an accepted request before trying another
+                // HWND. A later retry can advance if focus never arrived.
+                self.unconfirmed_focus.set(Some((desktop, id)));
+                return false;
+            }
+        }
+        false
     }
 
     pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {

@@ -133,33 +133,28 @@ pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
     };
     let shell = unsafe { GetShellWindow() };
     let shell_process = !shell.is_null() && pid(shell as Id) == pid(id);
-    if shell_process
+    let switcher = shell_process
         && matches!(
             class.as_str(),
             "MultitaskingViewFrame" | "TaskSwitcherWnd" | "XamlExplorerHostIslandWindow"
-        )
-    {
-        return Transient;
-    }
+        );
     let wallpaper = hwnd == shell
         || hwnd == unsafe { GetDesktopWindow() }
         || (shell_process && is_desktop_view(hwnd, shell, &class));
     let taskbar =
         shell_process && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
-    if !wallpaper && !taskbar {
-        if !hidden_or_minimized(id) && cloak_flags(id).is_none_or(|flags| flags == 0) {
-            return Preserve;
-        }
-        // A menu or dialog can become hidden before the Shell finishes
-        // activating its owner. Let the new foreground settle on its own.
-        if matches!(class.as_str(), "#32770" | "#32768") || class.starts_with("Rustile.") {
-            return Transient;
-        }
+    if !wallpaper && !taskbar && !hidden_or_minimized(id) && cloak_flags(id).is_none_or(|f| f == 0)
+    {
+        return if switcher { Transient } else { Preserve };
     }
+    // A closed or cloaked switcher can remain the nominal foreground after
+    // the desktop has changed. Only visible surfaces or live GUI interaction
+    // should keep the incoming desktop from receiving keyboard focus.
     let Some(gui) = window_gui_state(hwnd) else {
         return Transient;
     };
-    if shell_input_in_use(&gui, taskbar)
+    if gui_input_in_use(&gui)
+        || (taskbar && taskbar_control_has_focus(hwnd, gui.hwndFocus))
         || (wallpaper
             && !gui.hwndFocus.is_null()
             && window_class(gui.hwndFocus).as_deref() == Some("Edit"))
@@ -179,17 +174,18 @@ fn window_gui_state(hwnd: HWND) -> Option<GUITHREADINFO> {
 }
 
 pub(crate) fn app_input_idle(id: Id) -> bool {
-    window_gui_state(id as HWND).is_some_and(|gui| !shell_input_in_use(&gui, false))
+    window_gui_state(id as HWND).is_some_and(|gui| !gui_input_in_use(&gui))
 }
 
-fn shell_input_in_use(gui: &GUITHREADINFO, taskbar: bool) -> bool {
+fn gui_input_in_use(gui: &GUITHREADINFO) -> bool {
     let interacting = GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE | GUI_INMOVESIZE;
-    gui.flags & interacting != 0
-        || !gui.hwndCapture.is_null()
-        || !gui.hwndMenuOwner.is_null()
-        // Win+T and keyboard navigation within the tray own a focused
-        // control. A bare taskbar with no keyboard focus can yield it.
-        || (taskbar && !gui.hwndFocus.is_null())
+    gui.flags & interacting != 0 || !gui.hwndCapture.is_null() || !gui.hwndMenuOwner.is_null()
+}
+
+fn taskbar_control_has_focus(taskbar: HWND, focus: HWND) -> bool {
+    // Explorer can leave focus on the taskbar frame itself while handing
+    // off desktops. Win+T and tray keyboard navigation can focus a control.
+    !focus.is_null() && unsafe { IsChild(taskbar, focus) } != 0
 }
 
 fn is_desktop_view(hwnd: HWND, shell: HWND, class: &str) -> bool {
@@ -477,10 +473,10 @@ fn untracked_in_reserved_strip(frame: Rect, screen: Rect, work: Rect, tracked: b
             || frame.y >= bottom(work))
 }
 
-pub(crate) fn tile_state(id: Id) -> TileState {
+fn visible_app_style(id: Id) -> Option<(u32, u32)> {
     let hwnd = id as HWND;
     if hwnd.is_null() {
-        return TileState::Excluded;
+        return None;
     }
     unsafe {
         if IsWindowVisible(hwnd) == 0
@@ -490,20 +486,66 @@ pub(crate) fn tile_state(id: Id) -> TileState {
             || hwnd == GetShellWindow()
             || IsHungAppWindow(hwnd) != 0
         {
-            return TileState::Excluded;
+            return None;
         }
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let extended = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let resizable = style & WS_THICKFRAME != 0;
-        let borderless = style & WS_CAPTION != WS_CAPTION;
         if style & WS_CHILD != 0
-            || (!resizable && !borderless)
             || extended & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_DLGMODALFRAME) != 0
             || cloaked(id)
             || shell_or_dialog(hwnd)
         {
-            return TileState::Excluded;
+            return None;
         }
+        Some((style, extended))
+    }
+}
+
+/// Return the top-level app that can vouch for this focus target's desktop.
+/// A modal dialog may be the only enabled window of that app.
+pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
+    let hwnd = id as HWND;
+    if !window_enabled(id) {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    visible_app_style(root as Id)?;
+    if root != hwnd {
+        let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+        if owner.is_null()
+            || window_enabled(owner as Id)
+            || window_enabled(root as Id)
+            || pid(id) != pid(root as Id)
+            || hidden_or_minimized(id)
+            || cloaked(id)
+            || unsafe { IsHungAppWindow(hwnd) } != 0
+            || unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_NOACTIVATE != 0
+            || (unsafe { GetLastActivePopup(root) } != hwnd
+                && unsafe { GetWindow(owner, GW_ENABLEDPOPUP) } != hwnd)
+        {
+            return None;
+        }
+    }
+    let info = monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) })?;
+    let bounds = outer_bounds(hwnd)?;
+    let frame = frame_bounds(hwnd, bounds);
+    let work = rect(info.rcWork);
+    (!untracked_in_reserved_strip(frame, rect(info.rcMonitor), work, false)
+        && ordinary_process(pid(id)))
+    .then_some(root as Id)
+}
+
+pub(crate) fn tile_state(id: Id) -> TileState {
+    let hwnd = id as HWND;
+    let Some((style, extended)) = visible_app_style(id) else {
+        return TileState::Excluded;
+    };
+    let resizable = style & WS_THICKFRAME != 0;
+    let borderless = style & WS_CAPTION != WS_CAPTION;
+    if !resizable && !borderless {
+        return TileState::Excluded;
+    }
+    unsafe {
         let Some(info) = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)) else {
             return TileState::Excluded;
         };
@@ -908,15 +950,21 @@ pub(crate) fn focus_after_desktop_change(
     let can_activate = || may_activate() && window_enabled(id) && foreground() == previous;
     // Explorer can activate its own application view during a desktop change.
     // Recheck after RPC: input or desktop membership may already have changed.
-    if let Some(view) = desktops::shell::ApplicationView::lookup(hwnd) {
+    let shell_accepted = if let Some(view) = desktops::shell::ApplicationView::lookup(hwnd) {
         if !can_activate() {
             return false;
         }
-        if view.request_focus() {
-            return true;
-        }
+        view.request_focus()
+    } else {
+        false
+    };
+    if foreground() == id {
+        return true;
     }
-    can_activate() && unsafe { SetForegroundWindow(hwnd) } != 0
+    // S_OK can precede the actual focus change. While the previous window
+    // can still yield, also give Windows the regular foreground request.
+    let accepted = can_activate() && unsafe { SetForegroundWindow(hwnd) } != 0;
+    accepted || shell_accepted
 }
 
 #[cfg(test)]
@@ -931,12 +979,41 @@ mod work_area_tests {
     fn desktop_recovery_respects_taskbar_keyboard_focus_and_desktop_context_menus() {
         let mut gui = GUITHREADINFO::default();
         assert_eq!(desktop_foreground(0), DesktopForeground::Vacant);
-        assert!(!shell_input_in_use(&gui, true));
-        gui.hwndFocus = std::ptr::dangling_mut();
-        assert!(shell_input_in_use(&gui, true));
-        assert!(!shell_input_in_use(&gui, false));
+        assert!(!gui_input_in_use(&gui));
         gui.flags = GUI_POPUPMENUMODE;
-        assert!(shell_input_in_use(&gui, false));
+        assert!(gui_input_in_use(&gui));
+        let create = |class, style, parent| unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class,
+                null(),
+                style,
+                0,
+                0,
+                0,
+                0,
+                parent,
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        // Message-only fixtures exercise native handle relationships without
+        // creating a visible window or changing the user's actual focus.
+        let dialog = create(windows_sys::w!("#32770"), 0, HWND_MESSAGE);
+        assert!(!dialog.is_null());
+        let button = create(windows_sys::w!("BUTTON"), WS_CHILD, dialog);
+        assert!(!button.is_null());
+        assert!(!taskbar_control_has_focus(dialog, null_mut()));
+        assert!(!taskbar_control_has_focus(dialog, dialog));
+        assert!(taskbar_control_has_focus(dialog, button));
+        let state = desktop_foreground(dialog as Id);
+        unsafe { DestroyWindow(dialog) };
+        assert_eq!(
+            state,
+            DesktopForeground::Vacant,
+            "a hidden dialog cannot keep the incoming desktop waiting"
+        );
     }
 
     #[test]

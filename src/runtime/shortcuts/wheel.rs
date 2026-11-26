@@ -111,6 +111,7 @@ pub(super) unsafe extern "system" fn on_mouse(code: i32, message: usize, data: i
         )
     {
         end_transfer_focus_watch();
+        end_desktop_focus_watch();
     }
     if code == HC_ACTION as i32 && message as u32 == WM_MOUSEWHEEL {
         let delta = (unsafe { (*(data as *const MSLLHOOKSTRUCT)).mouseData } >> 16) as i16;

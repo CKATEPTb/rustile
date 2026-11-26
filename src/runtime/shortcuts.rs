@@ -22,6 +22,19 @@ use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
 
 static TRANSFER_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
+static DESKTOP_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn watch_desktop_focus() {
+    DESKTOP_FOCUS_WATCH.store(true, Ordering::Relaxed);
+}
+
+pub(super) fn desktop_focus_uninterrupted() -> bool {
+    DESKTOP_FOCUS_WATCH.load(Ordering::Relaxed)
+}
+
+pub(super) fn end_desktop_focus_watch() {
+    DESKTOP_FOCUS_WATCH.store(false, Ordering::Relaxed);
+}
 
 pub(super) fn watch_transfer_focus() {
     TRANSFER_FOCUS_WATCH.store(true, Ordering::Relaxed);
@@ -37,6 +50,14 @@ pub(super) fn end_transfer_focus_watch() {
 
 fn is_desktop_move(id: i32) -> bool {
     matches!(id, MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT)
+}
+
+pub(super) fn is_focus_command(id: i32) -> bool {
+    (FOCUS..FOCUS + 4).contains(&id)
+}
+
+fn uses_desktop_focus(id: i32) -> bool {
+    is_focus_command(id) || is_desktop_move(id) || DesktopDestination::from_command(id).is_some()
 }
 
 // The table is rebuilt only on a settings change. The hook inspects virtual
@@ -87,12 +108,14 @@ impl KeyRoutes {
         let target = if id == TOGGLE_MOSAIC || DesktopDestination::from_command(id).is_some() {
             Some(0) // Global commands need no foreground window.
         } else {
-            // Explorer can clear the foreground during the switch. The manager
-            // still has to validate the window from the pending transfer.
-            let has_window = active != 0 || (is_desktop_move(id) && transfer_focus_uninterrupted());
+            // When Explorer clears the foreground, a focus command can select
+            // a tile on the current desktop, and a transfer can continue its handoff.
+            let has_target = active != 0
+                || is_focus_command(id)
+                || (is_desktop_move(id) && transfer_focus_uninterrupted());
             // Own a configured normal chord even when its action is unavailable
             // in resize mode. The manager validates the sampled HWND on delivery.
-            (has_window && (!resizing || resize != 0)).then_some(active)
+            (has_target && (!resizing || resize != 0)).then_some(active)
         };
         Some(BoundCommand {
             id,
@@ -402,6 +425,11 @@ impl BoundCommand {
 
     fn post(self, pending: Pending) {
         let Some(target) = self.target else { return };
+        // Arm at the gesture so input arriving before the pump handles the
+        // command can cancel automatic activation.
+        if uses_desktop_focus(self.id) {
+            watch_desktop_focus();
+        }
         let transition = self.transition(pending);
         let ticket = transition.map_or(0, |next| next.ticket);
         let command = (ticket << 8) | self.id as usize;
@@ -467,6 +495,12 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
                 && !binding.is_some_and(|b| is_desktop_move(b.id))
             {
                 end_transfer_focus_watch();
+            }
+            if down
+                && desktop_focus_uninterrupted()
+                && !binding.is_some_and(|b| uses_desktop_focus(b.id))
+            {
+                end_desktop_focus_watch();
             }
             let mut press = previous;
             let action = press.route(down, binding);
@@ -596,6 +630,7 @@ impl Drop for Hook {
             let _ = thread.join();
         }
         end_transfer_focus_watch();
+        end_desktop_focus_watch();
         update(None, Mode::Normal, 0);
         ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
     }
@@ -864,6 +899,25 @@ mod tests {
             );
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
             assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+        }
+    }
+
+    #[test]
+    fn navigation_with_no_foreground_posts_the_observed_null_target() {
+        let keyboard = Keyboard::new(); // The snapshot still names the outgoing tile.
+        let routes = Routes::new(keyboard.settings);
+        for (slot, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
+            let binding = |mods| {
+                routes.0[key as usize]?
+                    .binding(keyboard.state, Pending::NEW, mods, || 0)
+                    .map(|b| (b.id, b.target))
+            };
+            assert_eq!(binding(MOD_WIN), Some((FOCUS + slot as i32, Some(0))));
+            assert_eq!(binding(WIN_SHIFT), Some((MOVE + slot as i32, None)));
+            assert_eq!(
+                binding(MOD_WIN | MOD_ALT),
+                Some((QUICK_RESIZE + slot as i32, None))
+            );
         }
     }
 
@@ -1167,7 +1221,7 @@ mod tests {
         );
         k.state.target = None;
         assert_eq!(k.key(VK_K, false, 0), Action::Consume);
-        assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Consume);
+        assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Command(FOCUS));
     }
 
     #[test]

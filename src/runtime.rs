@@ -57,6 +57,7 @@ pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
 const DESKTOP_LIST_CHANGED: u32 = WM_APP + 5;
 const DESKTOP_SETTLE_MS: u32 = 160;
 const FOCUS_SETTLE_MS: u32 = 40;
+const FOCUS_CONFIRM_MS: u32 = 450;
 
 enum DesktopDestination {
     Relative {
@@ -141,7 +142,7 @@ unsafe extern "system" fn on_window_event(
     _: u32,
     _: u32,
 ) {
-    if (hwnd.is_null() && event != EVENT_SYSTEM_DESKTOPSWITCH)
+    if (hwnd.is_null() && !matches!(event, EVENT_SYSTEM_DESKTOPSWITCH | EVENT_SYSTEM_FOREGROUND))
         || (event >= EVENT_OBJECT_CREATE && (object != OBJID_WINDOW || child != 0))
     {
         return;
@@ -388,11 +389,15 @@ impl Drop for MessageTimer {
     }
 }
 
-// Registry and window notifications also fire for renames, reorders, and
-// creating the spare. Only a change of desktop identity arms focus recovery.
+// Keep the arrival identity after the initial retries. Explorer can revoke an
+// apparently successful activation or uncloak the first app much later.
+#[derive(Default)]
 struct DesktopFocus {
     observed: Option<DesktopId>,
     pending: Option<(DesktopId, usize)>,
+    arrival: Option<DesktopId>,
+    confirm_arrival: bool,
+    switch_before_first_sample: bool,
 }
 
 impl DesktopFocus {
@@ -403,18 +408,40 @@ impl DesktopFocus {
 
     fn requested(&mut self, from: DesktopId, to: DesktopId) {
         self.observed = Some(from);
-        self.pending = Some((to, 0));
+        self.arrived_or_requested(to);
+    }
+
+    fn arrived_or_requested(&mut self, target: DesktopId) {
+        self.pending = Some((target, 0));
+        self.arrival = Some(target);
+        self.confirm_arrival = true;
+    }
+
+    fn stop_watching(&mut self) {
+        self.arrival = None;
+        self.confirm_arrival = false;
+    }
+
+    fn recheck_arrival(&mut self, actual: Option<DesktopId>) {
+        if self.pending.is_none()
+            && let Some(target) = self.arrival
+            && Some(target) == actual
+        {
+            self.pending = Some((target, 0));
+        }
     }
 
     fn observe(&mut self, actual: Option<DesktopId>) -> bool {
         let Some(actual) = actual else { return false };
         let previous = self.observed.replace(actual);
-        if previous.is_none_or(|old| old == actual)
+        let initial_switch = std::mem::take(&mut self.switch_before_first_sample);
+        if previous == Some(actual)
+            || (previous.is_none() && !initial_switch)
             || self.pending.is_some_and(|(target, _)| target == actual)
         {
             return false;
         }
-        self.pending = Some((actual, 0));
+        self.arrived_or_requested(actual);
         true
     }
 
@@ -454,7 +481,7 @@ fn pump(
         observed: workspaces
             .current_desktop()
             .or_else(|| manager.layout_desktop()),
-        pending: None,
+        ..Default::default()
     };
     let mut drag_timer = MessageTimer::default();
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
@@ -497,10 +524,12 @@ fn pump(
             manager.reconcile_desktop();
         }
         let mut settling = desktops_changed;
+        let mut desktop_switch_event = false;
+        let mut focus_event = false;
         for (event, id) in events.drain(..) {
             // Child controls and focus changes don't change which desktops have
             // windows. A destroyed HWND can no longer be checked for a parent.
-            inventory_changed |= match event {
+            let changed_window = match event {
                 EVENT_OBJECT_DESTROY | EVENT_SYSTEM_DESKTOPSWITCH => true,
                 EVENT_OBJECT_CREATE
                 | EVENT_OBJECT_SHOW
@@ -509,14 +538,24 @@ fn pump(
                 | EVENT_OBJECT_UNCLOAKED => {
                     (unsafe { GetAncestor(id as HWND, GA_ROOT) }) == id as HWND
                 }
-                EVENT_SYSTEM_FOREGROUND => desktop_watch.is_none(),
                 _ => false,
             };
+            inventory_changed |=
+                changed_window || (event == EVENT_SYSTEM_FOREGROUND && desktop_watch.is_none());
+            focus_event |= changed_window
+                || matches!(
+                    event,
+                    EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND
+                );
             settling |= matches!(
                 event,
                 EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
             ) || (event == EVENT_OBJECT_HIDE && manager.tracks_window(id));
             if event == EVENT_SYSTEM_DESKTOPSWITCH {
+                desktop_switch_event = true;
+                desktop_focus.switch_before_first_sample |= desktop_focus.observed.is_none();
+            }
+            if event == EVENT_SYSTEM_DESKTOPSWITCH || id == 0 {
                 manager.finish_mode();
                 manager.cancel_mouse_move();
             } else {
@@ -529,7 +568,10 @@ fn pump(
             || ((unresolved || work_area_changed) && desktop_timer.id == 0 && !timer_due)
         {
             retries = 2;
-            !desktop_timer.schedule(DESKTOP_SETTLE_MS)
+            if !timer_due {
+                desktop_timer.schedule_within(DESKTOP_SETTLE_MS);
+            }
+            timer_due || desktop_timer.id == 0
         } else {
             timer_due
         };
@@ -567,6 +609,17 @@ fn pump(
         {
             navigation.retain(|step: &DesktopDestination| !step.continues_transfer(&window));
         }
+        if !shortcuts::desktop_focus_uninterrupted() {
+            desktop_focus.stop_watching();
+        }
+        if (focus_event || reconcile)
+            && desktop_focus.pending.is_none()
+            && let Some(home) = desktop_focus.arrival
+            && manager.desktop_foreground_on(native::foreground(), home)
+                != native::DesktopForeground::Preserve
+        {
+            focus_timer.schedule_within(FOCUS_SETTLE_MS);
+        }
         let mut destination = if message.message == KEY_COMMAND {
             DesktopDestination::from_shortcut(
                 (message.wParam & 0xff) as i32,
@@ -577,6 +630,7 @@ fn pump(
             None
         };
         if desktops_changed
+            || desktop_switch_event
             || timer_fired
             || focus_due
             || (destination.is_some() && desktop_focus.awaiting_switch())
@@ -590,6 +644,7 @@ fn pump(
             };
             if desktop_focus.observe(actual) {
                 // Task View or another program selected a different desktop.
+                shortcuts::watch_desktop_focus();
                 navigation.clear();
                 if matches!(destination, Some(DesktopDestination::Transfer { .. })) {
                     destination = None;
@@ -601,6 +656,7 @@ fn pump(
                 }
                 focus_timer.schedule(FOCUS_SETTLE_MS);
             } else if focus_due {
+                desktop_focus.recheck_arrival(actual);
                 let awaiting_switch = desktop_focus.awaiting_switch();
                 let delay = desktop_focus.settle(actual, |id| match &following {
                     Some(window) => manager.restore_transferred_focus(
@@ -608,11 +664,21 @@ fn pump(
                         id,
                         shortcuts::transfer_focus_uninterrupted,
                     ),
-                    None => manager.restore_desktop_focus(id),
+                    None => {
+                        manager.restore_desktop_focus(id, shortcuts::desktop_focus_uninterrupted)
+                    }
                 });
                 if let Some(delay) = delay {
                     focus_timer.schedule(delay);
                 } else {
+                    // One check after the Shell animation also catches a late
+                    // loss without a foreground event. Further checks need an event.
+                    if std::mem::take(&mut desktop_focus.confirm_arrival)
+                        && desktop_focus.arrival == actual
+                        && actual.is_some()
+                    {
+                        focus_timer.schedule(FOCUS_CONFIRM_MS);
+                    }
                     if awaiting_switch {
                         navigation.clear();
                     }
@@ -653,6 +719,24 @@ fn pump(
             } else {
                 if manager.accepts_foreground_shortcut(target) {
                     dispatch(manager, target, command);
+                } else if preferences.live.enabled && shortcuts::is_focus_command(command) {
+                    let foreground = native::foreground();
+                    if shortcuts::desktop_focus_uninterrupted()
+                        && (target == 0 || target == foreground)
+                        && !desktop_focus.awaiting_switch()
+                        && let Some(actual) = if workspaces.available() {
+                            workspaces.current_desktop()
+                        } else {
+                            manager.layout_desktop()
+                        }
+                        && manager.desktop_foreground_on(foreground, actual)
+                            != native::DesktopForeground::Preserve
+                    {
+                        // With no starting tile, this press selects an app.
+                        // Subsequent directional presses navigate from it.
+                        desktop_focus.arrived_or_requested(actual);
+                        focus_timer.schedule_within(1);
+                    }
                 }
                 refresh(manager, ticket);
             }

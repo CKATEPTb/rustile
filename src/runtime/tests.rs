@@ -7,10 +7,7 @@ use windows_sys::core::w;
 #[test]
 fn desktop_focus_waits_for_the_requested_desktop_and_ignores_reorders() {
     let (a, b) = (DesktopId(1), DesktopId(2));
-    let mut focus = DesktopFocus {
-        observed: None,
-        pending: None,
-    };
+    let mut focus = DesktopFocus::default();
     assert!(!focus.observe(Some(a)));
     assert!(!focus.observe(Some(a)));
     assert!(
@@ -56,7 +53,7 @@ fn external_switch_supersedes_pending_focus_and_empty_desktops_stop_retrying() {
     let (a, b, c) = (DesktopId(1), DesktopId(2), DesktopId(3));
     let mut focus = DesktopFocus {
         observed: Some(a),
-        pending: None,
+        ..Default::default()
     };
     focus.requested(a, b);
     assert!(focus.observe(Some(c)));
@@ -78,6 +75,55 @@ fn external_switch_supersedes_pending_focus_and_empty_desktops_stop_retrying() {
             })
             .is_none()
     );
+}
+
+#[test]
+fn arrival_recovers_a_late_focus_loss_after_an_initial_success_or_exhausted_retries() {
+    let (a, b, c) = (DesktopId(1), DesktopId(2), DesktopId(3));
+    for initially_focused in [true, false] {
+        let mut focus = DesktopFocus::default();
+        focus.requested(a, b);
+        focus.observe(Some(b));
+        while focus.settle(Some(b), |_| initially_focused).is_some() {}
+        assert!(
+            focus.pending.is_none(),
+            "the desktop can idle without polling"
+        );
+        focus.recheck_arrival(Some(c));
+        assert!(
+            focus.pending.is_none(),
+            "a stale event cannot target a different desktop"
+        );
+        focus.recheck_arrival(Some(b));
+        assert_eq!(focus.pending, Some((b, 0)));
+        let mut recovered = false;
+        focus.settle(Some(b), |_| {
+            recovered = true;
+            true
+        });
+        assert!(
+            recovered,
+            "Explorer dropped focus or the window only just appeared"
+        );
+
+        focus.stop_watching();
+        focus.recheck_arrival(Some(b));
+        assert!(
+            focus.pending.is_none(),
+            "deliberate user input ends automatic recovery"
+        );
+    }
+}
+
+#[test]
+fn a_switch_before_explorer_reports_its_first_desktop_still_restores_focus() {
+    let mut focus = DesktopFocus {
+        switch_before_first_sample: true,
+        ..Default::default()
+    };
+    assert!(!focus.observe(None));
+    assert!(focus.observe(Some(DesktopId(3))));
+    assert_eq!(focus.pending, Some((DesktopId(3), 0)));
 }
 
 fn smoke_desktop() -> String {
@@ -121,7 +167,10 @@ fn isolated_shortcut_ownership() {
     // This also creates the receiving thread's queue. The callback is invoked
     // directly, so no input enters the user's session or the Shell.
     assert_eq!(next_command(), None);
-    assert_eq!(key(VK_F13, true), 1, "window command without a tile");
+    shortcuts::end_desktop_focus_watch();
+    assert_eq!(key(VK_F13, true), 1, "focus shortcut without a foreground");
+    assert_eq!(next_command(), Some((FOCUS, 0, 0)));
+    assert!(shortcuts::desktop_focus_uninterrupted());
     hook.set_settings(Settings::default());
     assert_eq!(key(VK_F13, true), 1, "held repeat after unbinding");
     assert_eq!(key(VK_F13, false), 1, "release after unbinding");
@@ -144,11 +193,13 @@ fn isolated_shortcut_ownership() {
     assert_eq!(key(VK_F15, true), 0);
     assert_eq!(key(VK_F15, false), 0);
 
+    shortcuts::watch_desktop_focus();
     assert_eq!(key(VK_F16, true), 1);
     assert_eq!(key(VK_F16, true), 1);
     assert_eq!(key(VK_F16, false), 1);
     assert_eq!(next_command(), Some((DESKTOP_TENTH, 0, 0)));
     assert_eq!(next_command(), None);
+    assert!(shortcuts::desktop_focus_uninterrupted());
 
     assert_eq!(key(VK_F17, true), 1);
     assert_eq!(key(VK_F17, false), 1);
@@ -166,9 +217,11 @@ fn isolated_shortcut_ownership() {
     assert!(matches!(next_command(), Some((MOVE_DESKTOP_NEXT, ticket, 0)) if ticket != 0));
     assert_eq!(next_command(), None);
     assert!(shortcuts::transfer_focus_uninterrupted());
+    assert!(shortcuts::desktop_focus_uninterrupted());
 
     assert_eq!(key(VK_F15, true), 0);
     assert!(!shortcuts::transfer_focus_uninterrupted());
+    assert!(!shortcuts::desktop_focus_uninterrupted());
     assert_eq!(key(VK_F15, false), 0);
     assert_eq!(key(VK_F17, true), 1);
     assert_eq!(key(VK_F17, false), 1);

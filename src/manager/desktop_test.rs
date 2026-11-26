@@ -1022,6 +1022,37 @@ fn window_controls() {
     // The reference is this same native HWND, including any DWM frame overhang.
     let maximized_frame = frame(active);
     let mut manager = Manager::new();
+    let destination = DesktopId(2);
+    manager.desktops.set_memberships(windows.map(|id| {
+        let membership = if id == active {
+            DesktopMembership::Current(destination)
+        } else {
+            DesktopMembership::Other(DesktopId(1))
+        };
+        (id, membership)
+    }));
+    manager.reconcile_desktop();
+    assert_eq!(
+        manager.layout_desktop(),
+        None,
+        "all destination windows are maximized"
+    );
+    let foreground = std::cell::Cell::new(windows[0]);
+    assert!(manager.restore_desktop_focus_with(
+        destination,
+        || foreground.get(),
+        |id, previous| {
+            assert_eq!(
+                previous, windows[0],
+                "the outgoing app still appears visible"
+            );
+            assert_eq!(id, active);
+            foreground.set(id);
+            true
+        }
+    ));
+    assert_eq!(foreground.get(), active);
+    assert_eq!(frame(active), maximized_frame);
     manager
         .desktops
         .set_memberships(windows.map(|id| (id, DesktopMembership::Current(DesktopId(1)))));

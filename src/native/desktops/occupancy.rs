@@ -21,6 +21,10 @@ use crate::native::{Cloak, append_window, cloak_state, pid};
 const PINNED_WINDOW: DesktopId = DesktopId(0xc2ddea68_66f2_4cf9_8264_1bfd00fbbbac);
 const PINNED_APP: DesktopId = DesktopId(0xbb64d5b7_4de3_4ab2_a87c_db7601aea7dc);
 
+pub(crate) fn is_pinned(id: DesktopId) -> bool {
+    matches!(id, PINNED_APP | PINNED_WINDOW)
+}
+
 /// Snapshot all monitors and virtual desktops independently of tiling eligibility.
 /// The caller owns the COM apartment. None means that emptiness is unproven.
 pub(crate) fn occupied(desktops: &[DesktopId]) -> Option<HashSet<DesktopId>> {
@@ -141,7 +145,7 @@ fn assigned_desktop(
     id: DesktopId,
     parked: impl FnOnce() -> bool,
 ) -> Result<Option<DesktopId>, ()> {
-    if matches!(id, PINNED_APP | PINNED_WINDOW) {
+    if is_pinned(id) {
         return Ok(None);
     }
     if id.0 == 0 {

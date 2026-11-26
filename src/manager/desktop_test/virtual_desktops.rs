@@ -213,6 +213,36 @@ fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], fl
         "first visit follows layout order"
     );
     manager.workspace.focus_history = history;
+    foreground.set(0);
+    let mut refused = Vec::new();
+    assert!(manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |id, previous| {
+            refused.push(id);
+            id != remembered && activate(id, previous)
+        }
+    ));
+    assert_eq!(
+        refused,
+        [remembered, other],
+        "a rejected tile cannot starve its peer"
+    );
+    foreground.set(0);
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |id, _| {
+            assert_eq!(id, remembered);
+            true // Shell accepted the request, but no window received focus.
+        }
+    ));
+    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
+    assert_eq!(
+        foreground.get(),
+        other,
+        "an unconfirmed request advances on retry"
+    );
     assert!(
         !manager.restore_desktop_focus_with(desktop, || 0, |_, _| false),
         "Windows can decline foreground activation during a switch"
@@ -330,15 +360,83 @@ pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area
     select_desktop(manager, &homes, A, None);
     manager.reconcile_desktop();
     assert_eq!(windows.map(frame), before);
+    let foreground = Cell::new(0);
+    assert!(manager.restore_desktop_focus_with(
+        A,
+        || foreground.get(),
+        |id, _| {
+            assert!([moving, source_peer].contains(&id));
+            foreground.set(id);
+            true
+        }
+    ));
+    assert!([moving, source_peer].contains(&foreground.get()));
+    assert_eq!(
+        windows.map(frame),
+        before,
+        "focus recovery while paused preserves geometry"
+    );
     manager.apply_settings(settings).unwrap();
     settle(manager, 2);
     assert_eq!(
         super::join_frames(frame(moving), frame(source_peer)),
         manager.area
     );
+    focus_owned_dialog(manager, moving);
+    manager.desktops.set_memberships([(
+        floating,
+        DesktopMembership::Current(DesktopId(0xbb64d5b7_4de3_4ab2_a87c_db7601aea7dc)),
+    )]);
+    assert_eq!(
+        manager.desktop_foreground_on(floating, A),
+        crate::native::DesktopForeground::Preserve,
+        "a pinned application keeps keyboard input"
+    );
     manager
         .desktops
         .set_memberships(windows.map(|id| (id, DesktopMembership::Current(B))));
+}
+
+fn focus_owned_dialog(manager: &mut Manager, owner: Id) {
+    use std::cell::Cell;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_ENABLEDPOPUP, GetWindow, PostMessageW, WM_CLOSE,
+    };
+
+    select_desktop(manager, &[(owner, A)], A, None);
+    assert_ne!(unsafe { PostMessageW(owner as _, WM_APP + 1, 0, 0) }, 0);
+    let mut dialog = owner;
+    until("fixture modal popup", || {
+        dialog = unsafe { GetWindow(owner as _, GW_ENABLEDPOPUP) } as Id;
+        dialog != 0
+            && dialog != owner
+            && !crate::native::hidden_or_minimized(dialog)
+            && !crate::native::window_enabled(owner)
+    });
+    let foreground = Cell::new(0);
+    let recovered = manager.restore_desktop_focus_with(
+        A,
+        || foreground.get(),
+        |id, _| {
+            foreground.set(id);
+            true
+        },
+    );
+    // The dialog inherits the owner's GUID only while its own membership is unknown.
+    manager.desktops.set_memberships([
+        (owner, DesktopMembership::Current(A)),
+        (dialog, DesktopMembership::Other(B)),
+    ]);
+    let accepted_foreign = manager.focusable_on(dialog, A);
+    assert_ne!(unsafe { PostMessageW(dialog as _, WM_CLOSE, 0, 0) }, 0);
+    until("fixture modal closed", || {
+        crate::native::window_enabled(owner)
+    });
+    assert!(
+        recovered && foreground.get() == dialog,
+        "expected the enabled modal dialog"
+    );
+    assert!(!accepted_foreign);
 }
 
 pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
