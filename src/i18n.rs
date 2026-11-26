@@ -1,4 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::Globalization::{
     GetUserDefaultUILanguage, GetUserPreferredUILanguages, LCIDToLocaleName, MUI_LANGUAGE_NAME,
 };
@@ -6,7 +8,8 @@ use windows_sys::Win32::Globalization::{
 include!(concat!(env!("OUT_DIR"), "/messages.rs"));
 
 // Column order in locales/*.tsv.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Language {
     En,
     Ru,
@@ -14,6 +17,7 @@ pub(crate) enum Language {
     Fr,
     It,
     Es,
+    #[serde(rename = "zh-Hans")]
     ZhHans,
     Ja,
     Pt,
@@ -23,6 +27,38 @@ pub(crate) enum Language {
 }
 
 impl Language {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::En,
+        Self::Ru,
+        Self::De,
+        Self::Fr,
+        Self::It,
+        Self::Es,
+        Self::ZhHans,
+        Self::Ja,
+        Self::Pt,
+        Self::Ko,
+        Self::Pl,
+        Self::Tr,
+    ];
+
+    pub(crate) const fn native_name(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::Ru => "Русский",
+            Self::De => "Deutsch",
+            Self::Fr => "Français",
+            Self::It => "Italiano",
+            Self::Es => "Español",
+            Self::ZhHans => "简体中文",
+            Self::Ja => "日本語",
+            Self::Pt => "Português (Brasil)",
+            Self::Ko => "한국어",
+            Self::Pl => "Polski",
+            Self::Tr => "Türkçe",
+        }
+    }
+
     fn from_tag(tag: &str) -> Option<Self> {
         let tag = tag.to_ascii_lowercase();
         let mut parts = tag.split('-');
@@ -56,6 +92,10 @@ fn preferred(buffer: &[u16]) -> Option<Language> {
 }
 
 fn windows_language() -> Language {
+    #[cfg(test)]
+    if let Some(language) = TEST_SYSTEM_LANGUAGE.get() {
+        return *language;
+    }
     let (mut count, mut size) = (0, 0);
     if unsafe {
         GetUserPreferredUILanguages(
@@ -91,14 +131,23 @@ fn windows_language() -> Language {
     Language::En
 }
 
-static CURRENT: OnceLock<Language> = OnceLock::new();
+static ACTIVE: OnceLock<AtomicUsize> = OnceLock::new();
 
-fn current() -> Language {
+pub(crate) fn set_language(language: Option<Language>) {
+    // Re-read Windows when the user returns to automatic selection.
+    let index = language.unwrap_or_else(windows_language) as usize;
+    ACTIVE
+        .get_or_init(|| AtomicUsize::new(index))
+        .store(index, Ordering::Relaxed);
+}
+
+pub(crate) fn current() -> Language {
     #[cfg(test)]
     if let Some(language) = TEST_LANGUAGE.get() {
         return language;
     }
-    *CURRENT.get_or_init(windows_language)
+    let active = ACTIVE.get_or_init(|| AtomicUsize::new(windows_language() as usize));
+    Language::ALL[active.load(Ordering::Relaxed)]
 }
 
 pub(crate) fn tr(message: Msg) -> &'static str {
@@ -145,8 +194,11 @@ pub(crate) fn render(message: Msg, args: &[(&str, &str)]) -> String {
 thread_local! { static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) }; }
 
 #[cfg(test)]
+static TEST_SYSTEM_LANGUAGE: OnceLock<Language> = OnceLock::new();
+
+#[cfg(test)]
 pub(crate) fn set_test_process_language(tag: &str) {
-    CURRENT
+    TEST_SYSTEM_LANGUAGE
         .set(Language::from_tag(tag).expect("unsupported smoke-test language"))
         .expect("the test process must choose its language before creating windows");
 }
@@ -204,7 +256,19 @@ mod tests {
             );
             wide(message)
         });
-        with_language(Language::Ja, || assert_ne!(wide(message), english));
+        let japanese = with_language(Language::Ja, || {
+            // Win32 may still hold a tooltip pointer from the previous language.
+            let expected: Vec<_> = "Default settings applied.\n\n{detail}"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(english, expected.len()) },
+                expected
+            );
+            assert_ne!(wide(message), english);
+            wide(message)
+        });
         with_language(Language::En, || {
             let expected: Vec<_> = tr(message).encode_utf16().chain([0]).collect();
             assert_eq!(wide(message), english);
@@ -213,5 +277,6 @@ mod tests {
                 expected
             );
         });
+        with_language(Language::Ja, || assert_eq!(wide(message), japanese));
     }
 }

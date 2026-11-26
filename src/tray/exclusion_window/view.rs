@@ -38,9 +38,9 @@ impl Editor {
                 Ok(control)
             }
         };
-        let label = |id, name| make(w!("STATIC"), id, name, SS_NOPREFIX);
-        let button = |id, name| make(w!("BUTTON"), id, name, BS_OWNERDRAW as u32 | WS_TABSTOP);
-        label(LIST_LABEL, tr(Msg::RuleList))?;
+        let label = |id| make(w!("STATIC"), id, "", SS_NOPREFIX);
+        let button = |id| make(w!("BUTTON"), id, "", BS_OWNERDRAW as u32 | WS_TABSTOP);
+        label(LIST_LABEL)?;
         make(
             w!("LISTBOX"),
             LIST,
@@ -52,23 +52,23 @@ impl Editor {
                 | LBS_HASSTRINGS as u32
                 | LBS_NOINTEGRALHEIGHT as u32,
         )?;
-        button(NEW, tr(Msg::RuleNew))?;
-        button(REMOVE, tr(Msg::RuleDelete))?;
-        label(FORM_LABEL, tr(Msg::RuleConditions))?;
-        button(PICK, tr(Msg::RulePick))?;
-        label(HINT, tr(Msg::RuleHint))?;
-        for (id, field, name) in [
-            (PROCESS_LABEL, PROCESS, tr(Msg::RuleProcess)),
-            (TITLE_LABEL, TITLE_FIELD, tr(Msg::RuleTitle)),
-            (CLASS_LABEL, CLASS_FIELD, tr(Msg::RuleClass)),
+        button(NEW)?;
+        button(REMOVE)?;
+        label(FORM_LABEL)?;
+        button(PICK)?;
+        label(HINT)?;
+        for (id, field) in [
+            (PROCESS_LABEL, PROCESS),
+            (TITLE_LABEL, TITLE_FIELD),
+            (CLASS_LABEL, CLASS_FIELD),
         ] {
-            label(id, name)?;
+            label(id)?;
             let hwnd = make(w!("EDIT"), field, "", ES_AUTOHSCROLL as u32 | WS_TABSTOP)?;
             // A Unicode scalar may occupy two UTF-16 code units. The matcher
             // checks its actual limit rather than truncating valid input here.
             unsafe { SendMessageW(hwnd, EM_SETLIMITTEXT, 2049, 0) };
         }
-        label(MODE_LABEL, tr(Msg::RuleMatch))?;
+        label(MODE_LABEL)?;
         let combo = make(
             w!("COMBOBOX"),
             MODE,
@@ -79,15 +79,40 @@ impl Editor {
                 | CBS_HASSTRINGS as u32
                 | CBS_OWNERDRAWFIXED as u32,
         )?;
-        for (_, name) in MODES {
-            unsafe { SendMessageW(combo, CB_ADDSTRING, 0, wide_message(name) as _) };
-        }
         // The closed system combo otherwise draws its own white arrow and
         // bevel on Windows' dark palette. Keep its list and input behavior.
         unsafe { SetWindowSubclass(combo, Some(mode_proc), 1, self as *const Self as usize) };
-        label(STATUS, "")?;
-        button(SAVE, tr(Msg::RuleSave))?;
+        label(STATUS)?;
+        button(SAVE)?;
+        self.localize_controls();
         Ok(())
+    }
+
+    pub(super) fn localize_controls(&self) {
+        for (id, message) in [
+            (LIST_LABEL, Msg::RuleList),
+            (NEW, Msg::RuleNew),
+            (REMOVE, Msg::RuleDelete),
+            (FORM_LABEL, Msg::RuleConditions),
+            (PICK, Msg::RulePick),
+            (HINT, Msg::RuleHint),
+            (PROCESS_LABEL, Msg::RuleProcess),
+            (TITLE_LABEL, Msg::RuleTitle),
+            (CLASS_LABEL, Msg::RuleClass),
+            (MODE_LABEL, Msg::RuleMatch),
+            (SAVE, Msg::RuleSave),
+        ] {
+            set_text(self.child(id), tr(message));
+        }
+        let combo = self.child(MODE);
+        unsafe {
+            let selected = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+            SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+            for (_, name) in MODES {
+                SendMessageW(combo, CB_ADDSTRING, 0, wide_message(name) as _);
+            }
+            SendMessageW(combo, CB_SETCURSEL, selected as usize, 0);
+        }
     }
 
     pub(super) fn refresh_fonts(&self) {

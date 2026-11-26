@@ -1,4 +1,4 @@
-use crate::i18n::{Msg, render, tr};
+use crate::i18n::{self, Language, Msg, render, tr};
 use std::io;
 use std::os::windows::{
     ffi::OsStrExt,
@@ -107,8 +107,14 @@ fn change_task(enable: bool, sid: &str) -> Result<(), String> {
 // This entry point accepts only a fixed operation for the caller's own SID.
 // No source, destination, scheduled command or task name comes from the CLI.
 pub(crate) fn handle_helper(args: &[String]) -> Option<ExitCode> {
-    let [flag, requested_sid] = args else {
-        return None;
+    let (flag, requested_sid, language) = match args {
+        [flag, sid] => (flag, sid, None),
+        [flag, sid, index] => (
+            flag,
+            sid,
+            Some(*Language::ALL.get(index.parse::<usize>().ok()?)?),
+        ),
+        _ => return None,
     };
     let enable = match flag.as_str() {
         ENABLE => true,
@@ -118,6 +124,7 @@ pub(crate) fn handle_helper(args: &[String]) -> Option<ExitCode> {
     if elevated() != Ok(true) || sid().as_ref().ok() != Some(requested_sid) {
         return Some(ExitCode::from(ACCOUNT_MISMATCH));
     }
+    i18n::set_language(language);
     Some(match change_task(enable, requested_sid) {
         Ok(()) => ExitCode::SUCCESS,
         Err(detail) => {
@@ -136,7 +143,13 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let file: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
     let flag = if enable { ENABLE } else { DISABLE };
-    let params: Vec<_> = format!("{flag} {sid}").encode_utf16().chain([0]).collect();
+    // Both sides use this executable. Pass the selected catalog so any Rustile
+    // diagnostic in the elevated process follows the language of the tray.
+    let language = i18n::current() as usize;
+    let params: Vec<_> = format!("{flag} {sid} {language}")
+        .encode_utf16()
+        .chain([0])
+        .collect();
     // Called from a dedicated worker; ShellExecute can require an STA.
     let apartment = unsafe {
         CoInitializeEx(

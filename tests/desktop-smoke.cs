@@ -858,6 +858,9 @@ internal static class DesktopSmoke {
             throw;
         }
         Require(labels.Length > 0, "Missing binding for action " + action);
+        // Native slot creation and WM_SETTEXT are separate messages. A poll
+        // can see the new control before it receives its accessible name.
+        if (labels.Any(String.IsNullOrEmpty)) return String.Empty;
         return labels[0] + String.Concat(labels.Skip(1).Select(label =>
             AlternativesSeparator + label.Substring(label.IndexOf(", ", StringComparison.Ordinal) + 2)));
     }
@@ -2140,6 +2143,87 @@ internal static class DesktopSmoke {
         }
     }
 
+    static void VerifyLanguagePicker(string rustile, string desktop, Rectangle area) {
+        var system = languageIndex;
+        // Exercise a non-English override even on a German Windows installation.
+        bool useFrench = Languages[system] == "de";
+        string choice = useFrench ? "Français" : "Deutsch";
+        int manual = Array.IndexOf(Languages, useFrench ? "fr" : "de");
+        try {
+            using (var manager = new Child(rustile, "", desktop, true)) {
+                var tray = TrayWindow(manager);
+                TrayOpen(tray, TrayKeyboard, area);
+                OpenShortcutEditor(manager, tray, area);
+                TrayOpen(tray, TrayKeyboard, area);
+                TrayClick(tray, T("TrayExclusions"));
+                var rules = TrayWindow(manager, "Rustile.Exclusions");
+                const string draft = "unsaved window title";
+                SetText(EditorControl(rules, 605), draft);
+                TrayOpen(tray, TrayKeyboard, area);
+
+                TrayKey(tray, T("TrayLanguage"), Keys.Right);
+                TrayButton(tray, T("TraySystemLanguage") + ", " + T("TraySelected"));
+                Require(area.Contains(Bounds(tray)), "The language picker extends outside the work area");
+                var option = T("TraySystemLanguage");
+                foreach (var next in new[] { "English", "Русский", "Deutsch", "Français", "Italiano", "Español",
+                    "简体中文", "日本語", "Português (Brasil)", "한국어", "Polski", "Türkçe" }) {
+                    TrayKey(tray, option, Keys.Down);
+                    TrayFocus(tray, next);
+                    Require(Bounds(tray).Contains(Bounds(TrayButton(tray, next))), "Unreachable language: " + next);
+                    option = next;
+                }
+                TrayKey(tray, option, Keys.Escape);
+                TrayFocus(tray, T("TrayLanguage") + ", " + T("TraySystemLanguage"));
+                TrayClick(tray, T("TrayLanguage"));
+                TrayClick(tray, choice);
+                languageIndex = manual;
+                TrayButton(tray, T("TrayLanguage") + ", " + choice);
+                TrayFocus(tray, T("TrayLanguage"));
+                Until("Both open editors should translate and preserve the unsaved rule", () => {
+                    var shortcuts = ManagerWindow(manager, "Rustile.Shortcuts", true);
+                    var exclusions = ManagerWindow(manager, "Rustile.Exclusions", true);
+                    return shortcuts != IntPtr.Zero && exclusions != IntPtr.Zero
+                        && ControlText(shortcuts) == T("UiShortcutTitle")
+                        && ControlText(EditorControl(shortcuts, 505)) == T("UiResetAll")
+                        && ControlText(EditorControl(shortcuts, 1004)) == T("BindMoveLeft") + ", Win+Shift+Left"
+                        && ControlText(exclusions) == T("RuleWindowTitle")
+                        && ControlText(EditorControl(exclusions, 608)) == T("RuleSave")
+                        && ControlText(EditorControl(exclusions, 605)) == draft;
+                });
+                Require(Cli(rustile, "mosaic status", desktop) == "on",
+                    "Changing UI language affected the English CLI response");
+                TrayClick(tray, T("TrayQuit"));
+                Require(manager.Exited(5000) && manager.ExitCode == 0, "Could not restart with a saved language");
+            }
+            using (var restarted = new Child(rustile, "", desktop, true)) {
+                var tray = TrayWindow(restarted);
+                TrayOpen(tray, TrayKeyboard, area);
+                TrayClick(tray, T("TrayLanguage"));
+                TrayButton(tray, choice + ", " + T("TraySelected"));
+                TrayClick(tray, T("TraySystemLanguage"));
+                languageIndex = system;
+                TrayButton(tray, T("TrayTiling"));
+                TrayClick(tray, T("TrayLanguage"));
+                TrayButton(tray, T("TraySystemLanguage") + ", " + T("TraySelected"));
+                TrayKey(tray, T("TraySystemLanguage"), Keys.Left);
+                TrayClick(tray, T("TrayQuit"));
+                Require(restarted.Exited(5000) && restarted.ExitCode == 0, "Could not restart in system language mode");
+            }
+            using (var automatic = new Child(rustile, "", desktop, true)) {
+                var tray = TrayWindow(automatic);
+                TrayOpen(tray, TrayKeyboard, area);
+                TrayClick(tray, T("TrayLanguage"));
+                TrayButton(tray, T("TraySystemLanguage") + ", " + T("TraySelected"));
+                TrayKey(tray, T("TraySystemLanguage"), Keys.Escape);
+                TrayClick(tray, T("TrayQuit"));
+                Require(automatic.Exited(5000) && automatic.ExitCode == 0, "Automatic language fixture failed to exit");
+            }
+        } finally {
+            languageIndex = system;
+        }
+        Console.WriteLine("PASS  Tray language choice updates open editors and preserves drafts, English keys and CLI; manual and system choices survive restart");
+    }
+
     static void Run(string rustile, string managerTests, string locales) {
         LoadCatalog(locales);
         var desktopName = "rustile-smoke-" + Guid.NewGuid().ToString("N");
@@ -2164,6 +2248,7 @@ internal static class DesktopSmoke {
             }
             Console.WriteLine("PASS  Shortcut callback consumes assigned presses, repeats and releases with no foreground or failed delivery; unassigned keys pass");
             LocalizedWindows(managerTests, desktopName, Screen.PrimaryScreen.WorkingArea);
+            VerifyLanguagePicker(rustile, desktopName, Screen.PrimaryScreen.WorkingArea);
             var self = Process.GetCurrentProcess().MainModule.FileName;
             var windows = new IntPtr[3];
             var originals = new Rectangle[3];

@@ -139,7 +139,7 @@ impl ShortcutWindow {
     pub(super) fn create_controls(&self, hwnd: HWND) -> Result<(), String> {
         create(hwnd, w!("STATIC"), "", STATUS, 0, 0)?;
         create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW, 0)?;
-        let reset_all = button(hwnd, tr(Msg::UiResetAll), RESET_ALL)?;
+        button(hwnd, "", RESET_ALL)?;
         let view = create(
             hwnd,
             w!("STATIC"),
@@ -173,48 +173,77 @@ impl ShortcutWindow {
             )
         };
         self.tooltip.set(tooltip);
-        self.hint(hwnd, reset_all, localized_wide(Msg::UiResetAllHint));
-        let prev = button(view, tr(Msg::UiPreviousPage), PAGE_PREV)?;
-        let next = button(view, tr(Msg::UiNextPage), PAGE_NEXT)?;
+        button(view, "", PAGE_PREV)?;
+        button(view, "", PAGE_NEXT)?;
         create(view, w!("STATIC"), "", PAGE_LABEL, SS_OWNERDRAW, 0)?;
-        self.hint(view, prev, localized_wide(Msg::UiPreviousPage));
-        self.hint(view, next, localized_wide(Msg::UiNextPage));
         for (i, group) in GROUPS.iter().enumerate() {
-            let label = tr(group.title);
-            create(
-                view,
-                w!("STATIC"),
-                label,
-                SECTION + i as i32,
-                SS_OWNERDRAW,
-                0,
-            )?;
+            create(view, w!("STATIC"), "", SECTION + i as i32, SS_OWNERDRAW, 0)?;
             for &action in group.actions {
                 create(
                     view,
                     w!("STATIC"),
-                    action.label(),
+                    "",
                     LABEL_ROW + action.index() as i32,
                     SS_OWNERDRAW,
                     0,
                 )?;
                 self.sync_slots(action, self.settings.borrow().bindings(action).len().max(1))?;
-                let args = [("action", action.label()), ("category", label)];
-                let add = button(
-                    view,
-                    &render(Msg::UiAddForAction, &args),
-                    ADD_ROW + action.index() as i32,
-                )?;
-                let reset = button(
-                    view,
-                    &render(Msg::UiResetForAction, &args),
-                    RESET_ROW + action.index() as i32,
-                )?;
-                self.hint(view, add, localized_wide(Msg::UiAddShortcut));
-                self.hint(view, reset, localized_wide(Msg::UiRestoreAction));
+                button(view, "", ADD_ROW + action.index() as i32)?;
+                button(view, "", RESET_ROW + action.index() as i32)?;
             }
         }
+        self.localize_controls(hwnd, TTM_ADDTOOLW);
         Ok(())
+    }
+
+    fn localize_controls(&self, hwnd: HWND, tooltip_message: u32) {
+        let view = child(hwnd, VIEW);
+        for (parent, id, label, hint) in [
+            (hwnd, RESET_ALL, Msg::UiResetAll, Msg::UiResetAllHint),
+            (view, PAGE_PREV, Msg::UiPreviousPage, Msg::UiPreviousPage),
+            (view, PAGE_NEXT, Msg::UiNextPage, Msg::UiNextPage),
+        ] {
+            let button = child(parent, id);
+            caption(button, tr(label));
+            self.hint(parent, button, hint, tooltip_message);
+        }
+        for (i, group) in GROUPS.iter().enumerate() {
+            let category = tr(group.title);
+            caption(child(view, SECTION + i as i32), category);
+            for &action in group.actions {
+                let id = action.index() as i32;
+                caption(child(view, LABEL_ROW + id), action.label());
+                let args = [("action", action.label()), ("category", category)];
+                for (base, label, hint) in [
+                    (ADD_ROW, Msg::UiAddForAction, Msg::UiAddShortcut),
+                    (RESET_ROW, Msg::UiResetForAction, Msg::UiRestoreAction),
+                ] {
+                    let button = child(view, base + id);
+                    caption(button, &render(label, &args));
+                    self.hint(view, button, hint, tooltip_message);
+                }
+            }
+        }
+    }
+
+    pub(super) fn localize_window(&self, hwnd: HWND) {
+        caption(hwnd, tr(Msg::UiShortcutTitle));
+        self.localize_controls(hwnd, TTM_UPDATETIPTEXTW);
+        let view = child(hwnd, VIEW);
+        for slots in self.slots.borrow().iter() {
+            for slot in slots {
+                self.hint(view, slot.row, Msg::UiEditHint, TTM_UPDATETIPTEXTW);
+                self.hint(view, slot.remove, Msg::UiRemoveShortcut, TTM_UPDATETIPTEXTW);
+            }
+        }
+        self.update_fonts(hwnd);
+        caption(child(hwnd, STATUS), "");
+        if let Some(Command::Transfer(assignment, conflicts)) = self.transfer.get() {
+            self.localize_conflict(self.conflict.get(), assignment, conflicts);
+        }
+        unsafe {
+            RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
     }
 
     pub(super) fn update_fonts(&self, hwnd: HWND) {

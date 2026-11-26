@@ -31,6 +31,33 @@ impl ShortcutWindow {
         }
         self.transfer.set(Some(transfer));
         self.conflict.set(dialog);
+        self.localize_conflict(dialog, assignment, conflicts);
+        unsafe {
+            EnableWindow(owner, 0);
+            SetWindowPos(
+                dialog,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            SetFocus(child(dialog, IDCANCEL));
+        }
+        Ok(())
+    }
+
+    pub(super) fn localize_conflict(
+        &self,
+        dialog: HWND,
+        assignment: Assignment,
+        conflicts: BindingConflicts,
+    ) {
+        let owner = self.hwnd.get();
+        caption(dialog, tr(Msg::UiConflictTitle));
+        caption(child(dialog, IDOK), tr(Msg::UiReassign));
+        caption(child(dialog, IDCANCEL), tr(Msg::UiCancel));
         let entries: Vec<_> = conflicts.iter().collect();
         let action = assignment.action();
         let legends = entries
@@ -72,11 +99,17 @@ impl ShortcutWindow {
                 x = x.clamp(work.left, work.left.max(work.right - width));
                 y = y.clamp(work.top, work.top.max(work.bottom - height));
             }
-            EnableWindow(owner, 0);
-            SetWindowPos(dialog, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW);
-            SetFocus(child(dialog, IDCANCEL));
+            SetWindowPos(
+                dialog,
+                null_mut(),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            RedrawWindow(dialog, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
-        Ok(())
     }
 
     fn fit_conflicts(&self, dialog: HWND, conflicts: BindingConflicts) -> i32 {
@@ -217,9 +250,6 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe {
         if msg == WM_INITDIALOG {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp);
-            SetWindowTextW(hwnd, localized_wide(Msg::UiConflictTitle));
-            SetWindowTextW(child(hwnd, IDOK), localized_wide(Msg::UiReassign));
-            SetWindowTextW(child(hwnd, IDCANCEL), localized_wide(Msg::UiCancel));
         }
         let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ShortcutWindow).as_ref()
         else {

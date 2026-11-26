@@ -247,7 +247,8 @@ impl ShortcutWindow {
         if *self.settings.borrow() == settings {
             return;
         }
-        self.settings.replace(settings);
+        let language = settings.language;
+        let language_changed = self.settings.replace(settings).language != language;
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
             self.end_capture();
@@ -262,6 +263,9 @@ impl ShortcutWindow {
                     .position(|&c| c == chord)
             {
                 self.selected_slot.set(index);
+            }
+            if language_changed {
+                self.localize_window(hwnd);
             }
             self.update_rows();
             self.layout(hwnd);

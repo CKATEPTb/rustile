@@ -112,6 +112,15 @@ impl State {
         }
     }
 
+    pub(super) fn hide_arrows(&self, hwnd: HWND, index: usize) {
+        for offset in 0..2 {
+            let arrow = unsafe { GetDlgItem(hwnd, (ARROW_BASE + index * 2 + offset) as i32) };
+            if !arrow.is_null() {
+                unsafe { ShowWindow(arrow, SW_HIDE) };
+            }
+        }
+    }
+
     pub(super) fn layout_arrows(
         &self,
         hwnd: HWND,
@@ -125,13 +134,13 @@ impl State {
             let id = ARROW_BASE + index * 2 + offset;
             unsafe {
                 let mut arrow = GetDlgItem(hwnd, id as i32);
+                let message = if offset == 0 {
+                    Msg::TrayDecrease
+                } else {
+                    Msg::TrayIncrease
+                };
+                let name = wide(&render(message, &[("label", m.label())]));
                 if arrow.is_null() {
-                    let message = if offset == 0 {
-                        Msg::TrayDecrease
-                    } else {
-                        Msg::TrayIncrease
-                    };
-                    let name = wide(&render(message, &[("label", m.label())]));
                     arrow = CreateWindowExW(
                         0,
                         w!("BUTTON"),
@@ -150,6 +159,8 @@ impl State {
                         continue;
                     }
                     SetWindowSubclass(arrow, Some(button_proc), 1, 0);
+                } else {
+                    SetWindowTextW(arrow, name.as_ptr());
                 }
                 SetWindowPos(
                     arrow,

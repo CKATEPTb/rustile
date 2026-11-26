@@ -1,4 +1,4 @@
-use crate::i18n::{Msg, tr};
+use crate::i18n::{Language, Msg, tr};
 use crate::settings::{Command, Settings};
 use crate::startup::Startup;
 
@@ -44,6 +44,8 @@ impl Measure {
 
 #[derive(Clone, Copy)]
 pub(super) enum Action {
+    Languages,
+    Back,
     EditShortcuts,
     EditExclusions,
     Adjust(Measure),
@@ -92,12 +94,35 @@ impl Row {
 
     pub fn accessible_name(&self) -> Vec<u16> {
         let mut name = self.label.clone();
+        if matches!(self.action, Action::Back) {
+            name.push_str(", ");
+            name.push_str(tr(Msg::TrayBack));
+        }
+        if self.is_selected_language() {
+            name.push_str(", ");
+            name.push_str(tr(Msg::TraySelected));
+        }
         if !self.detail.is_empty() {
             name.push_str(", ");
             name.push_str(&self.detail);
         }
         name.encode_utf16().chain([0]).collect()
     }
+
+    pub fn is_selected_language(&self) -> bool {
+        matches!(self.action, Action::Apply(Command::SetLanguage(_))) && self.checked == Some(true)
+    }
+}
+
+pub(super) fn language_rows(preference: Option<Language>) -> Vec<Row> {
+    let mut rows = vec![Row::new(tr(Msg::TrayLanguage), "\u{e72b}", Action::Back)];
+    for choice in std::iter::once(None).chain(Language::ALL.into_iter().map(Some)) {
+        let label = choice.map_or_else(|| tr(Msg::TraySystemLanguage), Language::native_name);
+        let mut row = Row::new(label, "", Action::Apply(Command::SetLanguage(choice)));
+        row.checked = Some(choice == preference);
+        rows.push(row);
+    }
+    rows
 }
 
 pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
@@ -125,6 +150,14 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
         row.separator = measure == Measure::Outline;
         rows.push(row);
     }
+    rows.push(
+        Row::new(tr(Msg::TrayLanguage), "\u{e774}", Action::Languages)
+            .value(
+                s.language
+                    .map_or_else(|| tr(Msg::TraySystemLanguage), Language::native_name),
+            )
+            .group(),
+    );
     let launch = tr(Msg::TrayAutoStart);
     if let Some(mode) = startup {
         let enabled = mode != Startup::Off;
@@ -134,11 +167,11 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
         } else {
             Startup::Normal
         };
-        rows.push(
-            Row::new(launch, "\u{e768}", action(next))
-                .switch(enabled, tr(Msg::TrayOn), tr(Msg::TrayOff))
-                .group(),
-        );
+        rows.push(Row::new(launch, "\u{e768}", action(next)).switch(
+            enabled,
+            tr(Msg::TrayOn),
+            tr(Msg::TrayOff),
+        ));
         if enabled {
             let elevated = mode == Startup::Elevated;
             let next = if elevated {
@@ -155,11 +188,7 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
             );
         }
     } else {
-        rows.push(
-            Row::new(launch, "\u{e768}", Action::None)
-                .value(tr(Msg::TrayUnavailable))
-                .group(),
-        );
+        rows.push(Row::new(launch, "\u{e768}", Action::None).value(tr(Msg::TrayUnavailable)));
     }
     rows.push(Row::new(tr(Msg::TrayExclusions), "\u{e71c}", Action::EditExclusions).group());
     rows.push(Row::new(

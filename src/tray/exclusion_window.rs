@@ -78,6 +78,7 @@ struct Editor {
     rules: RefCell<Vec<ExclusionRule>>,
     selected: Cell<Option<usize>>,
     loading: Cell<bool>,
+    picked_cues: Cell<bool>,
     pending: RefCell<Option<Change>>,
     queued: Cell<bool>,
 }
@@ -93,6 +94,7 @@ impl Default for Editor {
             rules: RefCell::default(),
             selected: Cell::new(None),
             loading: Cell::new(false),
+            picked_cues: Cell::new(false),
             pending: RefCell::default(),
             queued: Cell::new(false),
         }
@@ -100,6 +102,24 @@ impl Default for Editor {
 }
 
 impl ExclusionWindow {
+    pub(super) fn language_changed(&self) {
+        let ui = &self.0;
+        let hwnd = ui.hwnd.get();
+        if hwnd.is_null() {
+            return;
+        }
+        set_text(hwnd, tr(Msg::RuleWindowTitle));
+        ui.localize_controls();
+        if !ui.picked_cues.get() {
+            ui.example_cues();
+        }
+        ui.status("");
+        ui.layout();
+        unsafe {
+            RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+    }
+
     pub(super) fn open(&self, owner: HWND, rules: &[ExclusionRule]) -> Result<(), String> {
         let ui = &*self.0;
         if ui.hwnd.get().is_null() {
@@ -336,11 +356,7 @@ impl Editor {
         {
             set_text(self.child(id), value);
         }
-        self.cues(
-            tr(Msg::RuleExampleProcess),
-            tr(Msg::RuleExampleTitle),
-            tr(Msg::RuleExampleClass),
-        );
+        self.example_cues();
         self.loading.set(false);
         self.status("");
         self.update_buttons();
@@ -420,6 +436,15 @@ impl Editor {
         self.queue(rules, next);
     }
 
+    fn example_cues(&self) {
+        self.picked_cues.set(false);
+        self.cues(
+            tr(Msg::RuleExampleProcess),
+            tr(Msg::RuleExampleTitle),
+            tr(Msg::RuleExampleClass),
+        );
+    }
+
     fn cues(&self, process: &str, title: &str, class: &str) {
         for (id, cue) in FIELDS.into_iter().zip([process, title, class]) {
             unsafe { SendMessageW(self.child(id), EM_SETCUEBANNER, 0, wide(cue).as_ptr() as _) };
@@ -488,6 +513,7 @@ impl Editor {
                         ""
                     },
                 );
+                self.picked_cues.set(true);
                 self.cues(process, title, class);
                 self.loading.set(false);
                 self.status("");

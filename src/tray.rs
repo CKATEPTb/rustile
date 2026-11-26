@@ -72,6 +72,7 @@ struct State {
     taskbar_created: u32,
     work_area_changed: Cell<bool>,
     registered: Cell<bool>,
+    choosing_language: Cell<bool>,
     attempts: Cell<u8>,
     shortcuts: ShortcutWindow,
     exclusions: ExclusionWindow,
@@ -134,6 +135,7 @@ impl Tray {
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
                 work_area_changed: Cell::new(false),
                 registered: Cell::new(false),
+                choosing_language: Cell::new(false),
                 attempts: Cell::new(0),
                 shortcuts: ShortcutWindow::default(),
                 exclusions: ExclusionWindow::default(),
@@ -177,10 +179,14 @@ impl Tray {
 
     pub fn set_settings(&self, settings: Settings) {
         self.state.applying.set(None);
+        let language_changed = self.state.settings.borrow().language != settings.language;
         self.state.shortcuts.set_settings(settings.clone());
+        if language_changed {
+            self.state.exclusions.language_changed();
+        }
         let enabled = settings.enabled;
         let previous = self.state.settings.replace(settings);
-        if previous.enabled != enabled && self.state.registered.get() {
+        if (previous.enabled != enabled || language_changed) && self.state.registered.get() {
             let mut data = self.state.icon_data(self.hwnd);
             data.uFlags = NIF_TIP | NIF_SHOWTIP;
             if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
@@ -189,7 +195,11 @@ impl Tray {
             }
         }
         if unsafe { IsWindowVisible(self.hwnd) } != 0 {
-            self.state.refresh_rows(self.hwnd);
+            if language_changed {
+                self.state.layout(self.hwnd);
+            } else {
+                self.state.refresh_rows(self.hwnd);
+            }
         }
     }
 
@@ -211,7 +221,10 @@ impl Tray {
         let was_pending = self.state.startup_pending.replace(false);
         self.state.applying.set(None);
         let previous = self.state.startup.replace(value);
-        if (!was_pending && previous == value) || unsafe { IsWindowVisible(self.hwnd) } == 0 {
+        if (!was_pending && previous == value)
+            || self.state.choosing_language.get()
+            || unsafe { IsWindowVisible(self.hwnd) } == 0
+        {
             return;
         }
         let has_admin_row = |mode| matches!(mode, Some(Startup::Normal | Startup::Elevated));
@@ -342,6 +355,9 @@ impl Drop for State {
 
 impl State {
     fn menu_rows(&self) -> Vec<Row> {
+        if self.choosing_language.get() {
+            return menu::language_rows(self.settings.borrow().language);
+        }
         let mut rows = menu::rows(&self.settings.borrow(), self.startup.get());
         if self.startup_pending.get() {
             for row in &mut rows {
@@ -404,6 +420,7 @@ impl State {
     }
 
     fn show(&self, hwnd: HWND, point: POINT, keyboard: bool) {
+        self.choosing_language.set(false);
         self.anchor.set(point);
         self.keyboard.set(keyboard);
         if !self.startup_pending.get() {
@@ -533,7 +550,12 @@ impl State {
         self.hot.set(null_mut());
         let rows = self.menu_rows();
         let count = rows.len();
-        *self.entries.borrow_mut() = rows;
+        let previous = self.entries.replace(rows);
+        for (i, row) in previous.iter().enumerate() {
+            if matches!(row.action, Action::Adjust(_)) && self.measure(i).is_none() {
+                self.hide_arrows(hwnd, i);
+            }
+        }
         let point = self.anchor.get();
         let mut monitor = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -562,6 +584,8 @@ impl State {
                         let range = render(Msg::TrayRange, &[("max", &setting.max().to_string())]);
                         label = label.max(measure(fonts.regular, &range));
                         p(118)
+                    } else if matches!(row.action, Action::Languages) {
+                        measure(fonts.small, &row.detail) + p(44)
                     } else if row.checked.is_some() {
                         p(52)
                     } else if !row.detail.is_empty() {
@@ -689,6 +713,22 @@ impl State {
         }
     }
 
+    fn show_language_choices(&self, hwnd: HWND, show: bool) {
+        self.finish_edit(hwnd, EndEdit::Blur);
+        self.choosing_language.set(show);
+        self.layout(hwnd);
+        let index = self.entries.borrow().iter().position(|row| {
+            if show {
+                row.is_selected_language()
+            } else {
+                matches!(row.action, Action::Languages)
+            }
+        });
+        if let Some(index) = index {
+            self.focus(hwnd, index);
+        }
+    }
+
     fn activate(&self, hwnd: HWND, index: usize) {
         let action = self
             .entries
@@ -697,6 +737,8 @@ impl State {
             .filter(|r| r.enabled)
             .map(|r| r.action);
         match action {
+            Some(Action::Languages) => self.show_language_choices(hwnd, true),
+            Some(Action::Back) => self.show_language_choices(hwnd, false),
             Some(Action::Adjust(_)) => self.start_edit(hwnd, index),
             Some(action @ (Action::EditShortcuts | Action::EditExclusions)) => {
                 self.hide(hwnd, false);
@@ -718,7 +760,9 @@ impl State {
                     return;
                 }
                 self.commands.borrow_mut().push_back(command);
-                if !matches!(command, Command::SetStartup(_)) {
+                if matches!(command, Command::SetLanguage(_)) {
+                    self.show_language_choices(hwnd, false);
+                } else if !matches!(command, Command::SetStartup(_)) {
                     self.hide(hwnd, true);
                 }
                 unsafe {
@@ -738,10 +782,16 @@ impl State {
             return true;
         }
         match key {
+            VK_ESCAPE | VK_LEFT | VK_BACK if self.choosing_language.get() => {
+                self.show_language_choices(hwnd, false);
+            }
             VK_ESCAPE | VK_LEFT | VK_BACK => self.hide(hwnd, true),
             VK_RIGHT => {
                 let opens = self.entries.borrow().get(index).is_some_and(|r| {
-                    matches!(r.action, Action::EditShortcuts | Action::EditExclusions)
+                    matches!(
+                        r.action,
+                        Action::EditShortcuts | Action::EditExclusions | Action::Languages
+                    )
                 });
                 if opens {
                     self.activate(hwnd, index);

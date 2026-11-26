@@ -46,7 +46,7 @@ pub(super) fn button(parent: HWND, label: &str, id: i32) -> Result<HWND, String>
 }
 
 impl ShortcutWindow {
-    pub(super) fn hint(&self, parent: HWND, hwnd: HWND, text: *const u16) {
+    pub(super) fn hint(&self, parent: HWND, hwnd: HWND, text: Msg, message: u32) {
         let tooltip = self.tooltip.get();
         if !tooltip.is_null() {
             let tool = TTTOOLINFOW {
@@ -54,10 +54,10 @@ impl ShortcutWindow {
                 uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                 hwnd: parent,
                 uId: hwnd as usize,
-                lpszText: text.cast_mut(),
+                lpszText: localized_wide(text).cast_mut(),
                 ..Default::default()
             };
-            unsafe { SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize) };
+            unsafe { SendMessageW(tooltip, message, 0, (&raw const tool) as isize) };
         }
     }
 
@@ -115,8 +115,8 @@ impl ShortcutWindow {
                     after = hwnd;
                 }
             }
-            self.hint(view, row, localized_wide(Msg::UiEditHint));
-            self.hint(view, remove, localized_wide(Msg::UiRemoveShortcut));
+            self.hint(view, row, Msg::UiEditHint, TTM_ADDTOOLW);
+            self.hint(view, remove, Msg::UiRemoveShortcut, TTM_ADDTOOLW);
             self.slots.borrow_mut()[index].push(Slot { row, remove });
         }
         let obsolete = {

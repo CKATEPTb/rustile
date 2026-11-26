@@ -2,7 +2,7 @@ mod bindings;
 pub(crate) mod exclusions;
 mod scheme;
 
-use crate::i18n::{Msg, render, tr};
+use crate::i18n::{Language, Msg, render, tr};
 use crate::profile_io;
 #[cfg(test)]
 pub(crate) use bindings::BindingOwners;
@@ -59,6 +59,7 @@ impl Modifier {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Toggle,
+    SetLanguage(Option<Language>),
     SetStartup(crate::startup::Startup),
     Outline(u8),
     Gap(u8),
@@ -83,6 +84,8 @@ impl Command {
 #[serde(from = "StoredSettings")]
 pub(crate) struct Settings {
     version: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
     pub enabled: bool,
     pub outline: u8,
     pub gap: u8,
@@ -99,6 +102,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: 1,
+            language: None,
             enabled: true,
             outline: 1,
             gap: 8,
@@ -116,6 +120,7 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 struct StoredSettings {
     version: Option<u16>,
+    language: Option<Language>,
     enabled: Option<bool>,
     outline: Option<u8>,
     gap: Option<u8>,
@@ -135,6 +140,7 @@ impl From<StoredSettings> for Settings {
         let defaults = Self::default();
         let mut settings = Self {
             version: file.version.unwrap_or(defaults.version),
+            language: file.language,
             enabled: file.enabled.unwrap_or(defaults.enabled),
             outline: file.outline.unwrap_or(defaults.outline),
             gap: file.gap.unwrap_or(defaults.gap),
@@ -186,6 +192,7 @@ impl Settings {
         let mut next = self.clone();
         match command {
             Command::Toggle => next.enabled = !next.enabled,
+            Command::SetLanguage(language) => next.language = language,
             Command::Outline(value) => next.outline = value,
             Command::Gap(value) => next.gap = value,
             Command::Padding(value) => next.padding = value,
@@ -328,6 +335,31 @@ impl Drop for PendingSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_round_trips_as_a_tag_and_automatic_preserves_legacy_profiles() {
+        let baseline: Settings = toml::from_str("gap = 16").unwrap();
+        assert_eq!(baseline.language, None);
+        let tags = [
+            "en", "ru", "de", "fr", "it", "es", "zh-Hans", "ja", "pt", "ko", "pl", "tr",
+        ];
+        for (index, (language, tag)) in Language::ALL.into_iter().zip(tags).enumerate() {
+            assert_eq!(language as usize, index);
+            let next = baseline
+                .changed(Command::SetLanguage(Some(language)))
+                .unwrap();
+            let text = toml::to_string_pretty(&next).unwrap();
+            assert!(
+                text.lines()
+                    .any(|line| line == format!("language = \"{tag}\""))
+            );
+            let loaded = toml::from_str::<Settings>(&text).unwrap();
+            assert_eq!(loaded, next);
+            let automatic = loaded.changed(Command::SetLanguage(None)).unwrap();
+            assert_eq!(automatic, baseline);
+            assert!(!toml::to_string(&automatic).unwrap().contains("language"));
+        }
+    }
 
     #[test]
     fn display_language_changes_action_and_conflict_text_but_keeps_bindings_portable() {

@@ -1,4 +1,8 @@
 # Key	en	ru	de	fr	it	es	zh-Hans	ja	pt	ko	pl	tr
+TrayLanguage	Language	Язык	Sprache	Langue	Lingua	Idioma	语言	言語	Idioma	언어	Język	Dil
+TraySystemLanguage	Match Windows	Как в Windows	Wie in Windows	Langue de Windows	Lingua di Windows	Idioma de Windows	跟随 Windows	Windows に合わせる	Idioma do Windows	Windows 언어 사용	Jak w systemie Windows	Windows ile aynı
+TraySelected	Selected	Выбрано	Ausgewählt	Sélectionné	Selezionato	Seleccionado	已选择	選択中	Selecionado	선택됨	Wybrano	Seçili
+TrayBack	Back	Назад	Zurück	Retour	Indietro	Atrás	返回	戻る	Voltar	뒤로	Wstecz	Geri
 TrayOutline	Border width	Толщина обводки	Rahmenbreite	Épaisseur du contour	Spessore del bordo	Grosor del borde	边框宽度	枠線の幅	Espessura da borda	테두리 두께	Grubość obramowania	Kenarlık kalınlığı
 TrayGap	Window gap	Между окнами	Fensterabstand	Espace entre les fenêtres	Spazio tra le finestre	Espacio entre ventanas	窗口间距	ウィンドウ間の余白	Espaço entre janelas	창 사이 간격	Odstęp między oknami	Pencere aralığı
 TrayPadding	Screen margins	По краям экрана	Bildschirmränder	Marges de l’écran	Margini dello schermo	Márgenes de pantalla	屏幕边距	画面端の余白	Margens da tela	화면 가장자리 여백	Marginesy ekranu	Ekran kenar boşluğu

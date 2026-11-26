@@ -444,7 +444,13 @@ impl Preferences<'_> {
             .then(|| saved.prepare(self.path))
             .transpose()?;
         manager.apply_settings_with(next.clone(), || {
-            write.map_or(Ok(()), |pending| pending.commit())
+            if let Some(pending) = write {
+                pending.commit()?;
+            }
+            if next.language != self.live.language {
+                crate::i18n::set_language(next.language);
+            }
+            Ok(())
         })?;
         WATCH_TITLES.set(manager.watches_titles());
         tray.set_settings(next.clone());
@@ -1204,6 +1210,7 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
         Ok(value) => (value, None),
         Err(detail) => (Settings::default(), Some(detail)),
     };
+    crate::i18n::set_language(saved.language);
     let live = match resize_override {
         Some(modifier) => saved.with_resize_override(modifier)?,
         None => saved.clone(),

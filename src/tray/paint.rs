@@ -14,6 +14,8 @@ use windows_sys::Win32::{
 };
 use windows_sys::core::{PCWSTR, w};
 
+use crate::settings::Command;
+
 use super::{
     HEADER_ICON_DIP,
     menu::{Action, Row},
@@ -389,7 +391,11 @@ impl Painter<'_> {
                 )
             };
         } else {
-            let icon = row.glyph;
+            let icon = if row.is_selected_language() {
+                "\u{e73e}"
+            } else {
+                row.glyph
+            };
             if !icon.is_empty() {
                 text(
                     dc,
@@ -406,7 +412,25 @@ impl Painter<'_> {
             }
         }
 
-        if let Some(checked) = row.checked {
+        if matches!(row.action, Action::Languages) {
+            let end = label.right;
+            text(
+                dc,
+                RECT {
+                    left: end - p(14),
+                    ..label
+                },
+                "\u{e76c}",
+                self.fonts.symbol,
+                sub,
+                DT_RIGHT,
+            );
+            label.right -= p(20);
+        }
+
+        if let Some(checked) = row.checked
+            && !matches!(row.action, Action::Apply(Command::SetLanguage(_)))
+        {
             let left = rc.right - p(10) - p(34);
             self.draw_toggle(dc, left, mid, selected, checked);
             label.right = left - p(8);
