@@ -488,8 +488,9 @@ internal static class DesktopSmoke {
     // Stable action IDs in the order in which a user reads each family.
     static readonly int[][] ShortcutFamilies = {
         new[] { 29, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7 },
-        new[] { 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59 },
-        new[] { 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 26 }
+        new[] { 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45 },
+        new[] { 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 26 },
+        new[] { 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59 }
     };
     static List<IntPtr> Bindings(IntPtr editor, int action) {
         var result = new List<IntPtr>();
@@ -605,6 +606,11 @@ internal static class DesktopSmoke {
         Require(bindings.SequenceEqual(ShortcutFamilies.SelectMany(family => family)),
             "Tab should reach each action's binding in reading order");
     }
+    static int[][] VisualColumns(IntPtr view, IEnumerable<int> actions) {
+        return actions.Select(id => new { id, rect = Bounds(GetDlgItem(view, 1500 + id)) })
+            .GroupBy(action => action.rect.Left).OrderBy(column => column.Key)
+            .Select(column => column.OrderBy(action => action.rect.Top).Select(action => action.id).ToArray()).ToArray();
+    }
     static void VerifyEditorLayout(IntPtr editor) {
         var original = Bounds(editor);
         int dpi = (int)GetDpiForWindow(editor);
@@ -614,6 +620,10 @@ internal static class DesktopSmoke {
         var previous = EditorControl(editor, 512);
         var next = EditorControl(editor, 513);
         var indicator = EditorControl(editor, 514);
+        var transfer = EditorControl(editor, 527);
+        var upperHeadings = Enumerable.Range(520, 7).Select(id => GetDlgItem(view, id)).ToArray();
+        var transferIds = ShortcutFamilies[3];
+        Require(ControlText(transfer) == "Перенос окна между столами", "The transfer section needs its own heading");
         Require((GetWindowLongW(view, -16) & 0x00200000 /* WS_VSCROLL */) == 0,
             "The shortcut editor should have no vertical scrollbar");
         Require(EditableRows.All(id => GetDlgItem(view, 1200 + id) == IntPtr.Zero && GetDlgItem(view, 2100 + id) == IntPtr.Zero),
@@ -625,11 +635,16 @@ internal static class DesktopSmoke {
             Require(Bounds(preview).Bottom <= viewport.Top && Bounds(reset).Bottom <= viewport.Top,
                 "The selection and global reset should remain above the list");
             var reached = new HashSet<int>();
+            bool visitedTransferSection = false;
             int page;
             for (page = 0; page < ActionCount; page++) {
                 var visibleRows = EditableRows.Where(id => IsWindowVisible(GetDlgItem(view, 1000 + id))).ToArray();
                 Require(visibleRows.Length > 0, "No actions visible at width " + size.Width + ", page " + page);
                 var positions = new List<Rectangle>();
+                var upper = upperHeadings.Where(IsWindowVisible).Select(Bounds).ToList();
+                var lower = new List<Rectangle>();
+                positions.AddRange(upper);
+                if (IsWindowVisible(transfer)) positions.Add(Bounds(transfer));
                 foreach (var id in visibleRows) {
                     var name = GetDlgItem(view, 1500 + id);
                     var add = GetDlgItem(view, 1300 + id);
@@ -647,8 +662,20 @@ internal static class DesktopSmoke {
                         Require(!positions.Any(other => other.IntersectsWith(rect)),
                             "Two shortcut controls overlap near " + title + " at " + size);
                         positions.Add(rect);
+                        if (transferIds.Contains(id)) lower.Add(rect);
+                        else upper.Add(rect);
                     }
                     reached.Add(id);
+                }
+                Require(!visitedTransferSection || upper.Count == 0,
+                    "Upper topic controls should not reappear on pages following the transfer section");
+                if (lower.Count > 0) {
+                    var heading = Bounds(transfer);
+                    Require(IsWindowVisible(transfer) && viewport.Contains(heading),
+                        "Transfer shortcuts must be accompanied by their visible section heading on every page");
+                    Require(upper.All(rect => rect.Bottom <= heading.Top) && lower.All(rect => rect.Top >= heading.Bottom),
+                        "The transfer heading should separate the upper topics from their full-width lower section");
+                    visitedTransferSection = true;
                 }
                 var anchor = GetDlgItem(view, 1000 + visibleRows[0]);
                 var before = Bounds(anchor);
@@ -659,10 +686,19 @@ internal static class DesktopSmoke {
                 if (size.Width == 1424) {
                     Require(page == 0 && reached.Count == EditableRows.Length && !IsWindowVisible(next),
                         "All factory bindings should fit the full-sized editor on a single page");
-                    var columns = visibleRows.GroupBy(id => Bounds(GetDlgItem(view, 1500 + id)).Left)
-                        .OrderBy(g => g.Key).Select(g => g.OrderBy(id => Bounds(GetDlgItem(view, 1500 + id)).Top).ToArray()).ToArray();
+                    var columns = VisualColumns(view, visibleRows.Except(transferIds));
                     Require(columns.Length == 3 && columns.Select((col, i) => col.SequenceEqual(ShortcutFamilies[i])).All(match => match),
-                        "Window, desktop and resize commands must each occupy their own column");
+                        "Window, desktop and resize commands must each occupy their own upper column");
+                    var heading = Bounds(transfer);
+                    Require(heading.Left == upper.Min(rect => rect.Left) && heading.Right >= upper.Max(rect => rect.Right),
+                        "The transfer heading should span from the first upper column to the last");
+                    var transferColumns = VisualColumns(view, transferIds);
+                    var expected = new[] { new[] { 46, 47 }, Enumerable.Range(50, 5).ToArray(), Enumerable.Range(55, 5).ToArray() };
+                    Require(transferColumns.Length == 3 && transferColumns.Select((col, i) => col.SequenceEqual(expected[i])).All(match => match),
+                        "The lower section should group previous/next, desktops 1–5 and desktops 6–10");
+                    Require(Enumerable.Range(0, 3).All(i => Bounds(GetDlgItem(view, 1500 + columns[i][0])).Left
+                        == Bounds(GetDlgItem(view, 1500 + transferColumns[i][0])).Left),
+                        "The three lower groups should align with the upper columns");
                     Require(EditableRows.All(id => Bindings(editor, id).All(IsWindowVisible)),
                         "The wide editor should display every default alternative");
                     Require(EditableRows.Any(id => Bindings(editor, id).Select(Bounds)

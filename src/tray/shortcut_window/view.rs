@@ -33,7 +33,7 @@ pub(super) struct Group {
     pub(super) actions: &'static [Shortcut],
 }
 
-// Native tab order and the layout both follow this list, top to bottom within each topic.
+// Native tab order follows the upper columns, then the full-width transfer section.
 pub(super) const GROUPS: [Group; 8] = [
     Group {
         topic: Windows,
@@ -69,25 +69,6 @@ pub(super) const GROUPS: [Group; 8] = [
         ],
     },
     Group {
-        topic: Desktops,
-        title: "Перенос окна между столами",
-        icon: "\u{e8ab}",
-        actions: &[
-            MovePreviousDesktop,
-            MoveNextDesktop,
-            MoveDesktop1,
-            MoveDesktop2,
-            MoveDesktop3,
-            MoveDesktop4,
-            MoveDesktop5,
-            MoveDesktop6,
-            MoveDesktop7,
-            MoveDesktop8,
-            MoveDesktop9,
-            MoveDesktop10,
-        ],
-    },
-    Group {
         topic: Resize,
         title: "Режим изменения размера",
         icon: "\u{e740}",
@@ -116,6 +97,25 @@ pub(super) const GROUPS: [Group; 8] = [
             QuickReverseRight,
             QuickReverseUp,
             QuickReverseDown,
+        ],
+    },
+    Group {
+        topic: Desktops,
+        title: "Перенос окна между столами",
+        icon: "\u{e8ab}",
+        actions: &[
+            MovePreviousDesktop,
+            MoveNextDesktop,
+            MoveDesktop1,
+            MoveDesktop2,
+            MoveDesktop3,
+            MoveDesktop4,
+            MoveDesktop5,
+            MoveDesktop6,
+            MoveDesktop7,
+            MoveDesktop8,
+            MoveDesktop9,
+            MoveDesktop10,
         ],
     },
 ];
@@ -432,10 +432,9 @@ impl ShortcutWindow {
         let gap = p(20);
         let col = ((width - 2 * margin - (columns - 1) as i32 * gap) / columns as i32).max(1);
         let dc = unsafe { GetDC(view) };
-        let sections: Vec<_> = GROUPS
-            .iter()
-            .enumerate()
-            .map(|(i, group)| Section {
+        let sections: [_; GROUPS.len()] = std::array::from_fn(|i| {
+            let group = &GROUPS[i];
+            Section {
                 heading: child(view, SECTION + i as i32),
                 topic: group.topic.column(),
                 actions: group
@@ -443,8 +442,8 @@ impl ShortcutWindow {
                     .iter()
                     .map(|&a| self.action_lines(view, dc, a, col))
                     .collect(),
-            })
-            .collect();
+            }
+        });
         unsafe { ReleaseDC(view, dc) };
         let grid = Grid {
             columns,
@@ -456,10 +455,11 @@ impl ShortcutWindow {
             heading: p(26),
             section_gap: p(8),
         };
-        let mut pages = grid.pages(&sections, height - p(5));
-        let footer = p(34);
+        let [upper @ .., transfers] = &sections;
+        let mut pages = grid.pages(upper, transfers, height - p(5));
+        let pager_height = p(34);
         if pages.len() > 1 {
-            pages = grid.pages(&sections, height - footer - p(4));
+            pages = grid.pages(upper, transfers, height - pager_height - p(4));
         }
         let recording = self.capture.borrow().is_some().then(|| self.selected_row());
         let page = recording
@@ -487,7 +487,7 @@ impl ShortcutWindow {
                 appearance::text_width(dc, fonts.small, &page_text) + p(20)
             });
             unsafe { ReleaseDC(view, dc) };
-            let y = height - footer;
+            let y = height - pager_height;
             let left = mid - number_w / 2;
             for (hwnd, x, width) in [
                 (prev, left - w, w),
