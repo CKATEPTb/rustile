@@ -204,6 +204,10 @@ pub enum Direction {
 }
 
 impl Direction {
+    pub(crate) fn same_axis(self, other: Self) -> bool {
+        self.axis() == other.axis()
+    }
+
     fn opposite(self) -> Self {
         self.axis().direction(!self.towards_start())
     }
@@ -528,6 +532,18 @@ pub struct ResizeStops {
     edge: Direction,
     origin: i64,
     step: i64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResizeStep {
+    Arrow {
+        direction: Direction,
+        reverse: bool,
+    },
+    Edge {
+        edge: Direction,
+        direction: Direction,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1336,7 +1352,8 @@ impl Layout {
         ))
     }
 
-    pub fn resize(
+    #[cfg(test)]
+    fn resize(
         &mut self,
         id: Id,
         direction: Direction,
@@ -1344,13 +1361,41 @@ impl Layout {
         area: Rect,
         stops: &mut Option<ResizeStops>,
     ) -> Option<Direction> {
+        self.resize_step(id, ResizeStep::Arrow { direction, reverse }, area, stops)
+    }
+
+    pub(crate) fn resize_step(
+        &mut self,
+        id: Id,
+        step: ResizeStep,
+        area: Rect,
+        stops: &mut Option<ResizeStops>,
+    ) -> Option<Direction> {
         let slot = self.slot(id)?;
         let tiles = self.visible_rects(area);
         let active = tiles[slot];
-        let edge = if direction.coordinate(active) == direction.coordinate(area) {
-            direction.opposite()
-        } else {
-            direction
+        let (edge, motion) = match step {
+            ResizeStep::Arrow { direction, reverse } => {
+                let edge = if direction.coordinate(active) == direction.coordinate(area) {
+                    direction.opposite()
+                } else {
+                    direction
+                };
+                (
+                    edge,
+                    if reverse {
+                        direction.opposite()
+                    } else {
+                        direction
+                    },
+                )
+            }
+            ResizeStep::Edge { edge, direction } => {
+                if !edge.same_axis(direction) || edge.coordinate(active) == edge.coordinate(area) {
+                    return None;
+                }
+                (edge, direction)
+            }
         };
         let peer = tiles[nearest(active, edge, tiles.iter().copied())?];
         if edge.distance(active, peer) != i64::from(self.grid.gap) {
@@ -1370,11 +1415,6 @@ impl Layout {
             }
         });
         let offset = current - run.origin;
-        let motion = if reverse {
-            direction.opposite()
-        } else {
-            direction
-        };
         let delta = if motion.towards_start() {
             -(run.step - (-offset).rem_euclid(run.step))
         } else {

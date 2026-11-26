@@ -293,7 +293,7 @@ internal static class DesktopSmoke {
         var client = Path.Combine(Path.GetDirectoryName(rustile), "rustilectl.exe");
         Require(File.Exists(client), "Build rustilectl.exe alongside rustile.exe for CLI checks");
         var help = Cli(client, "--help", desktop);
-        Require(help.Contains("desktop current") && help.Contains("focused window"), "Expected English CLI help without a manager");
+        Require(help.Contains("transfer") && help.Contains("resize") && help.Contains("focused window"), "Expected English CLI help without a manager");
         Require(Cli(client, "focus sideways", desktop, false).Contains("Unknown direction"), "Invalid directions need an English error");
         Require(Cli(client, "status", desktop, false).Contains("not running"), "A stopped manager needs an English error");
         Cli(client, "desktop go 0", desktop, false);
@@ -329,8 +329,10 @@ internal static class DesktopSmoke {
         }
         // Virtual desktops belong to the real interactive Shell; an isolated
         // Win32 desktop must return an error without switching the user's desktop.
-        Cli(client, "desktop current", desktop, false);
-        Cli(client, "desktop next", desktop, false);
+        var noDesktops = Cli(client, "desktop current", desktop, false);
+        foreach (var command in new[] { "desktop", "desktop next", "desktop previous", "desktop 3",
+            "transfer next", "transfer previous", "transfer 3" })
+            Require(Cli(client, command, desktop, false) == noDesktops, command + " must reach desktop management on the private desktop");
         var before = windows.Select(VisibleFrame).ToArray();
         var names = new[] { "left", "right", "up", "down" };
         var activeIndex = Array.IndexOf(windows, GetForegroundWindow());
@@ -351,8 +353,30 @@ internal static class DesktopSmoke {
             Cli(client, "focus right", desktop, false);
             Console.WriteLine("PASS  CLI reports an empty focus in English and rejects a directional move without a starting window");
         }
-        var dir = names[NeighborDirection(before[0], before[1])];
+        var edge = NeighborDirection(before[0], before[1]);
+        var dir = names[edge];
+        var opposite = names[edge ^ 1];
         var handle = " --hwnd 0x" + windows[0].ToInt64().ToString("X");
+        Cli(client, "resize " + opposite + " " + dir + handle, desktop, false);
+        Cli(client, "resize " + dir + " " + names[edge ^ 2] + handle, desktop, false);
+        Require(windows.Select(VisibleFrame).SequenceEqual(before), "Rejected edge resizes must leave both tiles in place");
+        Cli(client, "resize " + dir + " " + dir + handle, desktop);
+        Until("An explicit resize must move only the shared divider toward the neighbor", () => {
+            var current = windows.Select(VisibleFrame).ToArray();
+            return current[0] != before[0] && current[0].Contains(before[0])
+                && current[1] != before[1] && before[1].Contains(current[1])
+                && Rectangle.Union(current[0], current[1]) == Rectangle.Union(before[0], before[1]);
+        });
+        Cli(client, "resize " + dir + " " + opposite + handle, desktop);
+        Until("Reversing the same edge must restore both tiles", () => windows.Select(VisibleFrame).SequenceEqual(before));
+        var neighbor = " --hwnd 0x" + windows[1].ToInt64().ToString("X");
+        Cli(client, "resize " + opposite + " " + opposite + neighbor, desktop);
+        Until("Resizing the neighbor's edge must grow that window", () => {
+            var current = VisibleFrame(windows[1]);
+            return current != before[1] && current.Contains(before[1]);
+        });
+        Cli(client, "resize " + opposite + " " + dir + neighbor, desktop);
+        Until("Reversing from the neighbor must restore the same divider", () => windows.Select(VisibleFrame).SequenceEqual(before));
         Cli(client, "window resize " + dir + handle, desktop);
         Until("The explicit CLI target must grow toward its neighbor", () => {
             var current = VisibleFrame(windows[0]);
@@ -360,17 +384,30 @@ internal static class DesktopSmoke {
         });
         Cli(client, "window resize " + dir + " --shrink" + handle, desktop);
         Until("The inverse CLI resize must restore both tiles", () => windows.Select(VisibleFrame).SequenceEqual(before));
-        Cli(client, "window move " + dir + handle, desktop);
+        Cli(client, "move " + dir + handle, desktop);
         Until("CLI move must enter the adjacent tile", () => VisibleFrame(windows[0]).IntersectsWith(before[1]));
 
-        Require(Cli(client, "mosaic off", desktop) == "off" && Cli(client, "mosaic off", desktop) == "off",
-            "Repeated mosaic off must leave it off");
+        Require(Cli(client, "disable", desktop) == "off" && Cli(client, "mosaic off", desktop) == "off",
+            "disable and repeated mosaic off must leave tiling off");
         var paused = windows.Select(VisibleFrame).ToArray();
         Cli(client, "window move " + dir + handle, desktop, false);
         Cli(client, "window resize " + dir + handle, desktop, false);
         Require(windows.Select(VisibleFrame).SequenceEqual(paused), "CLI tile commands moved a paused layout");
-        Require(Cli(client, "mosaic toggle", desktop) == "on" && Cli(client, "mosaic on", desktop) == "on",
-            "Toggle and explicit enable must control the incumbent");
+        using (var app = new Child(Application.ExecutablePath, "fixture 7", desktop)) {
+            var target = IntPtr.Zero;
+            Until("CLI control fixture should be visible", () => (target = Find(app.Pid, false)) != IntPtr.Zero);
+            var targetArg = " --hwnd 0x" + target.ToInt64().ToString("X");
+            Cli(client, "maximize" + targetArg, desktop);
+            Until("maximize should expand the window while tiling is off", () => IsZoomed(target));
+            Cli(client, "maximize" + targetArg, desktop);
+            Until("Repeating maximize should restore the window", () => !IsZoomed(target));
+            Cli(client, "close" + targetArg, desktop);
+            Require(app.Exited(5000) && app.ExitCode == 0, "close must send a regular close request to the selected fixture");
+        }
+        Require(Cli(client, "enable", desktop) == "on" && Cli(client, "enable", desktop) == "on",
+            "enable must resume tiling and keep it enabled when repeated");
+        Require(Cli(client, "toggle", desktop) == "off" && Cli(client, "toggle", desktop) == "on"
+            && Cli(client, "mosaic status", desktop) == "on", "toggle must change the incumbent's tiling state both ways");
         Require(TrayWindow(manager) == tray, "Running client commands changed the tray owner");
         Cli(client, "quit", desktop);
         Require(manager.Exited(5000) && manager.ExitCode == 0, "CLI quit must close the manager cleanly");
@@ -883,7 +920,7 @@ internal static class DesktopSmoke {
             EnterChord(toggle, keys);
             string chord = shift ? "Ctrl+Win+Shift+Y" : "Ctrl+Win+Y";
             Until("The mosaic toggle should retain its new alternative", () =>
-                File.ReadAllText(file) != before && IsWindowEnabled(add) && ShortcutLabel(editor, 29).EndsWith(chord));
+                IsWindowEnabled(add) && ShortcutLabel(editor, 29).EndsWith(chord) && File.ReadAllText(file) != before);
             VerifyPaintedFrame(editor, "adding " + chord);
         }
         VerifyInteractiveResize(editor);

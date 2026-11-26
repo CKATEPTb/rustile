@@ -3,35 +3,46 @@ use crate::settings::Modifier;
 
 const USAGE: &str = "Rustile window manager for Windows
 
-rustilectl focus                            Print the focused window's title
-rustilectl focus DIR                        Focus the neighboring window
-rustilectl window list                      List windows on the current desktop
-rustilectl window move DIR                  Move the focused tile
-rustilectl window resize DIR [--shrink]     Resize the focused tile by one step
-rustilectl window to-desktop next|prev|N    Move the focused window and follow it
-rustilectl window close|maximize            Close or maximize/restore the focused window
-rustilectl mosaic on|off|toggle|status      Control tiling or print its status
-rustilectl desktop current|list|next|prev   Inspect or switch virtual desktops
-rustilectl desktop go N                     Switch to desktop N (numbered from 1)
-rustilectl [start]                          Start Rustile or connect to the running manager
-rustilectl status                           Print the manager's status
-rustilectl quit                             Shut down the manager
+rustilectl enable | disable | toggle  Enable, disable, or toggle tiling
+rustilectl focus                      Print the focused window's title
+rustilectl focus DIR                  Focus the neighboring tile
+rustilectl move DIR                   Move the focused tile
+rustilectl resize EDGE DIR            Move the selected edge of the focused tile
+rustilectl close                      Close the focused window
+rustilectl maximize                   Maximize or restore the focused window
+rustilectl desktop                    Print the current desktop number
+rustilectl desktop next|previous|N    Switch desktops (numbered from 1)
+rustilectl transfer next|previous|N   Move the focused window and follow it
+rustilectl desktop list               List desktops in Windows order
+rustilectl window list                List windows on the current desktop
+rustilectl [start]                    Start Rustile or connect to the running manager
+rustilectl status                     Print the manager's status
+rustilectl quit                       Shut down the manager
 rustilectl --resize-shortcut win+enter|ctrl+alt+enter
 rustilectl --help | --version
 
-DIR is left, right, up, or down. Run rustilectl help COMMAND for details
-on focus, window, desktop, or mosaic.";
+DIR is left, right, up, or down. For example, resize left right moves the left
+edge to the right. Run rustilectl help resize for all edge and direction pairs.";
 
 const FOCUS_HELP: &str = "rustilectl focus                     Print the focused window's title
 rustilectl focus left|right|up|down  Focus the next tiled window in that direction";
 const MOSAIC_HELP: &str = "rustilectl mosaic status           Print on or off
 rustilectl mosaic on|off|toggle    Enable, disable, or toggle tiling";
-const DESKTOP_HELP: &str = "rustilectl desktop current         Print the current desktop number
+const DESKTOP_HELP: &str = "rustilectl desktop                 Print the current desktop number
 rustilectl desktop list            List desktops in Windows order
-rustilectl desktop next|prev       Switch to the next or previous desktop
-rustilectl desktop go N            Switch to desktop N (numbered from 1)
+rustilectl desktop next|previous   Switch to the next or previous desktop
+rustilectl desktop N               Switch to desktop N (numbered from 1)
 
 If N exceeds the desktop count, Rustile switches to the last desktop.";
+const TRANSFER_HELP: &str = "rustilectl transfer next|previous|N
+
+Move the focused window to the destination and follow it. Desktop numbers start
+at 1. Numbers above the desktop count select the last desktop.";
+const RESIZE_HELP: &str = "rustilectl resize left|right left|right
+rustilectl resize top|bottom up|down
+
+Move the selected tile edge one step in the given direction. The edge names
+up and down also select the top and bottom edges. A screen boundary stays fixed.";
 const WINDOW_HELP: &str =
     "rustilectl window current                   Print the focused window's title
 rustilectl window list                      List windows on the current desktop
@@ -88,7 +99,14 @@ pub(crate) enum Destination {
 pub(crate) enum WindowAction {
     Focus(Direction),
     Move(Direction),
-    Resize { direction: Direction, shrink: bool },
+    Resize {
+        direction: Direction,
+        shrink: bool,
+    },
+    ResizeEdge {
+        edge: Direction,
+        direction: Direction,
+    },
     ToDesktop(Destination),
     Close,
     Maximize,
@@ -105,6 +123,18 @@ pub(crate) fn parse(args: &[String]) -> Result<Invocation, String> {
         ["--help" | "-h" | "help"] => Ok(Invocation::Print(USAGE)),
         ["help", group] | [group, "--help" | "-h"] => match *group {
             "focus" => Ok(Invocation::Print(FOCUS_HELP)),
+            "move" => Ok(Invocation::Print("rustilectl move left|right|up|down")),
+            "resize" => Ok(Invocation::Print(RESIZE_HELP)),
+            "transfer" => Ok(Invocation::Print(TRANSFER_HELP)),
+            "enable" => Ok(Invocation::Print("rustilectl enable   Enable tiling")),
+            "disable" => Ok(Invocation::Print("rustilectl disable  Disable tiling")),
+            "toggle" => Ok(Invocation::Print("rustilectl toggle   Toggle tiling")),
+            "close" => Ok(Invocation::Print(
+                "rustilectl close   Close the focused window",
+            )),
+            "maximize" => Ok(Invocation::Print(
+                "rustilectl maximize   Maximize or restore the focused window",
+            )),
             "mosaic" => Ok(Invocation::Print(MOSAIC_HELP)),
             "desktop" => Ok(Invocation::Print(DESKTOP_HELP)),
             "window" => Ok(Invocation::Print(WINDOW_HELP)),
@@ -130,33 +160,28 @@ fn parse_command(words: &[&str]) -> Result<Command, String> {
     match words {
         ["status"] => Ok(Command::Status),
         ["quit"] => Ok(Command::Quit),
-        ["mosaic", verb] => match *verb {
-            "status" => Ok(Command::Mosaic(Mosaic::Status)),
-            "on" => Ok(Command::Mosaic(Mosaic::On)),
-            "off" => Ok(Command::Mosaic(Mosaic::Off)),
-            "toggle" => Ok(Command::Mosaic(Mosaic::Toggle)),
-            _ => Err(MOSAIC_HELP.into()),
-        },
+        ["enable"] | ["mosaic", "on"] => Ok(Command::Mosaic(Mosaic::On)),
+        ["disable"] | ["mosaic", "off"] => Ok(Command::Mosaic(Mosaic::Off)),
+        ["toggle"] | ["mosaic", "toggle"] => Ok(Command::Mosaic(Mosaic::Toggle)),
+        ["mosaic", "status"] => Ok(Command::Mosaic(Mosaic::Status)),
         ["mosaic", ..] => Err(MOSAIC_HELP.into()),
-        ["desktop", "current"] => Ok(Command::DesktopCurrent),
+        ["desktop"] | ["desktop", "current"] => Ok(Command::DesktopCurrent),
         ["desktop", "list"] => Ok(Command::DesktopList),
-        ["desktop", "next"] => Ok(Command::DesktopGo(Destination::Next)),
-        ["desktop", "prev"] => Ok(Command::DesktopGo(Destination::Previous)),
+        ["desktop", target] => destination(target).map(Command::DesktopGo),
         ["desktop", "go", n] => desktop_number(n).map(Command::DesktopGo),
         ["desktop", ..] => Err(DESKTOP_HELP.into()),
         ["focus"] | ["window", "current"] => Ok(Command::WindowCurrent),
-        ["focus", dir] => Ok(Command::Window {
-            action: WindowAction::Focus(direction(dir)?),
-            hwnd: None,
-        }),
-        ["focus", ..] => Err(FOCUS_HELP.into()),
         ["window", "list"] => Ok(Command::WindowList),
-        ["window", args @ ..] => parse_window(args),
+        ["window", args @ ..] => parse_window(args, true),
+        [
+            "focus" | "move" | "resize" | "transfer" | "close" | "maximize",
+            ..,
+        ] => parse_window(words, false),
         _ => Err("Unknown command or unexpected arguments. See rustilectl --help.".into()),
     }
 }
 
-fn parse_window(args: &[&str]) -> Result<Command, String> {
+fn parse_window(args: &[&str], grouped: bool) -> Result<Command, String> {
     let mut words = Vec::new();
     let mut hwnd = None;
     let mut shrink = false;
@@ -171,23 +196,42 @@ fn parse_window(args: &[&str]) -> Result<Command, String> {
         }
     }
     let action = match words.as_slice() {
-        ["resize", dir] => WindowAction::Resize {
+        ["resize", dir] if grouped => WindowAction::Resize {
             direction: direction(dir)?,
             shrink,
         },
-        _ if shrink => return Err("Only window resize accepts --shrink.".into()),
+        _ if shrink => return Err("Use --shrink only with window resize DIR.".into()),
+        ["resize", edge, dir] => {
+            let edge = match *edge {
+                "top" => Direction::Up,
+                "bottom" => Direction::Down,
+                text => direction(text)?,
+            };
+            let direction = direction(dir)?;
+            if !edge.same_axis(direction) {
+                return Err("Horizontal movement requires a left or right edge. Vertical movement requires a top or bottom edge.".into());
+            }
+            WindowAction::ResizeEdge { edge, direction }
+        }
+        ["resize", ..] if !grouped => return Err(RESIZE_HELP.into()),
         ["focus", dir] => WindowAction::Focus(direction(dir)?),
         ["move", dir] => WindowAction::Move(direction(dir)?),
         ["close"] => WindowAction::Close,
         ["maximize"] => WindowAction::Maximize,
-        ["to-desktop", target] => WindowAction::ToDesktop(match *target {
-            "next" => Destination::Next,
-            "prev" => Destination::Previous,
-            n => desktop_number(n)?,
-        }),
+        ["transfer" | "to-desktop", target] => WindowAction::ToDesktop(destination(target)?),
+        ["transfer", ..] => return Err(TRANSFER_HELP.into()),
+        ["focus", ..] => return Err(FOCUS_HELP.into()),
         _ => return Err(WINDOW_HELP.into()),
     };
     Ok(Command::Window { action, hwnd })
+}
+
+fn destination(text: &str) -> Result<Destination, String> {
+    match text {
+        "next" => Ok(Destination::Next),
+        "prev" | "previous" => Ok(Destination::Previous),
+        n => desktop_number(n),
+    }
 }
 
 fn direction(text: &str) -> Result<Direction, String> {
@@ -262,20 +306,23 @@ impl Command {
             Self::ResizeShortcut(modifier) => format!("resize-shortcut {}", modifier.bits()),
             Self::Window { action, hwnd } => {
                 let action = match action {
-                    WindowAction::Focus(d) => format!("focus {}", dir(d)),
-                    WindowAction::Move(d) => format!("move {}", dir(d)),
+                    WindowAction::Focus(d) => format!("window focus {}", dir(d)),
+                    WindowAction::Move(d) => format!("window move {}", dir(d)),
                     WindowAction::Resize { direction, shrink } => format!(
-                        "resize {}{}",
+                        "window resize {}{}",
                         dir(direction),
                         if shrink { " --shrink" } else { "" }
                     ),
-                    WindowAction::ToDesktop(d) => format!("to-desktop {}", target(d)),
-                    WindowAction::Close => "close".into(),
-                    WindowAction::Maximize => "maximize".into(),
+                    WindowAction::ResizeEdge { edge, direction } => {
+                        format!("resize {} {}", dir(edge), dir(direction))
+                    }
+                    WindowAction::ToDesktop(d) => format!("window to-desktop {}", target(d)),
+                    WindowAction::Close => "window close".into(),
+                    WindowAction::Maximize => "window maximize".into(),
                 };
                 match hwnd {
-                    Some(id) => format!("window {action} --hwnd {:#x}", id as usize),
-                    None => format!("window {action}"),
+                    Some(id) => format!("{action} --hwnd {:#x}", id as usize),
+                    None => action,
                 }
             }
         };
@@ -390,10 +437,71 @@ mod tests {
     }
 
     #[test]
+    fn flat_commands_preserve_the_existing_requests_and_wire_format() {
+        for (input, canonical) in [
+            ("enable", "mosaic on"),
+            ("disable", "mosaic off"),
+            ("toggle", "mosaic toggle"),
+            ("focus up --hwnd 9", "window focus up --hwnd 0x9"),
+            ("move right", "window move right"),
+            ("move down --hwnd 8", "window move down --hwnd 0x8"),
+            ("close", "window close"),
+            ("maximize", "window maximize"),
+            ("desktop", "desktop current"),
+            ("desktop next", "desktop next"),
+            ("desktop previous", "desktop prev"),
+            ("desktop 5", "desktop go 5"),
+            ("transfer next", "window to-desktop next"),
+            ("transfer previous", "window to-desktop prev"),
+            ("transfer 12 --hwnd 3", "window to-desktop 12 --hwnd 0x3"),
+        ] {
+            let Invocation::Request(cmd) = invocation(input).unwrap() else {
+                panic!("{input}")
+            };
+            let wire = format!("Rustile/1 {canonical}");
+            assert_eq!(cmd.to_wire(), wire, "{input}");
+            assert_eq!(Command::from_wire(&wire), Ok(cmd), "{input}");
+        }
+    }
+
+    #[test]
+    fn edge_resize_addresses_a_specific_edge_and_motion() {
+        use Direction::*;
+        for (edge_name, edge, motion_name, direction) in [
+            ("left", Left, "left", Left),
+            ("left", Left, "right", Right),
+            ("right", Right, "left", Left),
+            ("right", Right, "right", Right),
+            ("up", Up, "up", Up),
+            ("top", Up, "down", Down),
+            ("down", Down, "down", Down),
+            ("bottom", Down, "up", Up),
+        ] {
+            let input = format!("resize {edge_name} {motion_name}");
+            let action = WindowAction::ResizeEdge { edge, direction };
+            let cmd = Command::Window { action, hwnd: None };
+            assert_eq!(invocation(&input), Ok(Invocation::Request(cmd)));
+            assert_eq!(Command::from_wire(&cmd.to_wire()), Ok(cmd));
+            let cmd = Command::Window {
+                action,
+                hwnd: Some(16),
+            };
+            assert_eq!(
+                invocation(&format!("{input} --hwnd 0x10")),
+                Ok(Invocation::Request(cmd))
+            );
+            assert_eq!(Command::from_wire(&cmd.to_wire()), Ok(cmd));
+        }
+    }
+
+    #[test]
     fn client_only_options_are_never_remote_requests() {
         assert_eq!(parse(&[]), Ok(Invocation::Start(None)));
         assert_eq!(invocation("start"), parse(&[]));
-        for topic in ["mosaic", "desktop", "window", "focus"] {
+        for topic in [
+            "enable", "disable", "toggle", "focus", "move", "resize", "close", "maximize",
+            "desktop", "transfer", "mosaic", "window",
+        ] {
             assert!(matches!(
                 invocation(&format!("{topic} --help")),
                 Ok(Invocation::Print(_))
@@ -435,6 +543,18 @@ mod tests {
             "desktop go -1",
             "desktop go +1",
             "desktop go 123456789012345678901",
+            "desktop 0",
+            "desktop -1",
+            "transfer 0",
+            "transfer prev next",
+            "resize left",
+            "resize left down",
+            "resize top right",
+            "resize bottom down --shrink",
+            "resize up --shrink",
+            "resize left right --hwnd",
+            "transfer next --hwnd 1 --hwnd 2",
+            "enable extra",
             "window to-desktop 0",
             "window move left --hwnd 0",
             "window move right --hwnd 0x",

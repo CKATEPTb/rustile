@@ -8,7 +8,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::hud::{FocusOutline, ResizeHud};
-use crate::layout::{Direction, Id, Layout, Rect, ResizeStops};
+use crate::layout::{Direction, Id, Layout, Rect, ResizeStep, ResizeStops};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
 use crate::native::{self, Cloak, Original, TileState, WindowControl};
 use crate::settings::Settings;
@@ -1294,11 +1294,36 @@ impl Manager {
 
     pub fn resize(&mut self, active: Id, dir: Direction, reverse: bool) {
         if self.mode() == Mode::Resize {
-            self.resize_step(active, dir, reverse);
+            self.resize_step(
+                active,
+                ResizeStep::Arrow {
+                    direction: dir,
+                    reverse,
+                },
+            );
         }
     }
 
     pub fn quick_resize(&mut self, active: Id, dir: Direction, reverse: bool) -> bool {
+        self.quick_resize_step(
+            active,
+            ResizeStep::Arrow {
+                direction: dir,
+                reverse,
+            },
+        )
+    }
+
+    pub(crate) fn resize_edge_step(
+        &mut self,
+        target: Id,
+        edge: Direction,
+        direction: Direction,
+    ) -> bool {
+        self.quick_resize_step(target, ResizeStep::Edge { edge, direction })
+    }
+
+    fn quick_resize_step(&mut self, active: Id, step: ResizeStep) -> bool {
         if self.mode() != Mode::Normal || self.dragging.is_some() {
             return false;
         }
@@ -1309,10 +1334,10 @@ impl Manager {
                 stops: None,
             });
         }
-        self.resize_step(active, dir, reverse)
+        self.resize_step(active, step)
     }
 
-    fn resize_step(&mut self, active: Id, dir: Direction, reverse: bool) -> bool {
+    fn resize_step(&mut self, active: Id, step: ResizeStep) -> bool {
         let eligible = self.can_act_on(active);
         let (Some(session), Some(area)) = (&mut self.session, self.area) else {
             return false;
@@ -1326,7 +1351,7 @@ impl Manager {
         if let Some(edge) =
             self.workspace
                 .layout
-                .resize(target, dir, reverse, area, &mut session.stops)
+                .resize_step(target, step, area, &mut session.stops)
         {
             self.apply();
             if show_hint

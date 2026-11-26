@@ -166,3 +166,89 @@ fn a_rotated_pair_can_resize_both_ways_at_the_displayed_divider_and_complete_its
     assert!(layout.move_window(1, Right, AREA));
     assert_eq!(frame(&layout, 1), destination);
 }
+
+#[test]
+fn exact_steps_move_only_the_named_edge_in_the_given_direction() {
+    let layout = grid(9);
+    let initial = layout.placements(AREA);
+    let before = frame(&layout, 5);
+    for edge in [Left, Right, Up, Down] {
+        for direction in [Left, Right, Up, Down] {
+            let mut layout = layout.clone();
+            let mut stops = None;
+            let step = ResizeStep::Edge { edge, direction };
+            let moved = layout.resize_step(5, step, AREA, &mut stops);
+            if matches!(edge, Left | Right) != matches!(direction, Left | Right) {
+                assert_eq!(moved, None);
+                assert_eq!(layout.placements(AREA), initial);
+                continue;
+            }
+            assert_eq!(moved, Some(edge));
+            let after = frame(&layout, 5);
+            for side in [Left, Right, Up, Down] {
+                let delta = side.coordinate(after) - side.coordinate(before);
+                let expected = if side != edge {
+                    0
+                } else if direction.towards_start() {
+                    -1
+                } else {
+                    1
+                };
+                assert_eq!(
+                    delta.signum(),
+                    expected,
+                    "{edge:?} {direction:?} moved {side:?}"
+                );
+            }
+            let undo = ResizeStep::Edge {
+                edge,
+                direction: direction.opposite(),
+            };
+            assert_eq!(layout.resize_step(5, undo, AREA, &mut stops), Some(edge));
+            assert_eq!(layout.placements(AREA), initial);
+        }
+    }
+}
+
+#[test]
+fn exact_outer_edges_do_not_move_the_inner_divider() {
+    let mut layout = grid(9);
+    let initial = layout.placements(AREA);
+    let mut stops = None;
+    for (id, edge) in [(4, Left), (6, Right), (2, Up), (8, Down)] {
+        assert_eq!(edge.coordinate(frame(&layout, id)), edge.coordinate(AREA));
+        for direction in [edge, edge.opposite()] {
+            let step = ResizeStep::Edge { edge, direction };
+            assert_eq!(layout.resize_step(id, step, AREA, &mut stops), None);
+            assert_eq!(layout.placements(AREA), initial);
+        }
+    }
+}
+
+#[test]
+fn explicit_bsp_step_reverses_a_partial_move_at_the_neighbor_minimum() {
+    let mut layout = grid(1);
+    for (id, anchor) in [(2, 1), (3, 2), (4, 2)] {
+        assert!(layout.insert_near(id, anchor, AREA, (MIN_WIDTH, MIN_HEIGHT)));
+    }
+    let near_min = frame(&layout, 1).x + MIN_WIDTH + GAP_PX + 7;
+    assert!(layout.resize_edge_to(2, Left, near_min, AREA));
+    let initial = layout.placements(AREA);
+    let far = frame(&layout, 4);
+    let mut stops = None;
+    let left = ResizeStep::Edge {
+        edge: Left,
+        direction: Left,
+    };
+    assert_eq!(layout.resize_step(2, left, AREA, &mut stops), Some(Left));
+    assert_eq!(frame(&layout, 1).w, MIN_WIDTH);
+    assert_eq!(frame(&layout, 2).x, near_min - 7);
+    assert_eq!(frame(&layout, 4), far);
+    assert_eq!(layout.resize_step(2, left, AREA, &mut stops), None);
+    let undo = ResizeStep::Edge {
+        edge: Left,
+        direction: Right,
+    };
+    assert_eq!(layout.resize_step(2, undo, AREA, &mut stops), Some(Left));
+    assert_eq!(layout.placements(AREA), initial);
+}

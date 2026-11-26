@@ -140,27 +140,34 @@ fn window_command(
         };
     }
     if !mosaic {
-        return Err("Tiling is off. Run rustilectl mosaic on to enable it.".into());
+        return Err("Tiling is off. Run rustilectl enable to turn it on.".into());
     }
     if !manager.cli_tile_available(id) || !still_target() {
         return Err("The target window is unavailable or is not tiled on this desktop.".into());
     }
-    let applied = match action {
-        WindowAction::Focus(dir) => manager.focus_neighbor(id, dir, still_target),
-        WindowAction::Move(dir) => manager.move_window(id, dir),
-        WindowAction::Resize { direction, shrink } => manager.quick_resize(id, direction, shrink),
+    let (applied, error) = match action {
+        WindowAction::Focus(dir) => (
+            manager.focus_neighbor(id, dir, still_target),
+            "Could not focus a neighboring tile in that direction.",
+        ),
+        WindowAction::Move(dir) => (
+            manager.move_window(id, dir),
+            "The tile cannot move in that direction.",
+        ),
+        WindowAction::Resize { direction, shrink } => (
+            manager.quick_resize(id, direction, shrink),
+            "The tile cannot resize any further in that direction.",
+        ),
+        WindowAction::ResizeEdge { edge, direction } => (
+            manager.resize_edge_step(id, edge, direction),
+            "The selected edge cannot move in that direction.",
+        ),
         _ => unreachable!(),
     };
     if applied {
         Ok(Outcome::Done("ok".into()))
     } else {
-        Err(match action {
-            WindowAction::Focus(_) => "Could not focus a neighboring tile in that direction.",
-            WindowAction::Move(_) => "The tile cannot move in that direction.",
-            WindowAction::Resize { .. } => "The tile cannot resize any further in that direction.",
-            _ => unreachable!(),
-        }
-        .into())
+        Err(error.into())
     }
 }
 
