@@ -16,6 +16,26 @@ impl ShortcutWindow {
             return;
         }
 
+        if let Some(action) = id
+            .checked_sub(LABEL_ROW)
+            .and_then(|index| Shortcut::ALL.get(index as usize))
+        {
+            paint::text(
+                dc,
+                r,
+                action.label(),
+                fonts.regular,
+                colors.text,
+                DT_LEFT | DT_END_ELLIPSIS,
+            );
+            return;
+        }
+        if id == PAGE_LABEL {
+            let label = format!("{} / {}", self.page.get() + 1, self.pages.get());
+            paint::text(dc, r, &label, fonts.small, colors.secondary, DT_CENTER);
+            return;
+        }
+
         let disabled = item.itemState & ODS_DISABLED != 0;
         let pressed = item.itemState & ODS_SELECTED != 0;
         let focused = item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
@@ -26,84 +46,102 @@ impl ShortcutWindow {
             };
         let control = row_control(id);
         let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
-        let action = control.and_then(|(kind, a)| (kind == Control::Row).then_some(a));
-        let selected = action == Some(self.selected.get()) && slot == self.selected_slot.get();
-        let icon = control.and_then(|(kind, _)| match kind {
-            Control::Edit => Some("\u{e70f}"),
-            Control::Remove => Some("\u{e711}"),
-            Control::Add => Some("\u{e710}"),
-            Control::Reset => Some("\u{e777}"),
-            Control::Row => None,
-        });
+        let binding = control.and_then(|(kind, action)| (kind == Control::Row).then_some(action));
+        let selected = binding == Some(self.selected.get()) && slot == self.selected_slot.get();
         let recording = selected && self.capture.borrow().is_some();
-        let highlighted = colors.high_contrast && (selected || hovered || pressed);
-        let surface = if highlighted {
+        let active = recording || selected || hovered || pressed;
+        let mut ink = colors;
+        let highlighted = colors.high_contrast && active;
+        let face = if highlighted {
+            ink.text = colors.hover_text;
+            ink.secondary = colors.hover_text;
+            ink.accent = colors.hover_text;
             colors.hover
         } else if pressed {
-            blend(colors.hover, colors.text, 7)
-        } else if recording {
-            blend(colors.background, colors.accent, 17)
+            blend(colors.hover, colors.text, 6)
         } else if selected {
-            blend(colors.background, colors.accent, 10)
+            blend(
+                colors.control,
+                colors.accent,
+                if recording { 14 } else { 7 },
+            )
         } else if hovered {
             colors.hover
+        } else if binding.is_some() {
+            colors.control
         } else {
             colors.background
         };
-        let mut row_colors = colors;
-        if highlighted {
-            row_colors.text = colors.hover_text;
-            row_colors.secondary = colors.hover_text;
-            row_colors.accent = colors.hover_text;
-        }
-
-        let mut panel = inset(r, self.p(1));
-        if icon.is_some() {
-            let mid = (r.top + r.bottom) / 2;
-            panel.top = mid - self.p(13);
-            panel.bottom = mid + self.p(13);
-        }
-        if focused || recording {
-            let edge = if recording {
-                row_colors.accent
+        let edge = if focused || recording {
+            if colors.high_contrast {
+                colors.border
             } else {
-                row_colors.text
-            };
-            fill_outlined(dc, panel, surface, edge, self.p(5), self.p(1));
-        } else if selected || hovered || pressed {
-            paint::fill(dc, &panel, surface, self.p(5));
+                colors.accent
+            }
+        } else if selected && !colors.high_contrast {
+            blend(colors.border, colors.accent, 55)
+        } else {
+            colors.border
+        };
+        let mut panel = inset(r, self.p(1));
+        if binding.is_some() {
+            let height = (panel.bottom - panel.top).min(self.p(22));
+            panel.top = (r.top + r.bottom - height) / 2;
+            panel.bottom = panel.top + height;
+        }
+        if focused || binding.is_some() {
+            fill_outlined(dc, panel, face, edge, self.p(6), self.p(1));
+        } else if hovered || pressed {
+            paint::fill(dc, &panel, face, self.p(5));
         }
 
-        if let Some(action) = action {
-            if selected {
-                let mid = (r.top + r.bottom) / 2;
-                let rail = RECT {
-                    left: r.left + self.p(3),
-                    right: r.left + self.p(5),
-                    top: mid - self.p(7),
-                    bottom: mid + self.p(7),
-                };
-                paint::fill(dc, &rail, row_colors.accent, self.p(1));
-            }
-            self.draw_action(item, action, recording, fonts, row_colors);
-        } else if let Some(glyph) = icon {
-            paint::text(
+        if let Some(action) = binding {
+            let value = RECT {
+                left: panel.left + self.p(2),
+                right: panel.right - self.p(2),
+                ..panel
+            };
+            let caps = keycaps::Keycaps::new(
+                self,
                 dc,
-                r,
-                glyph,
-                fonts.symbol,
-                if disabled {
-                    colors.disabled
-                } else if control.is_some_and(|c| c.0 == Control::Remove)
-                    && !(hovered || pressed || focused || colors.high_contrast)
-                {
-                    blend(colors.secondary, colors.background, 28)
-                } else {
-                    row_colors.secondary
-                },
-                DT_CENTER,
+                fonts,
+                self.editor_chord(action, slot),
+                keycaps::Size::Row,
             );
+            if caps.width() == 0 {
+                paint::text(
+                    dc,
+                    value,
+                    placeholder(recording),
+                    fonts.small,
+                    if recording { ink.accent } else { ink.secondary },
+                    DT_CENTER | DT_END_ELLIPSIS,
+                );
+            } else {
+                caps.draw(dc, value, ink);
+            }
+            return;
         }
+        let glyph = match (control.map(|(kind, _)| kind), id) {
+            (Some(Control::Remove), _) => "\u{e74d}",
+            (Some(Control::Add), _) => "\u{e710}",
+            (Some(Control::Reset), _) => "\u{e777}",
+            (_, PAGE_PREV) => "\u{e76b}",
+            (_, PAGE_NEXT) => "\u{e76c}",
+            _ => return,
+        };
+        paint::text(
+            dc,
+            r,
+            glyph,
+            fonts.symbol,
+            if disabled {
+                colors.disabled
+            } else {
+                ink.secondary
+            },
+            DT_CENTER,
+        );
     }
 
     fn draw_section(&self, item: &DRAWITEMSTRUCT, fonts: &Fonts, section: usize) {
@@ -153,111 +191,35 @@ impl ShortcutWindow {
         }
     }
 
-    pub(super) fn action_row_height(&self, dc: HDC, action: Shortcut, row_width: i32) -> i32 {
+    pub(super) fn binding_width(&self, dc: HDC, action: Shortcut, slot: usize) -> i32 {
         let fonts = self.fonts.borrow();
         let Some(fonts) = fonts.as_ref() else {
-            return self.p(32);
+            return self.p(90);
         };
-        let binding = self.settings.borrow().bindings(action).first().copied();
-        let width = if let Some(chord) = binding {
-            keycaps::Keycaps::new(
-                self,
-                dc,
-                fonts,
-                (chord.mods, Some(chord.key)),
-                keycaps::Size::Row,
-            )
-            .width()
-        } else {
-            text_width(dc, fonts.small, "Не назначено")
-        };
-        let label = text_width(dc, fonts.regular, action.label());
-        if label + self.p(11) + self.p(8) + width + self.p(5) > row_width {
-            self.p(48)
-        } else {
-            self.p(32)
-        }
-    }
-
-    fn draw_action(
-        &self,
-        item: &DRAWITEMSTRUCT,
-        action: Shortcut,
-        recording: bool,
-        fonts: &Fonts,
-        colors: Colors,
-    ) {
-        let dc = item.hDC;
-        let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
-        let mut label = item.rcItem;
-        label.left += self.p(11);
-        label.right -= self.p(5);
-        let mut value = label;
-        let caps = keycaps::Keycaps::new(
+        let recording = self.selected.get() == action
+            && self.selected_slot.get() == slot
+            && self.capture.borrow().is_some();
+        let width = keycaps::Keycaps::new(
             self,
             dc,
             fonts,
             self.editor_chord(action, slot),
             keycaps::Size::Row,
-        );
-        let placeholder = if recording {
-            "Нажмите клавиши"
+        )
+        .width();
+        if recording || width == 0 {
+            width.max(text_width(dc, fonts.small, placeholder(recording)) + self.p(8)) + self.p(6)
         } else {
-            "Не назначено"
-        };
-        let width = caps.width();
-        let visible_width = if width == 0 {
-            text_width(dc, fonts.small, placeholder)
-        } else {
-            width
-        };
-        if slot > 0 {
-            value.left = (value.right - visible_width).max(value.left + self.p(22));
-            label.right = value.left - self.p(5);
-        } else if label.bottom - label.top >= self.p(44) {
-            label.bottom = label.top + self.p(22);
-            value.top = label.bottom;
-            value.bottom -= self.p(2);
-        } else {
-            value.left = (value.right - visible_width).max(value.left);
-            label.right = (value.left - self.p(8)).max(label.left);
+            width + self.p(6)
         }
-        paint::text(
-            dc,
-            label,
-            if slot == 0 { action.label() } else { "или" },
-            if slot == 0 {
-                fonts.regular
-            } else {
-                fonts.small
-            },
-            if slot == 0 {
-                colors.text
-            } else {
-                colors.secondary
-            },
-            if slot == 0 {
-                DT_LEFT | DT_END_ELLIPSIS
-            } else {
-                DT_RIGHT
-            },
-        );
-        if width == 0 {
-            paint::text(
-                dc,
-                value,
-                placeholder,
-                fonts.small,
-                if recording {
-                    colors.accent
-                } else {
-                    colors.secondary
-                },
-                DT_LEFT | DT_END_ELLIPSIS,
-            );
-        } else {
-            caps.draw(dc, value, self.colors.get());
-        }
+    }
+}
+
+pub(super) fn placeholder(recording: bool) -> &'static str {
+    if recording {
+        "Нажмите клавишу"
+    } else {
+        "Не назначено"
     }
 }
 

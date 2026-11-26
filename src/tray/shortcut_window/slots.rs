@@ -33,18 +33,12 @@ pub(super) fn create(
 }
 
 pub(super) fn button(parent: HWND, label: &str, id: i32) -> Result<HWND, String> {
-    // Tab reaches the pencil directly. The label remains selectable by mouse.
-    let tab = if row_control(id).is_some_and(|c| c.0 == Control::Row) {
-        0
-    } else {
-        WS_TABSTOP
-    };
     let hwnd = create(
         parent,
         w!("BUTTON"),
         label,
         id,
-        tab | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
+        WS_TABSTOP | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
         0,
     )?;
     unsafe { SetWindowSubclass(hwnd, Some(view::button_proc), 1, 0) };
@@ -76,21 +70,17 @@ impl ShortcutWindow {
             .map_or(null_mut(), |slot| slot.row)
     }
 
-    pub(super) fn extra_height(&self, action: Shortcut) -> i32 {
-        self.slots.borrow()[action.index()].len().saturating_sub(1) as i32 * self.p(27)
-    }
-
     pub(super) fn sync_slots(&self, action: Shortcut, count: usize) -> Result<(), String> {
         let index = action.index();
         let view = child(self.hwnd.get(), VIEW);
         let existing = self.slots.borrow()[index].len();
         for pos in existing..count {
             let ids = if pos == 0 {
-                [ROW, EDIT_ROW, REMOVE_ROW]
+                [ROW, REMOVE_ROW]
             } else {
-                [ALT_ROW, ALT_EDIT, ALT_REMOVE]
+                [ALT_ROW, ALT_REMOVE]
             };
-            let mut handles = [null_mut(); 3];
+            let mut handles = [null_mut(); 2];
             for (i, base) in ids.into_iter().enumerate() {
                 let hwnd = match button(view, "", base + index as i32) {
                     Ok(hwnd) => hwnd,
@@ -104,7 +94,8 @@ impl ShortcutWindow {
                 handles[i] = hwnd;
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, pos as isize) };
             }
-            let [row, edit, remove] = handles;
+            let [row, remove] = handles;
+            unsafe { ShowWindow(remove, SW_HIDE) };
             let previous = self.slots.borrow()[index].last().copied();
             if let Some(slot) = previous {
                 // Insert new editors in the native tab order next to their action.
@@ -124,16 +115,16 @@ impl ShortcutWindow {
                     after = hwnd;
                 }
             }
-            self.hint(view, edit, w!("Изменить сочетание"));
+            self.hint(view, row, w!("Дважды щёлкните, чтобы изменить сочетание"));
             self.hint(view, remove, w!("Удалить сочетание"));
-            self.slots.borrow_mut()[index].push(Slot { row, edit, remove });
+            self.slots.borrow_mut()[index].push(Slot { row, remove });
         }
         let obsolete = {
             let mut slots = self.slots.borrow_mut();
             slots[index].split_off(count)
         };
         for slot in obsolete {
-            for hwnd in [slot.row, slot.edit, slot.remove] {
+            for hwnd in [slot.row, slot.remove] {
                 unsafe {
                     if GetFocus() == hwnd {
                         SetFocus(self.selected_row());

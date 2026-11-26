@@ -6,6 +6,9 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 
 use Topic::{Desktops, Resize, Windows};
 
+mod pagination;
+use pagination::{ActionLines, CellPlacement, Grid, Section};
+
 #[derive(Clone, Copy)]
 enum Topic {
     Windows,
@@ -14,11 +17,11 @@ enum Topic {
 }
 
 impl Topic {
-    fn column(self, columns: usize) -> usize {
-        match (columns, self) {
-            (3, Desktops) | (2, Resize) => 1,
-            (3, Resize) => 2,
-            _ => 0,
+    fn column(self) -> usize {
+        match self {
+            Windows => 0,
+            Desktops => 1,
+            Resize => 2,
         }
     }
 }
@@ -134,7 +137,7 @@ impl ShortcutWindow {
             w!("STATIC"),
             "",
             VIEW,
-            WS_VSCROLL | WS_CLIPCHILDREN,
+            WS_CLIPCHILDREN,
             WS_EX_CONTROLPARENT,
         )?;
         unsafe { SetWindowSubclass(view, Some(view_proc), 1, self as *const Self as usize) };
@@ -156,6 +159,11 @@ impl ShortcutWindow {
         };
         self.tooltip.set(tooltip);
         self.hint(hwnd, reset_all, w!("Сбросить все сочетания"));
+        let prev = button(view, "Предыдущая страница", PAGE_PREV)?;
+        let next = button(view, "Следующая страница", PAGE_NEXT)?;
+        create(view, w!("STATIC"), "", PAGE_LABEL, SS_OWNERDRAW, 0)?;
+        self.hint(view, prev, w!("Предыдущая страница"));
+        self.hint(view, next, w!("Следующая страница"));
         for (i, group) in GROUPS.iter().enumerate() {
             let label = group.title;
             create(
@@ -167,6 +175,14 @@ impl ShortcutWindow {
                 0,
             )?;
             for &action in group.actions {
+                create(
+                    view,
+                    w!("STATIC"),
+                    action.label(),
+                    LABEL_ROW + action.index() as i32,
+                    SS_OWNERDRAW,
+                    0,
+                )?;
                 self.sync_slots(action, self.settings.borrow().bindings(action).len().max(1))?;
                 let add = button(
                     view,
@@ -264,7 +280,7 @@ impl ShortcutWindow {
         let compact = width < p(620);
         let content = width - 2 * margin;
         let reset_width = p(if compact { 34 } else { 133 });
-        let header_height = p(if compact { 92 } else { 86 });
+        let header_height = p(if compact { 58 } else { 60 });
         let button_height = p(32);
         let reset_y = (header_height - button_height) / 2;
         let preview_width = content - reset_width - p(if compact { 10 } else { 20 });
@@ -321,11 +337,89 @@ impl ShortcutWindow {
         let height = (client.bottom - top).max(1);
         let view = child(hwnd, VIEW);
         place(view, 0, top, width, height);
-        self.layout_rows(view, width, height);
+        self.layout_rows(view, width, height, None);
         unsafe { InvalidateRect(hwnd, null(), 1) };
     }
 
-    fn layout_rows(&self, view: HWND, width: i32, height: i32) {
+    fn action_lines(&self, view: HWND, dc: HDC, action: Shortcut, col: i32) -> ActionLines {
+        let p = |n| self.p(n);
+        let id = action.index() as i32;
+        let label = child(view, LABEL_ROW + id);
+        let add = child(view, ADD_ROW + id);
+        let reset = child(view, RESET_ROW + id);
+        let tool_width = p(24);
+        let text_area = (col - 2 * tool_width - p(4)).max(1);
+        let label_width = self
+            .fonts
+            .borrow()
+            .as_ref()
+            .map_or(p(120), |fonts| {
+                appearance::text_width(dc, fonts.regular, action.label()) + p(3)
+            })
+            .min(text_area);
+        let header = [
+            CellPlacement::new(label, 0, label_width),
+            CellPlacement::new(add, col - 2 * tool_width, tool_width),
+            CellPlacement::new(reset, col - tool_width, tool_width),
+        ];
+        let removable = self.selected.get() == action
+            && self
+                .capture
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| c.original.is_some());
+        let slots = self.slots.borrow()[action.index()].clone();
+        let bindings: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let trash = (removable && i == self.selected_slot.get()).then_some(slot.remove);
+                let width = self
+                    .binding_width(dc, action, i)
+                    .min((col - i32::from(trash.is_some()) * tool_width).max(1));
+                (slot.row, width, trash)
+            })
+            .collect();
+        let gap = p(6);
+        let bindings_width: i32 = bindings
+            .iter()
+            .map(|&(_, width, trash)| width + i32::from(trash.is_some()) * tool_width)
+            .sum::<i32>()
+            + bindings.len().saturating_sub(1) as i32 * gap;
+        // Keep complete alternatives together. When they do not fit beside their
+        // label, let the entire group use the full column below it.
+        let inline = label_width + p(5) + bindings_width <= text_area;
+        let mut lines = vec![Vec::from(header)];
+        let mut x = if inline {
+            text_area - bindings_width
+        } else {
+            0
+        };
+        if !inline {
+            lines.push(Vec::new());
+        }
+        for (row, width, trash) in bindings {
+            let total = width + i32::from(trash.is_some()) * tool_width;
+            if !inline && x > 0 && x + total > col {
+                lines.push(Vec::new());
+                x = 0;
+            }
+            let line = lines.last_mut().unwrap();
+            line.push(CellPlacement::new(row, x, width));
+            x += width;
+            if let Some(remove) = trash {
+                line.push(CellPlacement::new(remove, x, tool_width));
+                x += tool_width;
+            }
+            x += gap;
+        }
+        ActionLines { header, lines }
+    }
+
+    fn layout_rows(&self, view: HWND, width: i32, height: i32, reveal: Option<HWND>) {
+        if view.is_null() {
+            return;
+        }
         let p = |n| self.p(n);
         let columns = if width >= p(1140) {
             3
@@ -335,143 +429,149 @@ impl ShortcutWindow {
             1
         };
         let margin = self.margin(width);
-        let gap = p(24);
-        let button_w = p(25);
-        let tools_gap = p(5);
-        let tools_w = 4 * button_w + tools_gap;
-        let column_width =
-            |viewport| (viewport - 2 * margin - (columns as i32 - 1) * gap) / columns as i32;
-        let header_h = p(34);
-        let row_gap = |action| {
-            if matches!(
-                action,
-                GrowLeft | ShrinkLeft | QuickReverseLeft | MoveDesktop1
-            ) {
-                p(5)
-            } else {
-                0
-            }
-        };
+        let gap = p(20);
+        let col = ((width - 2 * margin - (columns - 1) as i32 * gap) / columns as i32).max(1);
         let dc = unsafe { GetDC(view) };
-        let measure = |viewport| {
-            let col = column_width(viewport);
-            let heights = Shortcut::ALL.map(|a| self.action_row_height(dc, a, col - tools_w));
-            let mut starts = [(0, 0); GROUPS.len()];
-            let mut ends = [0; 3];
-            for (i, group) in GROUPS.iter().enumerate() {
-                let column = group.topic.column(columns);
-                let top = if ends[column] == 0 {
-                    p(12)
-                } else {
-                    ends[column] + p(15)
-                };
-                starts[i] = (column, top);
-                let rows: i32 = group
+        let sections: Vec<_> = GROUPS
+            .iter()
+            .enumerate()
+            .map(|(i, group)| Section {
+                heading: child(view, SECTION + i as i32),
+                topic: group.topic.column(),
+                actions: group
                     .actions
                     .iter()
-                    .map(|&a| heights[a.index()] + row_gap(a) + self.extra_height(a))
-                    .sum();
-                ends[column] = top + header_h + rows;
-            }
-            (heights, starts, ends.into_iter().max().unwrap() + p(8))
-        };
-        // Measure without the scrollbar first so rows can return to one line
-        // when the user widens the window or assigns a shorter chord.
-        let mut measured = measure(width);
-        if measured.2 > height {
-            let scrollbar = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi.get()) };
-            measured = measure(width - scrollbar);
-        }
+                    .map(|&a| self.action_lines(view, dc, a, col))
+                    .collect(),
+            })
+            .collect();
         unsafe { ReleaseDC(view, dc) };
-        let (heights, starts, total) = measured;
-        self.scroll
-            .set(self.scroll.get().clamp(0, (total - height).max(0)));
-        let scroll = SCROLLINFO {
-            cbSize: size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-            nMin: 0,
-            nMax: total - 1,
-            nPage: height.max(1) as u32,
-            nPos: self.scroll.get(),
-            ..Default::default()
+        let grid = Grid {
+            columns,
+            margin,
+            col,
+            gap,
+            top: p(6),
+            row: p(24),
+            heading: p(26),
+            section_gap: p(8),
         };
-        let mut client = RECT::default();
+        let mut pages = grid.pages(&sections, height - p(5));
+        let footer = p(34);
+        if pages.len() > 1 {
+            pages = grid.pages(&sections, height - footer - p(4));
+        }
+        let recording = self.capture.borrow().is_some().then(|| self.selected_row());
+        let page = recording
+            .or(reveal)
+            .and_then(|hwnd| {
+                pages
+                    .iter()
+                    .position(|page| page.iter().any(|item| item.hwnd == hwnd))
+            })
+            .unwrap_or_else(|| self.page.get())
+            .min(pages.len() - 1);
+        self.page.set(page);
+        self.pages.set(pages.len());
+        let page_count = pages.len();
+        let items = &mut pages[page];
+        let prev = child(view, PAGE_PREV);
+        let next = child(view, PAGE_NEXT);
+        if page_count > 1 {
+            let mid = width / 2;
+            let w = p(28);
+            let label = child(view, PAGE_LABEL);
+            let page_text = format!("{} / {}", page + 1, page_count);
+            let dc = unsafe { GetDC(view) };
+            let number_w = self.fonts.borrow().as_ref().map_or(p(50), |fonts| {
+                appearance::text_width(dc, fonts.small, &page_text) + p(20)
+            });
+            unsafe { ReleaseDC(view, dc) };
+            let y = height - footer;
+            let left = mid - number_w / 2;
+            for (hwnd, x, width) in [
+                (prev, left - w, w),
+                (label, left, number_w),
+                (next, left + number_w, w),
+            ] {
+                items.push(pagination::Placement {
+                    hwnd,
+                    x,
+                    y,
+                    width,
+                    height: w,
+                });
+            }
+            caption(label, &page_text);
+        }
+        // Compute the entire visible set before changing any windows. A page
+        // change may hide the currently focused native button.
+        let visible: std::collections::HashSet<_> = items.iter().map(|item| item.hwnd).collect();
+        let focus = unsafe { GetFocus() };
+        let needs_focus = unsafe { GetParent(focus) == view }
+            && (!visible.contains(&focus)
+                || (focus == prev && page == 0)
+                || (focus == next && page + 1 == page_count));
         unsafe {
-            SetScrollInfo(view, SB_VERT, &scroll, 1);
-            GetClientRect(view, &mut client)
-        };
-        let col = column_width(client.right);
-        for (i, group) in GROUPS.iter().enumerate() {
-            let (column, start) = starts[i];
-            let x = margin + column as i32 * (col + gap);
-            let mut y = start - self.scroll.get();
-            place(child(view, SECTION + i as i32), x, y, col, header_h);
-            y += header_h;
-            for &action in group.actions {
-                y += row_gap(action);
-                let row_h = heights[action.index()];
-                let label_width = col - tools_w;
-                let slots = self.slots.borrow()[action.index()].clone();
-                for (index, slot) in slots.into_iter().enumerate() {
-                    let h = if index == 0 { row_h } else { self.p(27) };
-                    place(slot.row, x, y, label_width, h);
-                    place(slot.edit, x + label_width, y, button_w, h);
-                    place(slot.remove, x + label_width + button_w, y, button_w, h);
-                    if index == 0 {
-                        place(
-                            child(view, ADD_ROW + action.index() as i32),
-                            x + col - 2 * button_w,
-                            y,
-                            button_w,
-                            h,
-                        );
-                        place(
-                            child(view, RESET_ROW + action.index() as i32),
-                            x + col - button_w,
-                            y,
-                            button_w,
-                            h,
-                        );
-                    }
-                    y += h;
+            for item in items.iter() {
+                SetWindowPos(
+                    item.hwnd,
+                    null_mut(),
+                    item.x,
+                    item.y,
+                    item.width,
+                    item.height,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                );
+            }
+            EnableWindow(prev, i32::from(page > 0));
+            EnableWindow(next, i32::from(page + 1 < page_count));
+            let mut hwnd = GetWindow(view, GW_CHILD);
+            while !hwnd.is_null() {
+                if !visible.contains(&hwnd)
+                    && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0
+                {
+                    ShowWindow(hwnd, SW_HIDE);
                 }
+                hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+            }
+            // Focus notifications can re-enter layout. Send them only after
+            // applying this page and keep the input session on its own binding.
+            if needs_focus
+                && let Some(target) = recording.or_else(|| {
+                    items
+                        .iter()
+                        .find(|item| {
+                            row_control(GetDlgCtrlID(item.hwnd))
+                                .is_some_and(|(kind, _)| kind == Control::Row)
+                        })
+                        .map(|item| item.hwnd)
+                })
+            {
+                SetFocus(target);
             }
         }
     }
 
     pub(super) fn reveal_row(&self, hwnd: HWND, row: HWND) {
+        if row.is_null() || unsafe { GetWindowLongW(row, GWL_STYLE) as u32 } & WS_VISIBLE != 0 {
+            return;
+        }
         let view = child(hwnd, VIEW);
-        let mut rect = RECT::default();
-        let mut button = RECT::default();
-        unsafe {
-            GetClientRect(view, &mut rect);
-            GetWindowRect(row, &mut button);
-            MapWindowPoints(null_mut(), view, (&raw mut button).cast(), 2);
-        }
-        let delta = if button.top < 0 {
-            button.top
-        } else {
-            (button.bottom - rect.bottom).max(0)
-        };
-        if delta != 0 {
-            self.scroll_by(hwnd, delta);
-        }
-    }
-
-    fn scroll_by(&self, hwnd: HWND, delta: i32) {
-        self.scroll.set(self.scroll.get().saturating_add(delta));
-        let mut window = RECT::default();
         let mut viewport = RECT::default();
-        let view = child(hwnd, VIEW);
-        unsafe {
-            GetClientRect(hwnd, &mut window);
-            GetClientRect(view, &mut viewport)
-        };
-        self.layout_rows(view, window.right, viewport.bottom);
+        unsafe { GetClientRect(view, &mut viewport) };
+        self.layout_rows(view, viewport.right, viewport.bottom, Some(row));
     }
 
-    pub(super) fn wheel(&self, hwnd: HWND, delta: i32) {
-        self.scroll_by(hwnd, -delta * self.p(72) / 120);
+    pub(super) fn set_page(&self, hwnd: HWND, delta: i32) {
+        let page = self
+            .page
+            .get()
+            .saturating_add_signed(delta as isize)
+            .min(self.pages.get().saturating_sub(1));
+        if self.page.replace(page) != page {
+            self.layout(hwnd);
+        }
     }
 
     pub(super) fn background(&self, hwnd: HWND, dc: HDC) {
@@ -525,28 +625,6 @@ unsafe extern "system" fn view_proc(
             }
             WM_DRAWITEM | WM_COMMAND | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_MOUSEWHEEL => {
                 SendMessageW(parent, msg, wp, lp)
-            }
-            WM_VSCROLL => {
-                let mut si = SCROLLINFO {
-                    cbSize: size_of::<SCROLLINFO>() as u32,
-                    fMask: SIF_ALL,
-                    ..Default::default()
-                };
-                GetScrollInfo(hwnd, SB_VERT, &mut si);
-                let delta = match (wp & 0xffff) as i32 {
-                    SB_LINEUP => -ui.p(31),
-                    SB_LINEDOWN => ui.p(31),
-                    SB_PAGEUP => -(si.nPage as i32),
-                    SB_PAGEDOWN => si.nPage as i32,
-                    SB_TOP => -si.nPos,
-                    SB_BOTTOM => si.nMax - si.nPos,
-                    SB_THUMBTRACK | SB_THUMBPOSITION => si.nTrackPos - si.nPos,
-                    _ => 0,
-                };
-                if delta != 0 {
-                    ui.scroll_by(parent, delta);
-                }
-                0
             }
             WM_NCDESTROY => {
                 RemoveWindowSubclass(hwnd, Some(view_proc), 1);

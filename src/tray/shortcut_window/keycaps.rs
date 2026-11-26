@@ -28,7 +28,7 @@ impl Keycaps {
         size: Size,
     ) -> Self {
         let (font, gap, padding, min_width) = match size {
-            Size::Row => (fonts.small, 3, 10, 22),
+            Size::Row => (fonts.small, 1, 9, 17),
             Size::Compact => (fonts.regular, 4, 15, 30),
             Size::Preview => (fonts.heading, 6, 24, 44),
         };
@@ -65,9 +65,14 @@ impl Keycaps {
     }
 
     pub(super) fn draw(&self, dc: HDC, bounds: RECT, colors: Colors) {
-        let available = bounds.right - bounds.left;
+        let mut available = bounds.right - bounds.left;
         if self.keys.is_empty() || available <= 0 || bounds.bottom <= bounds.top {
             return;
+        }
+        let mut origin = bounds.left;
+        if self.size == Size::Row && available > self.width() {
+            origin += (available - self.width()) / 2;
+            available = self.width();
         }
         let p = |dip| scale(dip, self.dpi);
         let (height, radius, foot) = match self.size {
@@ -97,7 +102,7 @@ impl Keycaps {
             padding_used += self.key_width(*text) - minimum(*text);
             let end = text_used * text_budget / minimum_total.max(1)
                 + padding_used * padding_budget / padding_total.max(1);
-            let left = bounds.left + used + i as i32 * gap;
+            let left = origin + used + i as i32 * gap;
             let outer = RECT {
                 left,
                 top,
@@ -109,17 +114,38 @@ impl Keycaps {
                 continue;
             }
             let terminal = self.has_terminal && i + 1 == self.keys.len();
+            if self.size == Size::Row {
+                if i > 0 {
+                    let mid = (outer.top + outer.bottom) / 2;
+                    let divider = RECT {
+                        left: outer.left - gap,
+                        right: outer.left - gap + stroke,
+                        top: mid - p(5),
+                        bottom: mid + p(5),
+                    };
+                    paint::fill(dc, &divider, colors.border, 0);
+                }
+                paint::text(
+                    dc,
+                    outer,
+                    label,
+                    self.font,
+                    if terminal {
+                        colors.text
+                    } else {
+                        colors.secondary
+                    },
+                    DT_CENTER | DT_END_ELLIPSIS,
+                );
+                continue;
+            }
             let (face, ink) = if !terminal {
                 (colors.control, colors.text)
-            } else if self.size == Size::Row && !colors.high_contrast {
-                (blend(colors.control, colors.accent, 12), colors.text)
             } else {
                 (colors.accent, colors.on_accent)
             };
             let edge = if colors.high_contrast {
                 colors.border
-            } else if terminal && self.size == Size::Row {
-                blend(colors.border, colors.accent, 36)
             } else {
                 blend(face, colors.text, if colors.dark { 23 } else { 18 })
             };

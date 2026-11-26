@@ -169,7 +169,7 @@ impl Keys {
         if let Some(chord) = self.chord {
             chord.label()
         } else if self.held.is_empty() {
-            "Нажмите клавиши".into()
+            "Нажмите клавишу".into()
         } else {
             Chord::modifier_labels(self.modifiers())
                 .collect::<Vec<_>>()

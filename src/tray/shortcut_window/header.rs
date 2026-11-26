@@ -27,41 +27,42 @@ impl ShortcutWindow {
         } else {
             view::group_title(action)
         };
-        let placeholder = if recording {
-            "Нажмите клавиши"
-        } else {
-            "Не назначено"
-        };
         let p = |n| self.p(n);
         buffered(item, |dc, r| {
             paint::fill(dc, &r, self.header_color(), 0);
-            let available = r.right - r.left;
-            let caps = keycaps::Keycaps::new(self, dc, fonts, chord, keycaps::Size::Preview);
-            let legend_width = if caps.width() == 0 {
-                text_width(dc, fonts.regular, placeholder)
+            let width = r.right - r.left;
+            let compact = width < p(460);
+            let title_font = if compact {
+                fonts.heading
             } else {
-                caps.width()
+                fonts.display
             };
-            let title_width = text_width(dc, fonts.display, action.label()).max(text_width(
+            let key_size = if compact {
+                keycaps::Size::Compact
+            } else {
+                keycaps::Size::Preview
+            };
+            let caps = keycaps::Keycaps::new(self, dc, fonts, chord, key_size);
+            let legend_width = caps.width();
+            let title_width = text_width(dc, title_font, action.label()).max(text_width(
                 dc,
                 fonts.small,
                 category,
             ));
-            let stacked = available < p(422) || available < title_width + legend_width + p(24);
-            let mid_y = (r.bottom + r.top) / 2;
-            let title_right = if stacked {
-                r.right
-            } else {
+            let show_keys = legend_width > 0 && title_width + legend_width + p(18) <= width;
+            let label_right = if show_keys {
                 r.right - legend_width - p(18)
+            } else {
+                r.right
             };
-            let group_top = if stacked { r.top + p(3) } else { mid_y - p(24) };
+            let mid = (r.bottom + r.top) / 2;
             let category_rect = RECT {
                 left: r.left,
-                top: group_top,
-                right: title_right,
-                bottom: group_top + p(19),
+                right: label_right,
+                top: mid - p(22),
+                bottom: mid - p(3),
             };
-            let category_ink = if recording && !colors.high_contrast {
+            let secondary = if recording && !colors.high_contrast {
                 colors.accent
             } else {
                 colors.secondary
@@ -71,58 +72,28 @@ impl ShortcutWindow {
                 category_rect,
                 category,
                 fonts.small,
-                category_ink,
+                secondary,
                 DT_END_ELLIPSIS,
             );
             let title_rect = RECT {
                 top: category_rect.bottom,
-                bottom: category_rect.bottom + p(29),
+                bottom: mid + p(24),
                 ..category_rect
             };
             paint::text(
                 dc,
                 title_rect,
                 action.label(),
-                fonts.display,
+                title_font,
                 colors.text,
                 DT_END_ELLIPSIS,
             );
-
-            let top = if stacked {
-                title_rect.bottom + p(4)
-            } else {
-                mid_y - p(22)
-            };
-            let height = if stacked {
-                p(30).min(r.bottom - top)
-            } else {
-                p(44)
-            };
-            let left = if stacked {
-                r.left
-            } else {
-                r.right - legend_width
-            };
-            let legend_rect = RECT {
-                left,
-                top,
-                right: r.right,
-                bottom: top + height,
-            };
-            if caps.width() == 0 {
-                paint::text(
-                    dc,
-                    legend_rect,
-                    placeholder,
-                    fonts.regular,
-                    category_ink,
-                    DT_END_ELLIPSIS,
-                );
-            } else if stacked {
-                let compact = keycaps::Keycaps::new(self, dc, fonts, chord, keycaps::Size::Compact);
-                compact.draw(dc, legend_rect, colors);
-            } else {
-                caps.draw(dc, legend_rect, colors);
+            if show_keys {
+                let legend = RECT {
+                    left: r.right - legend_width,
+                    ..r
+                };
+                caps.draw(dc, legend, colors);
             }
         });
     }

@@ -34,20 +34,21 @@ const RESET_ALL: i32 = 505;
 const STATUS: i32 = 506;
 const VIEW: i32 = 510;
 const PREVIEW: i32 = 511;
+const PAGE_PREV: i32 = 512;
+const PAGE_NEXT: i32 = 513;
+const PAGE_LABEL: i32 = 514;
 const SECTION: i32 = 520;
 const ROW: i32 = 1000;
 const RESET_ROW: i32 = 1100;
-const EDIT_ROW: i32 = 1200;
 const ADD_ROW: i32 = 1300;
 const REMOVE_ROW: i32 = 1400;
+const LABEL_ROW: i32 = 1500;
 const ALT_ROW: i32 = 2000;
-const ALT_EDIT: i32 = 2100;
 const ALT_REMOVE: i32 = 2200;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Control {
     Row,
-    Edit,
     Remove,
     Add,
     Reset,
@@ -56,7 +57,6 @@ enum Control {
 fn row_control(id: i32) -> Option<(Control, Shortcut)> {
     let kind = match id / 100 * 100 {
         ROW | ALT_ROW => Control::Row,
-        EDIT_ROW | ALT_EDIT => Control::Edit,
         REMOVE_ROW | ALT_REMOVE => Control::Remove,
         ADD_ROW => Control::Add,
         RESET_ROW => Control::Reset,
@@ -69,7 +69,6 @@ fn row_control(id: i32) -> Option<(Control, Shortcut)> {
 #[derive(Clone, Copy)]
 struct Slot {
     row: HWND,
-    edit: HWND,
     remove: HWND,
 }
 
@@ -100,7 +99,8 @@ pub(super) struct ShortcutWindow {
     capture: RefCell<Option<capture::Capture>>,
     conflict: Cell<HWND>,
     transfer: Cell<Option<Command>>,
-    scroll: Cell<i32>,
+    page: Cell<usize>,
+    pages: Cell<usize>,
     colors: Cell<Colors>,
     fonts: RefCell<Option<Fonts>>,
 }
@@ -122,7 +122,8 @@ impl Default for ShortcutWindow {
             capture: RefCell::default(),
             conflict: Cell::default(),
             transfer: Cell::default(),
-            scroll: Cell::new(0),
+            page: Cell::new(0),
+            pages: Cell::new(1),
             colors: Cell::new(Colors::current()),
             fonts: RefCell::default(),
         }
@@ -240,7 +241,8 @@ impl ShortcutWindow {
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
             self.end_capture();
-            if let Some((action, chord)) = self.after_save.take()
+            let saved = self.after_save.take();
+            if let Some((action, chord)) = saved
                 && action == self.selected.get()
                 && let Some(index) = self
                     .settings
@@ -253,6 +255,9 @@ impl ShortcutWindow {
             }
             self.update_rows();
             self.layout(hwnd);
+            if saved.is_some() {
+                self.reveal_row(hwnd, self.selected_row());
+            }
             let foreground = unsafe { GetForegroundWindow() };
             if foreground == hwnd || foreground.is_null() {
                 let focus = unsafe { GetFocus() };
@@ -313,16 +318,22 @@ impl ShortcutWindow {
             let id = unsafe { GetDlgCtrlID(msg.hwnd) };
             if let Some((control, action)) = row_control(id) {
                 let slot = unsafe { GetWindowLongPtrW(msg.hwnd, GWLP_USERDATA) as usize };
-                if matches!(control, Control::Edit | Control::Row)
-                    && matches!(key, VK_RETURN | VK_F2)
-                {
+                if control == Control::Row && matches!(key, VK_RETURN | VK_F2) {
                     if !down {
                         self.start_capture(action, slot, false);
                     }
                     return true;
                 }
             }
-            if key == VK_RETURN && (row_control(id).is_some() || id == RESET_ALL) {
+            if matches!(key, VK_PRIOR | VK_NEXT) && self.pages.get() > 1 {
+                if down {
+                    self.set_page(hwnd, if key == VK_PRIOR { -1 } else { 1 });
+                }
+                return true;
+            }
+            if key == VK_RETURN
+                && (row_control(id).is_some() || matches!(id, RESET_ALL | PAGE_PREV | PAGE_NEXT))
+            {
                 if !down {
                     unsafe { SendMessageW(msg.hwnd, BM_CLICK, 0, 0) };
                 }
@@ -371,23 +382,26 @@ impl ShortcutWindow {
         }
         let slots = self.slots.borrow()[action.index()].clone();
         let category = view::group_title(action);
-        let base = format!("{}, {}", action.label(), legends.join(" или "));
         for (i, (&slot, value)) in slots.iter().zip(&legends).enumerate() {
             let detail = format!("{}, {}", action.label(), value);
-            caption(slot.row, if i == 0 { &base } else { &detail });
-            caption(
-                slot.edit,
-                &format!("Изменить {value} для «{}» — {category}", action.label()),
-            );
-            caption(
-                slot.remove,
-                &format!("Удалить {value} для «{}» — {category}", action.label()),
-            );
+            caption(slot.row, &detail);
+            if recording
+                && i == pos
+                && let Some(original) = bindings.get(i)
+            {
+                caption(
+                    slot.remove,
+                    &format!(
+                        "Удалить {} для «{}» — {category}",
+                        original.label(),
+                        action.label()
+                    ),
+                );
+            }
             unsafe {
-                EnableWindow(slot.edit, i32::from(!self.saving.get()));
                 EnableWindow(
                     slot.remove,
-                    i32::from(!self.saving.get() && i < bindings.len()),
+                    i32::from(recording && i == pos && i < bindings.len() && !self.saving.get()),
                 );
                 InvalidateRect(slot.row, null(), 0);
             }
@@ -448,16 +462,16 @@ impl ShortcutWindow {
         if self.saving.get() || !self.conflict.get().is_null() {
             return;
         }
-        if self.recording(action) && self.selected_slot.get() == index {
-            return;
-        }
-        self.end_capture();
         let bindings = self.settings.borrow().bindings(action);
         let slot = if append {
             bindings.len()
         } else {
             index.min(bindings.len())
         };
+        if self.recording(action) && self.selected_slot.get() == slot {
+            return;
+        }
+        self.end_capture();
         let original = bindings.get(slot).copied();
         self.select(action, slot.min(bindings.len().saturating_sub(1)));
         match capture::Capture::start(self.hwnd.get(), original) {
@@ -467,7 +481,6 @@ impl ShortcutWindow {
                 self.update_row(action);
                 self.layout(self.hwnd.get());
                 unsafe { SetFocus(self.selected_row()) };
-                self.reveal_row(self.hwnd.get(), self.selected_row());
                 self.set_status("");
             }
             Err(e) => self.result(Some(&e)),
@@ -492,7 +505,10 @@ impl ShortcutWindow {
         let action = self.selected.get();
         match event {
             None | Some(Event::Unchanged) => {}
-            Some(Event::Changed) => self.update_row(action),
+            Some(Event::Changed) => {
+                self.update_row(action);
+                self.layout(self.hwnd.get());
+            }
             Some(Event::Cancel) => self.end_capture(),
             Some(Event::Ambiguous) => {
                 self.end_capture();
@@ -632,27 +648,39 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Some((control, action)) = row_control(id) {
                     let pos = GetWindowLongPtrW(lp as HWND, GWLP_USERDATA) as usize;
                     if event == BN_SETFOCUS {
-                        if control != Control::Row {
+                        if matches!(control, Control::Add | Control::Reset) {
                             ui.end_capture();
                         }
                         ui.select(action, pos);
                         ui.reveal_row(hwnd, lp as HWND);
+                    } else if event == BN_DOUBLECLICKED && control == Control::Row {
+                        ui.start_capture(action, pos, false);
                     } else if event == BN_CLICKED {
                         match control {
                             Control::Row => ui.select(action, pos),
-                            Control::Edit => ui.start_capture(action, pos, false),
                             Control::Add => ui.start_capture(action, pos, true),
-                            Control::Remove | Control::Reset => {
-                                ui.select(action, pos);
-                                SetFocus(ui.selected_row());
-                                let old = ui.settings.borrow().bindings(action).get(pos).copied();
-                                if control == Control::Reset {
-                                    ui.submit(Command::Assign(Assignment::Reset(action)));
-                                } else if let Some(chord) = old {
+                            Control::Remove => {
+                                let original =
+                                    ui.capture.borrow().as_ref().and_then(|c| c.original);
+                                if action == ui.selected.get()
+                                    && pos == ui.selected_slot.get()
+                                    && let Some(chord) = original
+                                {
+                                    SetFocus(ui.selected_row());
                                     ui.submit(Command::RemoveShortcut(action, chord));
                                 }
                             }
+                            Control::Reset => {
+                                ui.select(action, 0);
+                                SetFocus(ui.selected_row());
+                                ui.submit(Command::Assign(Assignment::Reset(action)));
+                            }
                         }
+                    }
+                } else if matches!(id, PAGE_PREV | PAGE_NEXT) {
+                    if event == BN_CLICKED {
+                        ui.end_capture();
+                        ui.set_page(hwnd, if id == PAGE_PREV { -1 } else { 1 });
                     }
                 } else if id == RESET_ALL {
                     if event == BN_CLICKED {
@@ -703,10 +731,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SetDCBrushColor(wp as HDC, surface);
                 GetStockObject(DC_BRUSH) as isize
             }
-            WM_MOUSEWHEEL => {
-                ui.wheel(hwnd, (wp >> 16) as i16 as i32);
-                0
-            }
+            WM_MOUSEWHEEL => 0,
             WM_NCDESTROY => {
                 ui.capture.take();
                 ui.slots.borrow_mut().iter_mut().for_each(Vec::clear);
@@ -714,7 +739,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ui.after_save.set(None);
                 ui.selected_slot.set(0);
                 ui.hwnd.set(null_mut());
-                ui.scroll.set(0);
+                ui.page.set(0);
+                ui.pages.set(1);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
