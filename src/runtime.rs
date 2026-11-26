@@ -132,7 +132,7 @@ fn confirm_cli_arrival(
         arrival.client.respond(Ok((index + 1).to_string()));
     } else if stopped || arrival.client.expired() {
         arrival.client.respond(Err(
-            "Windows не подтвердила переход на выбранный рабочий стол.".into(),
+            "Windows did not confirm the switch to the requested desktop.".into(),
         ));
     } else {
         *pending = Some(arrival);
@@ -269,8 +269,8 @@ impl EventHooks {
             };
             if handle.is_null() {
                 return Err(format!(
-                    "Подписка на события окон {first:#x}–{last:#x}: {}",
-                    io::Error::last_os_error()
+                    "Could not subscribe to window events {first:#x}–{last:#x}: {}",
+                    crate::cli_error::io(io::Error::last_os_error())
                 ));
             }
             hooks.0.push(handle);
@@ -312,8 +312,8 @@ impl ConsoleHandler {
         if unsafe { SetConsoleCtrlHandler(Some(console_signal), 1) } == 0 {
             LOOP_THREAD.store(0, Ordering::Release);
             return Err(format!(
-                "Обработчик Ctrl+C недоступен: {}",
-                io::Error::last_os_error()
+                "Could not install the Ctrl+C handler: {}",
+                crate::cli_error::io(io::Error::last_os_error())
             ));
         }
         Ok(Self)
@@ -592,8 +592,8 @@ fn pump(
         match unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } {
             -1 => {
                 return Err(format!(
-                    "Ошибка цикла сообщений: {}",
-                    io::Error::last_os_error()
+                    "Windows message loop failed: {}",
+                    crate::cli_error::io(io::Error::last_os_error())
                 ));
             }
             0 => return Ok(None),
@@ -917,7 +917,9 @@ fn pump(
                         .current_desktop()
                         .is_some_and(|from| valid_target(window, from))
                 {
-                    request.respond(Err("Выбранное окно больше недоступно для переноса.".into()));
+                    request.respond(Err(
+                        "The selected window is no longer available to move.".into()
+                    ));
                     continue;
                 }
                 if let Some(index) = workspaces.stationary_index(destination) {
@@ -933,9 +935,8 @@ fn pump(
                 None => {
                     let Some((from, to)) = workspaces.navigate(destination) else {
                         if let Some(request) = client {
-                            request.respond(Err(
-                                "Не удалось переключить рабочий стол Windows.".into()
-                            ));
+                            request
+                                .respond(Err("Could not switch to the requested desktop.".into()));
                         }
                         continue;
                     };
@@ -953,7 +954,8 @@ fn pump(
                         shortcuts::end_transfer_focus_watch();
                         if let Some(request) = client {
                             request.respond(Err(
-                                "Windows не выполнила перенос окна на рабочий стол.".into(),
+                                "Windows could not move the window to the requested desktop."
+                                    .into(),
                             ));
                         }
                         continue;
@@ -985,7 +987,7 @@ fn pump(
                     confirm_cli_arrival(&mut cli_arrival, &workspaces, false);
                 } else {
                     request.respond(Err(
-                        "Окно перенесено, но Windows не переключила текущий рабочий стол.".into(),
+                        "The window moved, but Windows could not switch to its desktop.".into(),
                     ));
                 }
             }
@@ -1119,13 +1121,13 @@ fn start_background(modifier: Option<Modifier>) -> Result<(), String> {
         let start = Instant::now();
         while !instance::Instance::running()? {
             if start.elapsed() >= Duration::from_secs(5) {
-                return Err("Rustile не подтвердил запуск за 5 секунд.".into());
+                return Err("Rustile did not confirm startup within 5 seconds.".into());
             }
             match unsafe { WaitForSingleObject(child.as_raw_handle(), 20) } {
                 WAIT_TIMEOUT => {}
                 WAIT_OBJECT_0 if instance::Instance::running()? => break,
-                WAIT_OBJECT_0 => return Err("Rustile завершился при запуске.".into()),
-                _ => return Err(io::Error::last_os_error().to_string()),
+                WAIT_OBJECT_0 => return Err("Rustile exited during startup.".into()),
+                _ => return Err(crate::cli_error::io(io::Error::last_os_error())),
             }
         }
     }
@@ -1159,7 +1161,7 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
     let console = ConsoleHandler::install();
     match &console {
         Err(error) => eprintln!("{error}"),
-        Ok(_) => println!("Ctrl+C в консоли Rustile — выйти и восстановить окна."),
+        Ok(_) => println!("Press Ctrl+C to quit Rustile and restore your windows."),
     }
     let mut tray = Tray::new(live.clone())?;
     let server = ipc::Server::start()?;

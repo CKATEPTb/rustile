@@ -35,7 +35,7 @@ pub(crate) enum DesktopMembership {
     Unknown,
 }
 
-pub(crate) fn object_name(handle: HANDLE) -> Result<String, String> {
+pub(crate) fn object_name(handle: HANDLE) -> io::Result<String> {
     let mut bytes = 0;
     unsafe { GetUserObjectInformationW(handle, UOI_NAME, null_mut(), 0, &mut bytes) };
     let mut name = vec![0u16; (bytes as usize).div_ceil(2)];
@@ -50,10 +50,7 @@ pub(crate) fn object_name(handle: HANDLE) -> Result<String, String> {
             )
         } == 0
     {
-        return Err(format!(
-            "Имя рабочего стола: {}",
-            io::Error::last_os_error()
-        ));
+        return Err(io::Error::last_os_error());
     }
     Ok(String::from_utf16_lossy(
         name.strip_suffix(&[0]).unwrap_or(&name),

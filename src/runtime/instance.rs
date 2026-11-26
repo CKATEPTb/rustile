@@ -14,11 +14,22 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
 
-use crate::native::desktops::object_name;
+use crate::{cli_error, native::desktops::object_name};
 
 fn desktop_names() -> Result<(String, String), String> {
-    let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) })?;
-    let station = object_name(unsafe { GetProcessWindowStation() })?;
+    let desktop =
+        object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) }).map_err(|err| {
+            format!(
+                "Could not identify the Windows desktop: {}",
+                cli_error::io(err)
+            )
+        })?;
+    let station = object_name(unsafe { GetProcessWindowStation() }).map_err(|err| {
+        format!(
+            "Could not identify the window station: {}",
+            cli_error::io(err)
+        )
+    })?;
     Ok((station, desktop))
 }
 
@@ -35,7 +46,7 @@ fn name() -> Result<Vec<u16>, String> {
 }
 
 pub(super) fn launch_background() -> Result<OwnedHandle, String> {
-    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let exe = std::env::current_exe().map_err(cli_error::io)?;
     let path: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
     let mut args: Vec<_> = "rustile.exe --background"
         .encode_utf16()
@@ -70,8 +81,8 @@ pub(super) fn launch_background() -> Result<OwnedHandle, String> {
     } == 0
     {
         return Err(format!(
-            "Не удалось запустить Rustile: {}",
-            io::Error::last_os_error()
+            "Could not start Rustile: {}",
+            cli_error::io(io::Error::last_os_error())
         ));
     }
     drop(unsafe { OwnedHandle::from_raw_handle(child.hThread) });
@@ -82,7 +93,12 @@ pub(super) struct Instance(OwnedHandle);
 
 impl Instance {
     pub(super) fn acquire() -> Result<Option<Self>, String> {
-        Self::elect(&name()?).map_err(|e| format!("Проверка экземпляра Rustile: {e}"))
+        Self::elect(&name()?).map_err(|err| {
+            format!(
+                "Could not check the Rustile instance: {}",
+                cli_error::io(err)
+            )
+        })
     }
 
     fn elect(name: &[u16]) -> io::Result<Option<Self>> {
@@ -123,7 +139,10 @@ impl Instance {
             return match error.raw_os_error().map(|code| code as u32) {
                 Some(ERROR_FILE_NOT_FOUND) => Ok(false),
                 Some(ERROR_ACCESS_DENIED) => Ok(true),
-                _ => Err(format!("Проверка экземпляра Rustile: {error}")),
+                _ => Err(format!(
+                    "Could not check the Rustile instance: {}",
+                    cli_error::io(error)
+                )),
             };
         }
         drop(unsafe { OwnedHandle::from_raw_handle(handle) });

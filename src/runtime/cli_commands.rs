@@ -27,10 +27,9 @@ fn enabled(value: bool) -> &'static str {
 
 fn desktop_error(workspaces: &dynamic_desktops::Workspaces) -> String {
     if workspaces.supported {
-        "Проводник Windows не сообщил текущий рабочий стол или порядок столов.".into()
+        "Windows Explorer did not report the current desktop or desktop order.".into()
     } else {
-        "Управление виртуальными столами недоступно на этом рабочем столе или сборке Windows."
-            .into()
+        "Virtual desktop management is unavailable on this desktop or Windows build.".into()
     }
 }
 
@@ -69,6 +68,33 @@ fn window_list(manager: &Manager) -> String {
     lines
 }
 
+fn focused_title(
+    manager: &Manager,
+    workspaces: &dynamic_desktops::Workspaces,
+) -> Result<String, String> {
+    let id = native::foreground();
+    let desktop = workspaces
+        .current_desktop()
+        .or_else(|| manager.layout_desktop());
+    let state = desktop.map_or_else(
+        || native::desktop_foreground(id),
+        |d| manager.desktop_foreground_on(id, d),
+    );
+    if state != native::DesktopForeground::Preserve {
+        return Err("No window is focused.".into());
+    }
+    let pid = native::pid(id);
+    let title = native::window_title(id).replace(char::is_control, " ");
+    if pid == 0 || native::foreground() != id || native::pid(id) != pid {
+        return Err("The focused window changed. Try again.".into());
+    }
+    Ok(if title.trim().is_empty() {
+        format!("Untitled window (PID {pid})")
+    } else {
+        title
+    })
+}
+
 fn window_command(
     manager: &mut Manager,
     workspaces: &dynamic_desktops::Workspaces,
@@ -89,7 +115,7 @@ fn window_command(
         } else {
             let window = TransferIdentity::capture(id)
                 .filter(|_| manager.transferable_on(id, current) && still_target())
-                .ok_or("Окно недоступно для переноса на другой рабочий стол.")?;
+                .ok_or("This window cannot be moved to another desktop.")?;
             Some(Rc::new(window))
         };
         return Ok(Outcome::Navigate {
@@ -110,14 +136,14 @@ fn window_command(
             // The app can veto WM_CLOSE or defer its maximize/restore request.
             Ok(Outcome::Done("requested".into()))
         } else {
-            Err("Windows не приняла команду для этого окна на текущем рабочем столе.".into())
+            Err("Windows rejected the command for this window on the current desktop.".into())
         };
     }
     if !mosaic {
-        return Err("Мозаика выключена. Для этой команды включите её через mosaic on.".into());
+        return Err("Tiling is off. Run rustilectl mosaic on to enable it.".into());
     }
     if !manager.cli_tile_available(id) || !still_target() {
-        return Err("Целевое окно недоступно или не входит в мозаику текущего стола.".into());
+        return Err("The target window is unavailable or is not tiled on this desktop.".into());
     }
     let applied = match action {
         WindowAction::Focus(dir) => manager.focus_neighbor(id, dir, still_target),
@@ -128,7 +154,13 @@ fn window_command(
     if applied {
         Ok(Outcome::Done("ok".into()))
     } else {
-        Err("Не удалось выполнить команду в этом направлении в текущей раскладке.".into())
+        Err(match action {
+            WindowAction::Focus(_) => "Could not focus a neighboring tile in that direction.",
+            WindowAction::Move(_) => "The tile cannot move in that direction.",
+            WindowAction::Resize { .. } => "The tile cannot resize any further in that direction.",
+            _ => unreachable!(),
+        }
+        .into())
     }
 }
 
@@ -166,7 +198,8 @@ pub(super) fn execute(
                 Mosaic::Status => before,
             };
             if before != wanted {
-                preferences.apply(manager, hook, tray, Command::Toggle)?;
+                preferences.apply(manager, hook, tray, Command::Toggle)
+                    .map_err(|_| "Could not apply or save the tiling setting. Check your Rustile settings file.")?;
             }
             enabled(preferences.live.enabled).to_owned()
         }
@@ -187,13 +220,18 @@ pub(super) fn execute(
                 explicit_window: false,
             });
         }
+        CliCommand::WindowCurrent => focused_title(manager, workspaces)?,
         CliCommand::WindowList => window_list(manager),
         CliCommand::Window { action, hwnd } => {
             return window_command(manager, workspaces, preferences.live.enabled, action, hwnd);
         }
         CliCommand::ResizeShortcut(modifier) => {
-            let updated = preferences.live.with_resize_override(modifier)?;
-            manager.apply_settings_with(updated.clone(), || Ok(()))?;
+            let updated = preferences.live.with_resize_override(modifier).map_err(
+                |_| "Could not assign the resize shortcut. Check for a conflicting binding.",
+            )?;
+            manager
+                .apply_settings_with(updated.clone(), || Ok(()))
+                .map_err(|_| "Could not apply the resize shortcut.")?;
             hook.set_settings(&updated);
             tray.set_settings(updated.clone());
             // Just like an override passed at startup, it lasts for this session.

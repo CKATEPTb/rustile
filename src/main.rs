@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod cli;
 #[cfg(windows)]
+mod cli_error;
+#[cfg(windows)]
 mod hud;
 #[cfg(any(windows, test))]
 mod layout;

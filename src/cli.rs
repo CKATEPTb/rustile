@@ -1,46 +1,49 @@
 use crate::layout::{Direction, Id};
 use crate::settings::Modifier;
 
-const USAGE: &str = "Rustile — управление мозаикой Windows
+const USAGE: &str = "Rustile window manager for Windows
 
-rustilectl [start]                         Запустить менеджер или обратиться к работающему
-rustilectl status                          Показать состояние менеджера
-rustilectl mosaic on|off|toggle|status      Управлять мозаикой
-rustilectl desktop current|list|next|prev   Узнать или сменить рабочий стол
-rustilectl desktop go N                    Перейти на стол по номеру
-rustilectl window list                     Показать окна и их HWND
-rustilectl window focus|move DIR           Перевести фокус или переместить плитку
-rustilectl window resize DIR [--shrink]    Изменить размер плитки на один шаг
-rustilectl window to-desktop next|prev|N    Перенести окно и перейти вместе с ним
-rustilectl window close|maximize           Закрыть окно или развернуть/восстановить
-rustilectl quit                            Завершить основной экземпляр
+rustilectl focus                            Print the focused window's title
+rustilectl focus DIR                        Focus the neighboring window
+rustilectl window list                      List windows on the current desktop
+rustilectl window move DIR                  Move the focused tile
+rustilectl window resize DIR [--shrink]     Resize the focused tile by one step
+rustilectl window to-desktop next|prev|N    Move the focused window and follow it
+rustilectl window close|maximize            Close or maximize/restore the focused window
+rustilectl mosaic on|off|toggle|status      Control tiling or print its status
+rustilectl desktop current|list|next|prev   Inspect or switch virtual desktops
+rustilectl desktop go N                     Switch to desktop N (numbered from 1)
+rustilectl [start]                          Start Rustile or connect to the running manager
+rustilectl status                           Print the manager's status
+rustilectl quit                             Shut down the manager
 rustilectl --resize-shortcut win+enter|ctrl+alt+enter
 rustilectl --help | --version
 
-Направления DIR — left, right, up, down. Номера рабочих столов начинаются с 1.
-К команде управления окном можно добавить --hwnd ID (например, 0x1234).
-Справка по группе — rustilectl mosaic --help, rustilectl desktop --help, rustilectl window --help.";
+DIR is left, right, up, or down. Run rustilectl help COMMAND for details
+on focus, window, desktop, or mosaic.";
 
-const MOSAIC_HELP: &str = "rustilectl mosaic status           Узнать, включена ли мозаика
-rustilectl mosaic on|off|toggle    Включить, выключить или переключить мозаику";
-const DESKTOP_HELP: &str =
-    "rustilectl desktop current         Вывести номер текущего рабочего стола
-rustilectl desktop list            Перечислить рабочие столы в порядке Windows
-rustilectl desktop next|prev       Перейти на соседний рабочий стол
-rustilectl desktop go N            Перейти на стол N (нумерация с 1)
+const FOCUS_HELP: &str = "rustilectl focus                     Print the focused window's title
+rustilectl focus left|right|up|down  Focus the next tiled window in that direction";
+const MOSAIC_HELP: &str = "rustilectl mosaic status           Print on or off
+rustilectl mosaic on|off|toggle    Enable, disable, or toggle tiling";
+const DESKTOP_HELP: &str = "rustilectl desktop current         Print the current desktop number
+rustilectl desktop list            List desktops in Windows order
+rustilectl desktop next|prev       Switch to the next or previous desktop
+rustilectl desktop go N            Switch to desktop N (numbered from 1)
 
-Если N больше числа столов, выбирается последний существующий стол.";
-const WINDOW_HELP: &str = "rustilectl window list
-rustilectl window focus left|right|up|down [--hwnd ID]
-rustilectl window move left|right|up|down [--hwnd ID]
-rustilectl window resize left|right|up|down [--shrink] [--hwnd ID]
-rustilectl window to-desktop next|prev|N [--hwnd ID]
-rustilectl window close|maximize [--hwnd ID]
+If N exceeds the desktop count, Rustile switches to the last desktop.";
+const WINDOW_HELP: &str =
+    "rustilectl window current                   Print the focused window's title
+rustilectl window list                      List windows on the current desktop
+rustilectl window focus DIR                  Focus the neighboring window
+rustilectl window move DIR                   Move the focused tile
+rustilectl window resize DIR [--shrink]      Resize the tile by one step
+rustilectl window to-desktop next|prev|N     Move the focused window and follow it
+rustilectl window close|maximize             Close or maximize/restore the focused window
 
-По умолчанию команда действует на активное окно. Чтобы выбрать другое окно,
-передайте его HWND из window list в десятичной записи или с префиксом 0x.
-Для focus указанный HWND служит исходной плиткой при выборе соседа.
-Для resize параметр --shrink меняет направление движения того же разделителя.";
+DIR is left, right, up, or down. Use --shrink to move the same boundary in reverse.
+Window actions use the focused window by default. To target a specific window,
+pass --hwnd ID from window list. For window focus, that window is the starting tile.";
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Invocation {
@@ -56,6 +59,7 @@ pub(crate) enum Command {
     DesktopCurrent,
     DesktopList,
     DesktopGo(Destination),
+    WindowCurrent,
     WindowList,
     Window {
         action: WindowAction,
@@ -100,11 +104,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Invocation, String> {
         ))),
         ["--help" | "-h" | "help"] => Ok(Invocation::Print(USAGE)),
         ["help", group] | [group, "--help" | "-h"] => match *group {
+            "focus" => Ok(Invocation::Print(FOCUS_HELP)),
             "mosaic" => Ok(Invocation::Print(MOSAIC_HELP)),
             "desktop" => Ok(Invocation::Print(DESKTOP_HELP)),
             "window" => Ok(Invocation::Print(WINDOW_HELP)),
             _ => Err(format!(
-                "Неизвестная группа «{group}». См. rustilectl --help."
+                "Unknown help topic '{group}'. See rustilectl --help."
             )),
         },
         ["--resize-shortcut", chord] | ["start", "--resize-shortcut", chord] => {
@@ -113,7 +118,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Invocation, String> {
             } else if chord.eq_ignore_ascii_case("ctrl+alt+enter") {
                 Modifier::CtrlAlt
             } else {
-                return Err("Для --resize-shortcut укажите win+enter или ctrl+alt+enter.".into());
+                return Err("--resize-shortcut expects win+enter or ctrl+alt+enter.".into());
             };
             Ok(Invocation::Start(Some(modifier)))
         }
@@ -139,9 +144,15 @@ fn parse_command(words: &[&str]) -> Result<Command, String> {
         ["desktop", "prev"] => Ok(Command::DesktopGo(Destination::Previous)),
         ["desktop", "go", n] => desktop_number(n).map(Command::DesktopGo),
         ["desktop", ..] => Err(DESKTOP_HELP.into()),
+        ["focus"] | ["window", "current"] => Ok(Command::WindowCurrent),
+        ["focus", dir] => Ok(Command::Window {
+            action: WindowAction::Focus(direction(dir)?),
+            hwnd: None,
+        }),
+        ["focus", ..] => Err(FOCUS_HELP.into()),
         ["window", "list"] => Ok(Command::WindowList),
         ["window", args @ ..] => parse_window(args),
-        _ => Err("Неизвестная команда или лишние аргументы. См. rustilectl --help.".into()),
+        _ => Err("Unknown command or unexpected arguments. See rustilectl --help.".into()),
     }
 }
 
@@ -164,7 +175,7 @@ fn parse_window(args: &[&str]) -> Result<Command, String> {
             direction: direction(dir)?,
             shrink,
         },
-        _ if shrink => return Err("Параметр --shrink применим только к window resize.".into()),
+        _ if shrink => return Err("Only window resize accepts --shrink.".into()),
         ["focus", dir] => WindowAction::Focus(direction(dir)?),
         ["move", dir] => WindowAction::Move(direction(dir)?),
         ["close"] => WindowAction::Close,
@@ -186,7 +197,7 @@ fn direction(text: &str) -> Result<Direction, String> {
         "up" => Ok(Direction::Up),
         "down" => Ok(Direction::Down),
         _ => Err(format!(
-            "Неизвестное направление «{text}». Укажите left, right, up или down."
+            "Unknown direction '{text}'. Use left, right, up, or down."
         )),
     }
 }
@@ -196,7 +207,7 @@ fn desktop_number(text: &str) -> Result<Destination, String> {
         .ok()
         .filter(|&n| n > 0 && text.bytes().all(|c| c.is_ascii_digit()))
         .map(Destination::Number)
-        .ok_or_else(|| "Номер рабочего стола должен быть целым положительным числом.".into())
+        .ok_or_else(|| "Desktop numbers must be positive integers.".into())
 }
 
 fn window_id(text: &str) -> Result<Id, String> {
@@ -212,7 +223,7 @@ fn window_id(text: &str) -> Result<Id, String> {
         .filter(|&id| id != 0)
         .map(|id| id as Id)
         .ok_or_else(|| {
-            "Укажите ненулевой HWND в десятичной записи или в виде 0x1234. См. rustilectl window list."
+            "Use a nonzero window handle in decimal or hexadecimal (e.g. 0x1234). See rustilectl window list."
                 .into()
         })
 }
@@ -233,6 +244,7 @@ impl Command {
         let body = match self {
             Self::Status => "status".into(),
             Self::Quit => "quit".into(),
+            Self::WindowCurrent => "window current".into(),
             Self::WindowList => "window list".into(),
             Self::DesktopList => "desktop list".into(),
             Self::DesktopCurrent => "desktop current".into(),
@@ -273,12 +285,12 @@ impl Command {
     pub(crate) fn from_wire(request: &str) -> Result<Self, String> {
         let body = request
             .strip_prefix("Rustile/1 ")
-            .ok_or("Неподдерживаемая версия протокола Rustile.")?;
+            .ok_or("Unsupported Rustile protocol version.")?;
         if body.is_empty()
             || body.len() > 128
             || !body.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
         {
-            return Err("Некорректная команда Rustile.".into());
+            return Err("Invalid Rustile command.".into());
         }
         let words: Vec<_> = body.split(' ').collect();
         if let ["resize-shortcut", bits] = words.as_slice() {
@@ -287,7 +299,7 @@ impl Command {
                 .into_iter()
                 .find(|m| Some(m.bits()) == bits)
                 .map(Command::ResizeShortcut)
-                .ok_or_else(|| "Недопустимое сочетание для изменения размера.".into());
+                .ok_or_else(|| "Invalid resize shortcut.".into());
         }
         parse_command(&words)
     }
@@ -319,6 +331,9 @@ mod tests {
             "desktop next",
             "desktop prev",
             "desktop go 15",
+            "focus",
+            "focus right",
+            "window current",
             "window list",
             "window move left",
             "window focus down --hwnd 537",
@@ -349,10 +364,36 @@ mod tests {
     }
 
     #[test]
+    fn focus_commands_use_the_foreground_window_without_an_id() {
+        assert_eq!(
+            invocation("focus"),
+            Ok(Invocation::Request(Command::WindowCurrent))
+        );
+        assert_eq!(invocation("window current"), invocation("focus"));
+        assert_eq!(Command::WindowCurrent.to_wire(), "Rustile/1 window current");
+        for (name, dir) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ] {
+            let cmd = Command::Window {
+                action: WindowAction::Focus(dir),
+                hwnd: None,
+            };
+            assert_eq!(
+                invocation(&format!("focus {name}")),
+                Ok(Invocation::Request(cmd))
+            );
+            assert_eq!(cmd.to_wire(), format!("Rustile/1 window focus {name}"));
+        }
+    }
+
+    #[test]
     fn client_only_options_are_never_remote_requests() {
         assert_eq!(parse(&[]), Ok(Invocation::Start(None)));
         assert_eq!(invocation("start"), parse(&[]));
-        for topic in ["mosaic", "desktop", "window"] {
+        for topic in ["mosaic", "desktop", "window", "focus"] {
             assert!(matches!(
                 invocation(&format!("{topic} --help")),
                 Ok(Invocation::Print(_))
@@ -400,6 +441,9 @@ mod tests {
             "window move right --hwnd 0x+1",
             "window focus down --hwnd -1",
             "window list --hwnd 7",
+            "window current --hwnd 7",
+            "focus sideways",
+            "focus left right",
             "window close --hwnd 2 --hwnd 3",
             "window move right --shrink",
             "window resize right --shrink --shrink",

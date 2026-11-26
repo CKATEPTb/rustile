@@ -285,15 +285,17 @@ internal static class DesktopSmoke {
             Require((code == 0) == success, "Unexpected CLI exit " + code + " for " + args + ": " + stdout + " " + stderr);
             Require(success ? stderr.Length == 0 : stdout.Length == 0 && stderr.Length != 0,
                 "CLI used the wrong output stream for " + args + ": " + stdout + " / " + stderr);
-            return stdout;
+            return success ? stdout : stderr;
         }
     }
     static void VerifyCli(string rustile, string desktop, List<Child> children, IntPtr[] windows,
         Rectangle[] originals, Rectangle area) {
         var client = Path.Combine(Path.GetDirectoryName(rustile), "rustilectl.exe");
         Require(File.Exists(client), "Build rustilectl.exe alongside rustile.exe for CLI checks");
-        Require(Cli(client, "--help", desktop).Contains("desktop current"), "CLI help should work without a manager");
-        Cli(client, "status", desktop, false);
+        var help = Cli(client, "--help", desktop);
+        Require(help.Contains("desktop current") && help.Contains("focused window"), "Expected English CLI help without a manager");
+        Require(Cli(client, "focus sideways", desktop, false).Contains("Unknown direction"), "Invalid directions need an English error");
+        Require(Cli(client, "status", desktop, false).Contains("not running"), "A stopped manager needs an English error");
         Cli(client, "desktop go 0", desktop, false);
 
         // Compete for ownership from a cold start. A second tray must never
@@ -331,6 +333,24 @@ internal static class DesktopSmoke {
         Cli(client, "desktop next", desktop, false);
         var before = windows.Select(VisibleFrame).ToArray();
         var names = new[] { "left", "right", "up", "down" };
+        var activeIndex = Array.IndexOf(windows, GetForegroundWindow());
+        if (activeIndex >= 0) {
+            var other = 1 - activeIndex;
+            Require(Cli(client, "focus", desktop) == ControlText(windows[activeIndex]),
+                "focus should report the active fixture's title");
+            var towardOther = names[NeighborDirection(before[activeIndex], before[other])];
+            Cli(client, "focus " + towardOther, desktop);
+            Until("Directional CLI focus should select the neighboring window", () => GetForegroundWindow() == windows[other]);
+            Require(Cli(client, "window current", desktop) == ControlText(windows[other]), "window current should report the new focus");
+            Console.WriteLine("PASS  CLI reads the focused title and changes focus to the adjacent tile");
+        } else {
+            // A private desktop usually has no active application.
+            var noFocus = Cli(client, "focus", desktop, false);
+            Require(noFocus.IndexOf("focus", StringComparison.OrdinalIgnoreCase) >= 0
+                && noFocus == Cli(client, "window current", desktop, false), "Both focus queries should report the same English error");
+            Cli(client, "focus right", desktop, false);
+            Console.WriteLine("PASS  CLI reports an empty focus in English and rejects a directional move without a starting window");
+        }
         var dir = names[NeighborDirection(before[0], before[1])];
         var handle = " --hwnd 0x" + windows[0].ToInt64().ToString("X");
         Cli(client, "window resize " + dir + handle, desktop);

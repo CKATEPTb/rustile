@@ -1,5 +1,6 @@
 //! A process-local message pump owns all application state. The named pipe
 //! carries one bounded UTF-8 request/reply per connection to that pump.
+use crate::cli_error;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
@@ -37,9 +38,9 @@ const CLIENT_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUT
 const STARTUP_WAIT: Duration = Duration::from_secs(4);
 const COMMAND_WAIT: Duration = Duration::from_secs(10);
 const IO_WAIT: Duration = Duration::from_secs(2);
-const STOPPED: &str = "Rustile завершил работу до выполнения команды.";
-const TIMED_OUT: &str = "Rustile не подтвердил выполнение команды вовремя.";
-const PERMISSION: &str = "Нет доступа к Rustile. Используйте ту же учётную запись и, если Rustile запущен от администратора, терминал с повышенными правами.";
+const STOPPED: &str = "Rustile exited before the command completed.";
+const TIMED_OUT: &str = "Timed out waiting for Rustile to complete the command.";
+const PERMISSION: &str = "Use the same Windows account as Rustile. If Rustile is running as administrator, run your terminal as administrator too.";
 
 type Reply = Result<String, String>;
 
@@ -69,8 +70,12 @@ pub(super) struct Server {
 impl Server {
     pub(super) fn start() -> Result<Self, String> {
         let thread = unsafe { GetCurrentThreadId() };
-        Self::listen(thread, std::process::id())
-            .map_err(|e| format!("Не удалось открыть канал команд Rustile: {e}"))
+        Self::listen(thread, std::process::id()).map_err(|err| {
+            format!(
+                "Could not open the Rustile command pipe: {}",
+                cli_error::io(err)
+            )
+        })
     }
 
     fn listen(owner: u32, pid: u32) -> io::Result<Self> {
@@ -177,12 +182,12 @@ fn serve_one(
                 }
             }
         }
-        _ => Err("Некорректная команда Rustile.".into()),
+        _ => Err("Invalid Rustile command.".into()),
     };
     let (status, text) = match reply {
         Ok(text) if text.len() < MAX_REPLY => (0, text),
         Err(text) if text.len() < MAX_REPLY => (1, text),
-        _ => (1, "Результат превышает предел 512 КиБ.".to_owned()),
+        _ => (1, "The reply exceeds the 512 KiB limit.".to_owned()),
     };
     let mut message = Vec::with_capacity(5 + text.len());
     message.extend_from_slice(&(1 + text.len() as u32).to_le_bytes());
@@ -251,7 +256,9 @@ fn create_pipe(name: &[u16]) -> io::Result<OwnedHandle> {
     let logon = token_info(token.as_raw_handle(), TokenLogonSid)?;
     let groups = unsafe { &*logon.as_ptr().cast::<TOKEN_GROUPS>() };
     if groups.GroupCount != 1 {
-        return Err(io::Error::other("Не удалось определить сеанс входа."));
+        return Err(io::Error::other(
+            "Could not identify the Windows logon session.",
+        ));
     }
     let sid = sid_text(groups.Groups[0].Sid)?;
     let level = token_info(token.as_raw_handle(), TokenIntegrityLevel)?;
@@ -407,7 +414,7 @@ impl Channel {
         if n != buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                "Неполная запись в канал команд.",
+                "The command pipe received only part of the message.",
             ));
         }
         Ok(())
@@ -431,10 +438,10 @@ impl Channel {
 
 pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -> Reply {
     if command.is_empty() || command.len() > MAX_COMMAND {
-        return Err("Длина команды Rustile должна быть от 1 до 4096 байт.".into());
+        return Err("A Rustile command must contain between 1 and 4096 bytes.".into());
     }
     if !super::instance::Instance::running()? {
-        return Err("Rustile не запущен.".into());
+        return Err("Rustile is not running.".into());
     }
     let start = Instant::now();
     loop {
@@ -451,8 +458,8 @@ pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -
                         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
                         if handle.is_null() {
                             return Err(format!(
-                                "Ожидание завершения Rustile: {}",
-                                io::Error::last_os_error()
+                                "Could not wait for Rustile to exit: {}",
+                                cli_error::io(io::Error::last_os_error())
                             ));
                         }
                         Some(unsafe { OwnedHandle::from_raw_handle(handle) })
@@ -463,20 +470,21 @@ pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -
                         unsafe { AllowSetForegroundWindow(pid) };
                     }
                     let reply = transact(&pipe, command)
-                        .map_err(|e| format!("Канал команд Rustile: {e}"))??;
+                        .map_err(|err| format!("Rustile command pipe: {}", cli_error::io(err)))??;
                     drop(pipe);
                     if let Some(process) = process {
                         match unsafe { WaitForSingleObject(process.as_raw_handle(), 8000) } {
                             WAIT_OBJECT_0 => {}
                             WAIT_TIMEOUT => {
                                 return Err(
-                                    "Rustile принял команду выхода и ещё завершает работу.".into(),
+                                    "Rustile accepted the quit command and is still shutting down."
+                                        .into(),
                                 );
                             }
                             _ => {
                                 return Err(format!(
-                                    "Ожидание завершения Rustile: {}",
-                                    io::Error::last_os_error()
+                                    "Could not wait for Rustile to exit: {}",
+                                    cli_error::io(io::Error::last_os_error())
                                 ));
                             }
                         }
@@ -486,7 +494,7 @@ pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                     if start.elapsed() >= STARTUP_WAIT + COMMAND_WAIT + IO_WAIT {
                         return Err(
-                            "Rustile обрабатывает другую команду. Повторите запрос позже.".into(),
+                            "Rustile is processing another command. Try again shortly.".into()
                         );
                     }
                     unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
@@ -496,15 +504,18 @@ pub(super) fn send(command: &str, grant_foreground: bool, wait_for_exit: bool) -
                     thread::sleep(Duration::from_millis(20))
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(PERMISSION.into());
+                    return Err(format!(
+                        "Rustile command pipe: {}. {PERMISSION}",
+                        cli_error::io(e)
+                    ));
                 }
-                Err(e) => return Err(format!("Канал команд Rustile: {e}")),
+                Err(e) => return Err(format!("Rustile command pipe: {}", cli_error::io(e))),
             }
         } else {
             thread::sleep(Duration::from_millis(20));
         }
         if start.elapsed() >= STARTUP_WAIT {
-            return Err("Основной экземпляр Rustile не открыл канал команд. Проверьте, что запущена версия с поддержкой CLI.".into());
+            return Err("The running Rustile instance did not open its command pipe. Check that it supports the CLI.".into());
         }
     }
 }
@@ -529,7 +540,7 @@ fn connect(pid: u32, name: &[u16]) -> io::Result<Channel> {
     if peer != pid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Некорректный владелец канала Rustile.",
+            "The Rustile command pipe belongs to an unexpected process",
         ));
     }
     Ok(pipe)
@@ -542,7 +553,7 @@ fn transact(pipe: &Channel, command: &str) -> io::Result<Reply> {
     pipe.read_exact(&mut length, deadline)?;
     let n = u32::from_le_bytes(length) as usize;
     if !(1..=MAX_REPLY).contains(&n) {
-        return Err(io::Error::other("Неверный размер ответа Rustile."));
+        return Err(io::Error::other("Invalid Rustile reply size."));
     }
     let mut buf = vec![0; n];
     pipe.read_exact(&mut buf, deadline)?;
@@ -556,7 +567,7 @@ fn transact(pipe: &Channel, command: &str) -> io::Result<Reply> {
     match status {
         0 => Ok(Ok(text)),
         1 => Ok(Err(text)),
-        _ => Err(io::Error::other("Неизвестный ответ Rustile.")),
+        _ => Err(io::Error::other("Unknown Rustile reply status.")),
     }
 }
 
