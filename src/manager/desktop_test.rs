@@ -16,7 +16,7 @@ use windows_sys::Win32::{
         GetWindowLongW, GetWindowRect, GetWindowTextW, HTTRANSPARENT, IsWindow, IsWindowVisible,
         IsZoomed, SW_HIDE, SW_MAXIMIZE, SW_SHOWNOACTIVATE, SendMessageW, SetPropW, SetWindowLongW,
         ShowWindowAsync, WM_NCHITTEST, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
-        WS_MAXIMIZEBOX,
+        WS_MAXIMIZEBOX, WS_THICKFRAME,
     },
 };
 use windows_sys::core::w;
@@ -24,7 +24,7 @@ use windows_sys::core::w;
 use super::{Direction, Id, Manager, Mode, Rect, native};
 use crate::runtime::{
     CANCEL, CLOSE_WINDOW, CONFIRM, EXPAND, QUICK_RESIZE, QUICK_REVERSE, START_RESIZE,
-    TOGGLE_MAXIMIZE, dispatch,
+    TOGGLE_MAXIMIZE, dispatch_mosaic, dispatch_with_foreground,
 };
 
 mod virtual_desktops;
@@ -267,13 +267,13 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
     let grid = rows(windows, area, &[3, 2]);
     let (active, middle, end) = (grid[0][0], grid[0][1], grid[0][2]);
     let original_height = frame(active).h;
-    dispatch(manager, active, START_RESIZE);
+    dispatch_mosaic(manager, active, START_RESIZE);
     assert_eq!(manager.mode(), Mode::Resize);
-    dispatch(manager, active, EXPAND + 3); // Down
+    dispatch_mosaic(manager, active, EXPAND + 3); // Down
     settle(manager, 5);
     let applied_height = frame(active).h;
     assert!(applied_height > original_height);
-    dispatch(manager, active, CONFIRM);
+    dispatch_mosaic(manager, active, CONFIRM);
     settle(manager, 5);
     assert_eq!(manager.mode(), Mode::Normal);
     assert_eq!(resize_hint(), None);
@@ -295,21 +295,21 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
     let custom = frames();
     let offset_center = frame(middle);
     let offset_left = frame(active);
-    dispatch(manager, middle, QUICK_RESIZE);
+    dispatch_mosaic(manager, middle, QUICK_RESIZE);
     settle(manager, 5);
     assert_eq!(manager.mode(), Mode::Normal);
     assert_eq!(resize_hint(), None);
     let grown = frame(middle);
     assert!(grown.x < offset_center.x);
     assert_eq!(grown.x + grown.w, offset_center.x + offset_center.w);
-    dispatch(manager, middle, QUICK_REVERSE);
+    dispatch_mosaic(manager, middle, QUICK_REVERSE);
     settle(manager, 5);
     assert_eq!(manager.mode(), Mode::Normal);
     assert_eq!(resize_hint(), None);
     assert_eq!(frames(), custom);
 
     assert_eq!(left.x, area.x);
-    dispatch(manager, active, START_RESIZE);
+    dispatch_mosaic(manager, active, START_RESIZE);
     assert_eq!(manager.mode(), Mode::Resize);
     let hint = resize_hint().expect("modal resize shows its shortcut hint");
     assert!(
@@ -317,18 +317,18 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
         "{hint}"
     );
     assert!(!hint.contains('×'), "{hint}");
-    dispatch(manager, active, EXPAND); // Left into the work-area edge
+    dispatch_mosaic(manager, active, EXPAND); // Left into the work-area edge
     settle(manager, 5);
     let compressed = frame(active);
     assert_eq!(compressed.x, left.x);
     assert!(compressed.w < offset_left.w);
     let compressed_frames = frames();
-    dispatch(manager, active, CANCEL);
+    dispatch_mosaic(manager, active, CANCEL);
     settle(manager, 5);
     assert_eq!(manager.mode(), Mode::Normal);
     assert_eq!(resize_hint(), None);
     assert_eq!(frames(), compressed_frames);
-    dispatch(manager, active, QUICK_REVERSE);
+    dispatch_mosaic(manager, active, QUICK_REVERSE);
     settle(manager, 5);
     assert_eq!(manager.mode(), Mode::Normal);
     assert_eq!(resize_hint(), None);
@@ -351,10 +351,10 @@ fn five_windows(manager: &mut Manager, windows: &[Id], area: Rect) {
     manager.apply();
     settle(manager, 5);
     let near_limit = frames();
-    dispatch(manager, middle, QUICK_RESIZE);
+    dispatch_mosaic(manager, middle, QUICK_RESIZE);
     settle(manager, 5);
     assert_eq!(frame(middle).x, min_x);
-    dispatch(manager, middle, QUICK_REVERSE);
+    dispatch_mosaic(manager, middle, QUICK_REVERSE);
     settle(manager, 5);
     assert_eq!(frames(), near_limit);
     assert!(
@@ -996,18 +996,96 @@ fn check_normal_placement(id: Id) {
     }
 }
 
+fn paused_window_controls(active: Id, peer: Id) {
+    use super::{DesktopId, DesktopMembership};
+    use crate::settings::{Command, Settings};
+
+    let paused = Settings::default().changed(Command::Toggle).unwrap();
+    assert!(!paused.enabled);
+    let mut manager = Manager::with_settings(paused);
+    let home = DesktopMembership::Current(DesktopId(1));
+    manager
+        .desktops
+        .set_memberships([(active, home), (peer, home)]);
+    let original = frame(active);
+    let untouched = frame(peer);
+    manager.sync();
+    assert!(manager.windows.is_empty());
+
+    for command in [START_RESIZE, QUICK_RESIZE, QUICK_REVERSE] {
+        dispatch_with_foreground(&mut manager, active, command, || active);
+    }
+    assert_eq!(manager.mode(), Mode::Normal);
+    assert!(resize_hint().is_none());
+    assert_eq!(frame(active), original);
+
+    let veto = w!("Rustile.Smoke.VetoNextClose");
+    assert_ne!(unsafe { SetPropW(active as _, veto, 1usize as _) }, 0);
+    // A queued close whose window lost focus must never reach the app. The
+    // following maximize serves as a barrier in the fixture's message queue.
+    let foreground = std::cell::Cell::new(active);
+    dispatch_with_foreground(&mut manager, active, CLOSE_WINDOW, || {
+        foreground.replace(peer)
+    });
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
+    until("maximize an untiled window while paused", || {
+        native::maximized(active)
+    });
+    assert!(!unsafe { GetPropW(active as _, veto) }.is_null());
+    manager.event(EVENT_OBJECT_LOCATIONCHANGE, active);
+    manager.reconcile_desktop();
+    assert_eq!(frame(peer), untouched);
+
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
+    until("restore the original floating frame", || {
+        !native::maximized(active) && frame(active) == original
+    });
+    // Fixed-size app windows can still be closed on a paused desktop.
+    let style = unsafe { GetWindowLongW(active as _, GWL_STYLE) };
+    assert_eq!(
+        unsafe {
+            SetWindowLongW(
+                active as _,
+                GWL_STYLE,
+                style & !((WS_THICKFRAME | WS_MAXIMIZEBOX) as i32),
+            )
+        },
+        style
+    );
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
+    dispatch_with_foreground(&mut manager, active, CLOSE_WINDOW, || active);
+    until("app vetoes close while paused", || unsafe {
+        GetPropW(active as _, veto).is_null()
+    });
+    assert_ne!(unsafe { IsWindow(active as _) }, 0);
+    assert!(
+        !native::maximized(active),
+        "the maximize button is disabled"
+    );
+    dispatch_with_foreground(&mut manager, active, CLOSE_WINDOW, || active);
+    until("app closes while paused", || unsafe {
+        IsWindow(active as _) == 0
+    });
+    manager.event(EVENT_OBJECT_DESTROY, active);
+    manager.reconcile_desktop();
+    assert_eq!(frame(peer), untouched);
+    assert!(manager.windows.is_empty());
+    manager.shutdown();
+}
+
 #[test]
 #[ignore = "run with tests/desktop-smoke.ps1 on its isolated Win32 desktop"]
 fn window_controls() {
     use super::{DesktopId, DesktopMembership};
 
     native::init_dpi();
-    let windows: [Id; 3] = fixtures();
+    let [first, second, active, floating] = fixtures();
     let failure_file = env::var_os("RUSTILE_SMOKE_FAILURE").unwrap();
     std::panic::set_hook(Box::new(move |failure| {
         let _ = std::fs::write(&failure_file, failure.to_string());
     }));
-    let active = windows[2];
+    paused_window_controls(floating, first);
+    let windows = [first, second, active];
     let zoomed = || unsafe { IsZoomed(active as _) != 0 };
     assert_ne!(unsafe { ShowWindowAsync(active as _, SW_MAXIMIZE) }, 0);
     let work = native::work_area().unwrap();
@@ -1062,7 +1140,7 @@ fn window_controls() {
         manager.transferable_on(active, DesktopId(1)),
         "an already maximized window can move desktops"
     );
-    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
     until(
         "window already maximized at startup can return to the mosaic",
         || !zoomed(),
@@ -1083,7 +1161,7 @@ fn window_controls() {
         "the round trip must exercise a custom divider"
     );
 
-    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
     until("fixture maximized", zoomed);
     manager.event(EVENT_OBJECT_LOCATIONCHANGE, active);
     manager.reconcile_desktop();
@@ -1091,7 +1169,7 @@ fn window_controls() {
         "Win+F matches all four edges of native Windows maximize",
         || frame(active) == maximized_frame,
     );
-    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
     until("fixture restored from maximize", || !zoomed());
     manager.event(EVENT_OBJECT_LOCATIONCHANGE, active);
     manager.reconcile_desktop();
@@ -1107,15 +1185,12 @@ fn window_controls() {
     );
     assert_eq!(
         manager.shortcut_target(active),
-        Some(super::ShortcutTarget::Tile {
-            id: active,
-            can_maximize: false
-        })
+        Some(super::ShortcutTarget::Tile(active))
     );
-    dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
+    dispatch_with_foreground(&mut manager, active, TOGGLE_MAXIMIZE, || active);
     let veto = w!("Rustile.Smoke.VetoNextClose");
     assert_ne!(unsafe { SetPropW(active as _, veto, 1usize as _) }, 0);
-    dispatch(&mut manager, active, CLOSE_WINDOW);
+    dispatch_with_foreground(&mut manager, active, CLOSE_WINDOW, || active);
     until("fixture processed its close veto", || unsafe {
         GetPropW(active as _, veto).is_null()
     });
@@ -1124,7 +1199,7 @@ fn window_controls() {
     manager.reconcile_desktop();
     settle(&manager, 3);
     assert_eq!(windows.map(frame), custom);
-    dispatch(&mut manager, active, CLOSE_WINDOW);
+    dispatch_with_foreground(&mut manager, active, CLOSE_WINDOW, || active);
     until("fixture accepted the next close request", || unsafe {
         IsWindow(active as _) == 0
     });

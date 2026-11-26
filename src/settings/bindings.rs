@@ -107,7 +107,9 @@ impl Shortcut {
         matches!(self.spec().1, Group::Grow | Group::Shrink | Group::Finish)
     }
 
-    pub fn works_in_both_modes(self) -> bool {
+    // These commands reserve their chord in both modes. Window close and
+    // maximize also work in resize when no resize binding owns the chord.
+    pub fn reserves_both_modes(self) -> bool {
         self == Self::ToggleMosaic || matches!(self.spec().1, Group::Desktop | Group::DesktopMove)
     }
 
@@ -116,8 +118,8 @@ impl Shortcut {
     }
 
     fn shares_context(self, other: Self) -> bool {
-        self.works_in_both_modes()
-            || other.works_in_both_modes()
+        self.reserves_both_modes()
+            || other.reserves_both_modes()
             || self.is_resize() == other.is_resize()
     }
 
@@ -435,7 +437,7 @@ impl Settings {
         let owner = |resize| {
             let context = Shortcut::ALL
                 .into_iter()
-                .filter(|other| other.works_in_both_modes() || other.is_resize() == resize);
+                .filter(|other| other.reserves_both_modes() || other.is_resize() == resize);
             // Explicit bindings win over the variants that keep the resize opener held.
             context
                 .clone()
@@ -447,7 +449,7 @@ impl Settings {
                 })
                 .filter(|&other| action != other)
         };
-        if !action.works_in_both_modes() {
+        if !action.reserves_both_modes() {
             return owner(action.is_resize()).map(BindingOwners::One);
         }
         match (owner(false), owner(true)) {

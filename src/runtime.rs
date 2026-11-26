@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::Manager;
 use crate::layout::Direction;
-use crate::manager::Mode;
+use crate::manager::{Mode, WindowControl};
 use crate::native::desktops::DesktopId;
 use crate::native::{self, TransferIdentity};
 use crate::settings::{Command, Modifier, Settings};
@@ -265,14 +265,31 @@ fn refresh(manager: &mut Manager, handled: usize) {
     shortcuts::update(target, manager.mode(), handled);
 }
 
-pub(crate) fn dispatch(manager: &mut Manager, target: isize, command: i32) {
+pub(crate) fn dispatch_with_foreground(
+    manager: &mut Manager,
+    target: isize,
+    command: i32,
+    foreground: impl Fn() -> isize,
+) -> bool {
+    match command {
+        CLOSE_WINDOW => manager.control_window(target, WindowControl::Close, foreground),
+        TOGGLE_MAXIMIZE => {
+            manager.control_window(target, WindowControl::ToggleMaximize, foreground)
+        }
+        _ if manager.accepts_foreground_shortcut(target) => {
+            dispatch_mosaic(manager, target, command)
+        }
+        _ => return false,
+    }
+    true
+}
+
+pub(crate) fn dispatch_mosaic(manager: &mut Manager, target: isize, command: i32) {
     let direction = |base| ARROWS.get((command - base) as usize).copied();
     match (manager.mode(), command) {
         (Mode::Normal, START_RESIZE) => {
             manager.begin_resize(target);
         }
-        (Mode::Normal, CLOSE_WINDOW) => manager.close_window(target),
-        (Mode::Normal, TOGGLE_MAXIMIZE) => manager.toggle_maximize(target),
         (Mode::Normal, _) => {
             if let Some(dir) = direction(MOVE) {
                 manager.move_window(target, dir);
@@ -609,7 +626,7 @@ fn pump(
         {
             navigation.retain(|step: &DesktopDestination| !step.continues_transfer(&window));
         }
-        if !shortcuts::desktop_focus_uninterrupted() {
+        if !preferences.live.enabled || !shortcuts::desktop_focus_uninterrupted() {
             desktop_focus.stop_watching();
         }
         if (focus_event || reconcile)
@@ -717,9 +734,10 @@ fn pump(
                     refresh(manager, ticket);
                 }
             } else {
-                if manager.accepts_foreground_shortcut(target) {
-                    dispatch(manager, target, command);
-                } else if preferences.live.enabled && shortcuts::is_focus_command(command) {
+                if !dispatch_with_foreground(manager, target, command, native::foreground)
+                    && preferences.live.enabled
+                    && shortcuts::is_focus_command(command)
+                {
                     let foreground = native::foreground();
                     if shortcuts::desktop_focus_uninterrupted()
                         && (target == 0 || target == foreground)

@@ -364,17 +364,27 @@ pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area
     assert!(manager.restore_desktop_focus_with(
         A,
         || foreground.get(),
-        |id, _| {
-            assert!([moving, source_peer].contains(&id));
-            foreground.set(id);
+        |_, _| panic!("ordinary desktop navigation must leave focus to Windows while paused"),
+    ));
+    assert_eq!(foreground.get(), 0);
+    assert!(manager.restore_transferred_focus_with(
+        moving,
+        A,
+        || foreground.get(),
+        |_| {
+            foreground.set(moving);
             true
         }
     ));
-    assert!([moving, source_peer].contains(&foreground.get()));
+    assert_eq!(
+        foreground.get(),
+        moving,
+        "follow an explicit window transfer"
+    );
     assert_eq!(
         windows.map(frame),
         before,
-        "focus recovery while paused preserves geometry"
+        "following a transferred window while paused preserves geometry"
     );
     manager.apply_settings(settings).unwrap();
     settle(manager, 2);

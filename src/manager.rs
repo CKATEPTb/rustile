@@ -26,15 +26,21 @@ pub enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowControl {
+    Close,
+    ToggleMaximize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShortcutTarget {
-    Tile { id: Id, can_maximize: bool },
+    Tile(Id),
     Expanded(Id),
 }
 
 impl ShortcutTarget {
     pub(crate) fn id(self) -> Id {
         match self {
-            Self::Tile { id, .. } | Self::Expanded(id) => id,
+            Self::Tile(id) | Self::Expanded(id) => id,
         }
     }
 }
@@ -593,6 +599,7 @@ impl Manager {
         if !updated.enabled {
             self.dragging = None;
             self.transfer_anchor = None;
+            self.unconfirmed_focus.set(None);
             self.outline.hide();
         } else if resuming || system_changed {
             self.sync();
@@ -943,10 +950,7 @@ impl Manager {
             return None;
         }
         if self.can_act_on(id) {
-            return Some(ShortcutTarget::Tile {
-                id,
-                can_maximize: native::can_maximize(id),
-            });
+            return Some(ShortcutTarget::Tile(id));
         }
         // A window can already be maximized when Rustile starts, even on a
         // desktop with no normal tiles. Check its actual Shell membership.
@@ -978,23 +982,37 @@ impl Manager {
             .is_some_and(|window| window.id() == native::foreground())
     }
 
-    pub fn close_window(&mut self, target: Id) {
-        if self.shortcut_target(target).is_some() {
-            self.finish_mode();
-            native::close_window(target);
+    pub(crate) fn control_window(
+        &mut self,
+        target: Id,
+        control: WindowControl,
+        foreground: impl Fn() -> Id,
+    ) {
+        // A paused layout may have never seen this window. Validate the HWND
+        // from the physical press against Windows, independently of tile state.
+        if target == 0 || target != foreground() {
+            return;
         }
-    }
-
-    pub fn toggle_maximize(&mut self, target: Id) {
-        let maximize = match self.shortcut_target(target) {
-            Some(ShortcutTarget::Expanded(_)) => false,
-            Some(ShortcutTarget::Tile {
-                can_maximize: true, ..
-            }) => true,
-            _ => return,
+        let Some(window) = native::WindowMarker::for_window_control(target) else {
+            return;
         };
+        if !matches!(
+            self.desktops.membership(target),
+            DesktopMembership::Current(_)
+        ) {
+            return;
+        }
+        let maximized = native::maximized(target);
+        if control == WindowControl::ToggleMaximize && !maximized && !native::can_maximize(target) {
+            return;
+        }
         self.finish_mode();
-        native::set_maximized(target, maximize);
+        if window.matches() && foreground() == target {
+            match control {
+                WindowControl::Close => native::close_window(target),
+                WindowControl::ToggleMaximize => native::set_maximized(target, !maximized),
+            }
+        }
     }
 
     pub fn begin_resize(&mut self, target: Id) -> bool {
@@ -1034,7 +1052,7 @@ impl Manager {
         }
         let id = native::foreground();
         let target = self.shortcut_target(id);
-        let eligible = matches!(target, Some(ShortcutTarget::Tile { .. }));
+        let eligible = matches!(target, Some(ShortcutTarget::Tile(_)));
         if self
             .session
             .as_ref()
@@ -1181,6 +1199,9 @@ impl Manager {
         foreground: impl Fn() -> Id,
         mut activate: impl FnMut(Id, Id) -> bool,
     ) -> bool {
+        if !self.settings.enabled {
+            return true;
+        }
         let previous = foreground();
         match self.desktop_foreground_on(previous, desktop) {
             native::DesktopForeground::Transient => return false,
@@ -1196,7 +1217,7 @@ impl Manager {
             self.parked.get(&desktop)
         };
         let mut candidates = Vec::new();
-        if let Some(workspace) = workspace.filter(|_| self.settings.enabled) {
+        if let Some(workspace) = workspace {
             candidates.extend(workspace.focus_history.iter().rev().copied());
             if let Some(area) = self.area {
                 candidates.extend(
@@ -1208,8 +1229,7 @@ impl Manager {
                 );
             }
         }
-        // An all-maximized desktop and a paused mosaic can both have visible
-        // applications with no tiles. Consider their native Z order as well.
+        // A desktop with only maximized windows has no tiles to search.
         candidates.extend(native::enumerate().into_iter().rev());
         let mut seen = HashSet::new();
         candidates.retain(|&id| seen.insert(id));

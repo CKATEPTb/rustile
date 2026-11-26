@@ -1456,12 +1456,14 @@ internal static class DesktopSmoke {
             Require(GetProp(windows[4], "Rustile.Smoke.OffsetSevenPassed") != IntPtr.Zero, "Seven-window geometry test did not run");
             Until("Manager should restore all seven fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Seven windows: Up into an offset wider tile shares that tile and fills the bottom row; a second Up exchanges the original slots");
-            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Take(3).Select(w => w.ToInt64())));
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Take(4).Select(w => w.ToInt64())));
             geometryTest("window_controls");
-            Require(fixtures[2].Exited(3000), "The fixture should exit after accepting the second close request");
+            Require(fixtures[2].Exited(3000) && fixtures[3].Exited(3000),
+                "The tiled and floating fixtures should exit after accepting close");
             Until("The two surviving fixtures should return to their original bounds", () =>
                 windows.Take(2).Select(Bounds).SequenceEqual(originals.Take(2)));
             Console.WriteLine("PASS  Win+F restores custom tile sizes; Win+Q honors a veto and reclaims the tile after close");
+            Console.WriteLine("PASS  With mosaic paused at startup, Win+F restores floating bounds and Win+Q closes the active window, preserving its peer");
         } finally {
             children.Reverse();
             foreach (var child in children) child.Dispose();

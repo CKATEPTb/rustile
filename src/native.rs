@@ -535,21 +535,31 @@ pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
     .then_some(root as Id)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowUse {
+    Tiling,
+    NativeControl,
+}
+
 pub(crate) fn tile_state(id: Id) -> TileState {
+    classify_window(id, WindowUse::Tiling)
+}
+
+fn classify_window(id: Id, usage: WindowUse) -> TileState {
     let hwnd = id as HWND;
     let Some((style, extended)) = visible_app_style(id) else {
         return TileState::Excluded;
     };
     let resizable = style & WS_THICKFRAME != 0;
     let borderless = style & WS_CAPTION != WS_CAPTION;
-    if !resizable && !borderless {
+    if usage == WindowUse::Tiling && !resizable && !borderless {
         return TileState::Excluded;
     }
     unsafe {
         let Some(info) = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)) else {
             return TileState::Excluded;
         };
-        if info.dwFlags & MONITORINFOF_PRIMARY == 0 {
+        if usage == WindowUse::Tiling && info.dwFlags & MONITORINFOF_PRIMARY == 0 {
             return TileState::Excluded;
         }
         let Some(outer) = outer_bounds(hwnd) else {
@@ -577,11 +587,12 @@ pub(crate) fn tile_state(id: Id) -> TileState {
         // can cover the monitor. Its native maximize button still toggles it back.
         let fullscreen_only =
             borderless && fullscreen && (work != screen || style & WS_MAXIMIZEBOX == 0);
-        let state = if resizable && IsZoomed(hwnd) != 0 && !floating_panel && !fullscreen_only {
+        let normal_frame = resizable || (usage == WindowUse::NativeControl && !borderless);
+        let state = if normal_frame && IsZoomed(hwnd) != 0 && !floating_panel && !fullscreen_only {
             TileState::Maximized
         } else if fullscreen {
             TileState::Fullscreen
-        } else if resizable && !floating_panel {
+        } else if normal_frame && !floating_panel {
             TileState::Eligible
         } else {
             return TileState::Excluded;
@@ -614,8 +625,9 @@ fn process_marker_name(storage: &'static OnceLock<Vec<u16>>, purpose: &str) -> *
 }
 
 // Properties die with the HWND, even when its process recreates a window with
-// the same numeric handle. A transfer has a separate lifetime from a tile.
-struct WindowMarker {
+// the same numeric handle. Tile, transfer and native command markers each
+// have independent lifetimes.
+pub(crate) struct WindowMarker {
     id: Id,
     owner: u32,
     name: *const u16,
@@ -623,6 +635,19 @@ struct WindowMarker {
 }
 
 impl WindowMarker {
+    pub(crate) fn for_window_control(id: Id) -> Option<Self> {
+        static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+        if !window_enabled(id)
+            || !matches!(
+                classify_window(id, WindowUse::NativeControl),
+                TileState::Eligible | TileState::Maximized
+            )
+        {
+            return None;
+        }
+        Self::attach(id, process_marker_name(&NAME, "WindowControl"))
+    }
+
     fn attach(id: Id, name: *const u16) -> Option<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(1);
         let owner = pid(id);
@@ -639,7 +664,7 @@ impl WindowMarker {
         marker.matches().then_some(marker)
     }
 
-    fn matches(&self) -> bool {
+    pub(crate) fn matches(&self) -> bool {
         pid(self.id) == self.owner
             && unsafe { GetPropW(self.id as HWND, self.name) as usize == self.value }
     }

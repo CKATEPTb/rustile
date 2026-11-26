@@ -74,7 +74,7 @@ impl KeyRoutes {
         if !action.is_resize() {
             self.normal[mods as usize] = id;
         }
-        if action.is_resize() || action.works_in_both_modes() {
+        if action.is_resize() || action.reserves_both_modes() {
             self.resize[mods as usize] = id;
         }
     }
@@ -93,8 +93,7 @@ impl KeyRoutes {
             return None;
         }
         let active = foreground();
-        let known_tile =
-            matches!(state.target, Some(ShortcutTarget::Tile { id, .. }) if id == active);
+        let known_tile = matches!(state.target, Some(ShortcutTarget::Tile(id)) if id == active);
         // Only the window being resized owns modal-only keys like bare arrows.
         let resizing = mode == Mode::Resize && known_tile;
         let id = i32::from(if resizing && resize != 0 {
@@ -114,8 +113,11 @@ impl KeyRoutes {
                 || is_focus_command(id)
                 || (is_desktop_move(id) && transfer_focus_uninterrupted());
             // Own a configured normal chord even when its action is unavailable
-            // in resize mode. The manager validates the sampled HWND on delivery.
-            (has_target && (!resizing || resize != 0)).then_some(active)
+            // in resize mode. Close/maximize still apply to the live foreground;
+            // a saved binding specific to resize already took priority above.
+            let available =
+                !resizing || resize != 0 || matches!(id, CLOSE_WINDOW | TOGGLE_MAXIMIZE);
+            (has_target && available).then_some(active)
         };
         Some(BoundCommand {
             id,
@@ -347,9 +349,13 @@ impl Pending {
     fn transition(self, command: i32, focus_epoch: usize) -> Option<Self> {
         let mode = match command {
             START_RESIZE => Mode::Resize,
-            CONFIRM | CANCEL | TOGGLE_MOSAIC | MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT => {
-                Mode::Normal
-            }
+            CONFIRM
+            | CANCEL
+            | CLOSE_WINDOW
+            | TOGGLE_MAXIMIZE
+            | TOGGLE_MOSAIC
+            | MOVE_DESKTOP_PREVIOUS
+            | MOVE_DESKTOP_NEXT => Mode::Normal,
             _ => return None,
         };
         // Low eight bits of WPARAM carry the command. Ticket zero denotes a
@@ -658,10 +664,7 @@ mod tests {
                 held: [Press::Up; 256],
                 settings: Settings::default(),
                 state: Snapshot {
-                    target: Some(ShortcutTarget::Tile {
-                        id: 100,
-                        can_maximize: true,
-                    }),
+                    target: Some(ShortcutTarget::Tile(100)),
                     mode: Mode::Normal,
                     focus_epoch: 1,
                     handled: 0,
@@ -982,10 +985,7 @@ mod tests {
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
             keyboard.state.target = Some(ShortcutTarget::Expanded(100));
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
-            keyboard.state.target = Some(ShortcutTarget::Tile {
-                id: 101,
-                can_maximize: true,
-            });
+            keyboard.state.target = Some(ShortcutTarget::Tile(101));
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
             assert_eq!(keyboard.key(key, false, 0), Action::Consume);
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
@@ -997,12 +997,54 @@ mod tests {
     }
 
     #[test]
-    fn window_capabilities_are_checked_by_the_manager_after_the_hook_claims_the_chord() {
+    fn paused_window_controls_target_the_uncached_foreground_and_respect_remaps() {
+        for (action, key, command) in [
+            (Shortcut::CloseWindow, VK_Q, CLOSE_WINDOW),
+            (Shortcut::ToggleMaximize, VK_F, TOGGLE_MAXIMIZE),
+        ] {
+            let mut keyboard = Keyboard::new();
+            keyboard.settings.enabled = false;
+            keyboard.state.target = None;
+            let binding = |keyboard: &Keyboard, key: u16, mods, active| {
+                Routes::new(keyboard.settings).0[key as usize]?
+                    .binding(keyboard.state, Pending::NEW, mods, || active)
+                    .map(|b| (b.id, b.target))
+            };
+            assert_eq!(
+                binding(&keyboard, key, MOD_WIN, 741),
+                Some((command, Some(741)))
+            );
+            assert_eq!(binding(&keyboard, key, MOD_WIN, 0), Some((command, None)));
+            keyboard.assign(action, MOD_ALT, VK_F8);
+            assert_eq!(binding(&keyboard, key, MOD_WIN, 741), None);
+            assert_eq!(
+                binding(&keyboard, VK_F8, MOD_ALT, 741),
+                Some((command, Some(741)))
+            );
+        }
+    }
+
+    #[test]
+    fn window_controls_exit_resize_and_preserve_a_separate_modal_binding() {
+        for (key, command) in [(VK_Q, CLOSE_WINDOW), (VK_F, TOGGLE_MAXIMIZE)] {
+            let mut keyboard = Keyboard::new();
+            keyboard.state.mode = Mode::Resize;
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
+            assert_eq!(keyboard.key(VK_UP, true, 0), Action::Pass);
+
+            let mut custom = Keyboard::new();
+            custom.assign(Shortcut::GrowLeft, MOD_WIN, key);
+            assert_eq!(custom.key(key, true, MOD_WIN), Action::Command(command));
+            custom.key(key, false, 0);
+            custom.state.handled = custom.pending.ticket;
+            custom.state.mode = Mode::Resize;
+            assert_eq!(custom.key(key, true, MOD_WIN), Action::Command(EXPAND));
+        }
+    }
+
+    #[test]
+    fn tile_shortcuts_still_work_after_a_native_window_command() {
         let mut keyboard = Keyboard::new();
-        keyboard.state.target = Some(ShortcutTarget::Tile {
-            id: 100,
-            can_maximize: false,
-        });
         assert_eq!(
             keyboard.key(VK_F, true, MOD_WIN),
             Action::Command(TOGGLE_MAXIMIZE)
@@ -1162,10 +1204,7 @@ mod tests {
         assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Consume);
         assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
         assert_eq!(keyboard.key(VK_RIGHT, true, WIN_SHIFT), Action::Consume);
-        keyboard.state.target = Some(ShortcutTarget::Tile {
-            id: 100,
-            can_maximize: true,
-        });
+        keyboard.state.target = Some(ShortcutTarget::Tile(100));
         keyboard.state.focus_epoch += 1;
         assert_eq!(keyboard.key(VK_UP, true, 0), Action::Pass);
     }
