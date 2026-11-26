@@ -25,9 +25,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::Manager;
 use crate::layout::Direction;
-use crate::manager::{Mode, WindowControl};
+use crate::manager::Mode;
 use crate::native::desktops::DesktopId;
-use crate::native::{self, TransferIdentity};
+use crate::native::{self, TransferIdentity, WindowControl};
 use crate::settings::{Command, Modifier, Settings};
 use crate::startup;
 use crate::tray::Tray;

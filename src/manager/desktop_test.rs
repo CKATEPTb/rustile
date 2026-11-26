@@ -1073,17 +1073,63 @@ fn paused_window_controls(active: Id, peer: Id) {
     manager.shutdown();
 }
 
+fn close_fullscreen_game(game: Id, mosaic_enabled: bool) {
+    use super::{DesktopId, DesktopMembership};
+    use crate::settings::Settings;
+
+    let mut settings = Settings::default();
+    settings.enabled = mosaic_enabled;
+    let mut manager = Manager::with_settings(settings);
+    manager
+        .desktops
+        .set_memberships([(game, DesktopMembership::Current(DesktopId(1)))]);
+    let style = unsafe { GetWindowLongW(game as _, GWL_STYLE) };
+    // Some games retain a maximize box in their borderless fullscreen style.
+    assert_eq!(
+        unsafe { SetWindowLongW(game as _, GWL_STYLE, style | WS_MAXIMIZEBOX as i32) },
+        style
+    );
+    assert!(native::can_maximize(game));
+    until("borderless game is fullscreen", || {
+        native::tile_state(game) == native::TileState::Fullscreen
+    });
+    let bounds = frame(game);
+    manager.sync();
+    assert!(!manager.workspace.layout.contains(game));
+
+    let veto = w!("Rustile.Smoke.VetoNextClose");
+    let no_maximize = w!("Rustile.Smoke.ExpectNoMaximize");
+    for prop in [veto, no_maximize] {
+        assert_ne!(unsafe { SetPropW(game as _, prop, 1usize as _) }, 0);
+    }
+    dispatch_with_foreground(&mut manager, game, TOGGLE_MAXIMIZE, || game);
+    dispatch_with_foreground(&mut manager, game, CLOSE_WINDOW, || game);
+    until("fullscreen game receives and vetoes the close", || unsafe {
+        GetPropW(game as _, veto).is_null()
+    });
+    assert_ne!(unsafe { IsWindow(game as _) }, 0);
+    assert!(!unsafe { GetPropW(game as _, no_maximize) }.is_null());
+    assert_eq!(frame(game), bounds);
+    dispatch_with_foreground(&mut manager, game, CLOSE_WINDOW, || game);
+    until("fullscreen game accepts the next close", || unsafe {
+        IsWindow(game as _) == 0
+    });
+    manager.shutdown();
+}
+
 #[test]
 #[ignore = "run with tests/desktop-smoke.ps1 on its isolated Win32 desktop"]
 fn window_controls() {
     use super::{DesktopId, DesktopMembership};
 
     native::init_dpi();
-    let [first, second, active, floating] = fixtures();
+    let [first, second, active, floating, game, paused_game] = fixtures();
     let failure_file = env::var_os("RUSTILE_SMOKE_FAILURE").unwrap();
     std::panic::set_hook(Box::new(move |failure| {
         let _ = std::fs::write(&failure_file, failure.to_string());
     }));
+    close_fullscreen_game(game, true);
+    close_fullscreen_game(paused_game, false);
     paused_window_controls(floating, first);
     let windows = [first, second, active];
     let zoomed = || unsafe { IsZoomed(active as _) != 0 };

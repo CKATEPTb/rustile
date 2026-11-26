@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::hud::{FocusOutline, ResizeHud};
 use crate::layout::{Direction, Id, Layout, Rect, ResizeStops};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
-use crate::native::{self, Cloak, Original, TileState};
+use crate::native::{self, Cloak, Original, TileState, WindowControl};
 use crate::settings::Settings;
 
 mod mouse;
@@ -23,12 +23,6 @@ mod desktop_test;
 pub enum Mode {
     Normal,
     Resize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowControl {
-    Close,
-    ToggleMaximize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,7 +279,7 @@ impl Manager {
     }
 
     fn transferable_on(&self, id: Id, desktop: DesktopId) -> bool {
-        native::can_transfer(id)
+        native::can_close_or_transfer(id)
             && self.desktops.membership(id) == DesktopMembership::Current(desktop)
     }
 
@@ -990,7 +984,7 @@ impl Manager {
         if target == 0 || target != foreground() {
             return;
         }
-        let Some(window) = native::WindowMarker::for_window_control(target) else {
+        let Some(window) = native::WindowMarker::for_window_control(target, control) else {
             return;
         };
         if !matches!(

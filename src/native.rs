@@ -536,16 +536,22 @@ pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowUse {
     Tiling,
-    NativeControl,
-    DesktopTransfer,
+    Maximize,
+    CloseOrTransfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowControl {
+    Close,
+    ToggleMaximize,
 }
 
 pub(crate) fn tile_state(id: Id) -> TileState {
     classify_window(id, WindowUse::Tiling)
 }
 
-pub(crate) fn can_transfer(id: Id) -> bool {
-    window_enabled(id) && classify_window(id, WindowUse::DesktopTransfer) != TileState::Excluded
+pub(crate) fn can_close_or_transfer(id: Id) -> bool {
+    window_enabled(id) && classify_window(id, WindowUse::CloseOrTransfer) != TileState::Excluded
 }
 
 fn classify_window(id: Id, usage: WindowUse) -> TileState {
@@ -592,10 +598,10 @@ fn classify_window(id: Id, usage: WindowUse) -> TileState {
             borderless && fullscreen && (work != screen || style & WS_MAXIMIZEBOX == 0);
         let normal_frame = match usage {
             WindowUse::Tiling => resizable,
-            WindowUse::NativeControl => resizable || !borderless,
-            // Explorer moves the app view without changing its frame. A game
-            // can use a fixed-size borderless window even in windowed mode.
-            WindowUse::DesktopTransfer => true,
+            WindowUse::Maximize => resizable || !borderless,
+            // Closing and moving to another desktop also work for games
+            // that use a fixed-size borderless window.
+            WindowUse::CloseOrTransfer => true,
         };
         let state = if normal_frame && IsZoomed(hwnd) != 0 && !floating_panel && !fullscreen_only {
             TileState::Maximized
@@ -644,14 +650,19 @@ pub(crate) struct WindowMarker {
 }
 
 impl WindowMarker {
-    pub(crate) fn for_window_control(id: Id) -> Option<Self> {
+    pub(crate) fn for_window_control(id: Id, control: WindowControl) -> Option<Self> {
         static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-        if !window_enabled(id)
-            || !matches!(
-                classify_window(id, WindowUse::NativeControl),
-                TileState::Eligible | TileState::Maximized
-            )
-        {
+        let allowed = match control {
+            WindowControl::Close => can_close_or_transfer(id),
+            WindowControl::ToggleMaximize => {
+                window_enabled(id)
+                    && matches!(
+                        classify_window(id, WindowUse::Maximize),
+                        TileState::Eligible | TileState::Maximized
+                    )
+            }
+        };
+        if !allowed {
             return None;
         }
         Self::attach(id, process_marker_name(&NAME, "WindowControl"))
@@ -692,7 +703,7 @@ pub(crate) struct TransferIdentity(WindowMarker);
 impl TransferIdentity {
     pub(crate) fn capture(id: Id) -> Option<Self> {
         static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-        if !can_transfer(id) {
+        if !can_close_or_transfer(id) {
             return None;
         }
         WindowMarker::attach(id, process_marker_name(&NAME, "TransferIdentity")).map(Self)

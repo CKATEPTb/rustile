@@ -181,6 +181,8 @@ internal static class DesktopSmoke {
             } else if (m.Msg == SetFixtureMode) {
                 m.Result = ApplyMode((FixtureMode)m.WParam.ToInt32()) ? (IntPtr)1 : IntPtr.Zero;
             } else {
+                if (m.Msg == 0x112 /* WM_SYSCOMMAND */ && (m.WParam.ToInt64() & 0xfff0) == 0xf030 /* SC_MAXIMIZE */)
+                    RemoveProp(m.HWnd, "Rustile.Smoke.ExpectNoMaximize");
                 base.WndProc(ref m);
                 if (m.Msg == 0x47 /* WM_WINDOWPOSCHANGED */) {
                     Rect rect;
@@ -1457,13 +1459,16 @@ internal static class DesktopSmoke {
             Require(GetProp(windows[4], "Rustile.Smoke.OffsetSevenPassed") != IntPtr.Zero, "Seven-window geometry test did not run");
             Until("Manager should restore all seven fixtures", () => windows.Select(Bounds).SequenceEqual(originals));
             Console.WriteLine("PASS  Seven windows: Up into an offset wider tile shares that tile and fills the bottom row; a second Up exchanges the original slots");
-            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Take(4).Select(w => w.ToInt64())));
+            SetMode(windows[4], FixtureMode.Borderless);
+            SetMode(windows[5], FixtureMode.Borderless);
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Take(6).Select(w => w.ToInt64())));
             geometryTest("window_controls");
-            Require(fixtures[2].Exited(3000) && fixtures[3].Exited(3000),
-                "The tiled and floating fixtures should exit after accepting close");
+            Require(fixtures.Skip(2).Take(4).All(fixture => fixture.Exited(3000)),
+                "The tiled, floating and fullscreen fixtures should exit after accepting close");
             Until("The two surviving fixtures should return to their original bounds", () =>
                 windows.Take(2).Select(Bounds).SequenceEqual(originals.Take(2)));
             Console.WriteLine("PASS  Win+F restores custom tile sizes; Win+Q honors a veto and reclaims the tile after close");
+            Console.WriteLine("PASS  Fullscreen Win+Q supports a close veto and an accepted exit with mosaic on and off; Win+F preserves fullscreen");
             Console.WriteLine("PASS  With mosaic paused at startup, Win+F restores floating bounds and Win+Q closes the active window, preserving its peer");
         } finally {
             children.Reverse();
