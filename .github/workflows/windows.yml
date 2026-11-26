@@ -1,0 +1,138 @@
+name: Windows CI and release
+
+on:
+  push:
+    branches: [development, production]
+  pull_request:
+    branches: [development, production]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTDOCFLAGS: -D warnings
+    outputs:
+      tag: ${{ steps.asset.outputs.tag }}
+      sha256: ${{ steps.asset.outputs.sha256 }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust with MSVC
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy --no-self-update
+      - name: Check formatting
+        run: |
+          cargo +stable-x86_64-pc-windows-msvc fmt --all --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable-x86_64-pc-windows-msvc fmt --manifest-path packaging/Cargo.toml --check
+      - name: Run Clippy
+        run: cargo +stable-x86_64-pc-windows-msvc clippy --all-targets --locked -- -D warnings
+      - name: Run unit tests
+        run: cargo +stable-x86_64-pc-windows-msvc test --locked
+      - name: Check documentation
+        run: cargo +stable-x86_64-pc-windows-msvc doc --locked --no-deps --document-private-items
+      - name: Build the LZX-compressed release
+        env:
+          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+        run: ./scripts/package-release.ps1
+      - name: Test packaged command-line behavior
+        env:
+          RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+        run: ./tests/release-package.ps1
+
+      - name: Identify the release binary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/production'
+        id: asset
+        run: |
+          $metadata = cargo +stable-x86_64-pc-windows-msvc metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'rustile').version
+          if (-not $version) { throw 'Missing rustile package version' }
+          $separator = if ($version.Contains('+')) { '.' } else { '+' }
+          $binary = 'target/dist/rustile.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
+          "tag=v${version}${separator}build.$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+      - name: Pass rustile.exe to the release job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/production'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: target/dist/rustile.exe
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    name: Publish rustile.exe
+    if: github.event_name == 'push' && github.ref == 'refs/heads/production'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: rustile-production-release
+      # Keep intermediate merges queued while another release is uploading.
+      queue: max
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64
+          path: dist
+          digest-mismatch: error
+
+      - name: Publish the verified binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          printf '%s  dist/rustile.exe\n' "$SHA256" | sha256sum --check
+
+          # Never publish into an existing tag belonging to a different commit.
+          ref=$(gh api "repos/{owner}/{repo}/git/matching-refs/tags/$TAG" |
+            jq -r --arg ref "refs/tags/$TAG" '.[] | select(.ref == $ref) | .object.sha')
+          [[ -z "$ref" || "$ref" == "$GITHUB_SHA" ]]
+
+          if ! release=$(gh release view "$TAG" --json targetCommitish,isDraft,assets); then
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "Rustile ${TAG#v}" --generate-notes
+            release=$(gh release view "$TAG" --json targetCommitish,isDraft,assets)
+          fi
+          jq -e --arg sha "$GITHUB_SHA" '
+            .targetCommitish == $sha and all(.assets[]; .name == "rustile.exe")
+          ' <<< "$release" >/dev/null
+
+          if [[ $(jq -r '.isDraft' <<< "$release") == false ]]; then
+            # A re-run of the build may have new PE timestamps. Keep the published binary.
+            [[ "$ref" == "$GITHUB_SHA" ]]
+            jq -e '.assets | length == 1 and .[0].state == "uploaded" and .[0].size > 0' <<< "$release"
+            exit 0
+          fi
+
+          gh release upload "$TAG" dist/rustile.exe --clobber
+          gh release view "$TAG" --json assets |
+            jq -e --arg digest "sha256:$SHA256" '.assets | length == 1 and .[0].digest == $digest'
+
+          # Production jobs can finish out of order. Only advance Latest along its commit history.
+          previous=$(gh api graphql -F owner='{owner}' -F name='{repo}' -f query='
+            query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { latestRelease { tagName } } }
+          ' --jq '.data.repository.latestRelease.tagName // ""')
+          latest=true
+          if [[ -n "$previous" ]]; then
+            relation=$(gh api "repos/{owner}/{repo}/compare/$previous...$GITHUB_SHA" --jq .status)
+            case "$relation" in
+              ahead|identical) ;;
+              *) latest=false ;;
+            esac
+          fi
+          gh release edit "$TAG" --draft=false --latest="$latest"

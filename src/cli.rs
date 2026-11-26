@@ -1,3 +1,9 @@
+//! English command grammar for both terminal clients and the running manager.
+//!
+//! A client can print help locally, start the manager, or send a typed request.
+//! Public aliases map to the same [`Command`]. Its canonical wire form lets
+//! the server validate the request again before touching a window.
+
 use crate::layout::{Direction, Id};
 use crate::settings::Modifier;
 

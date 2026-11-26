@@ -1,3 +1,7 @@
+//! Resolve HWNDs to virtual desktop IDs for the tiler. An unresolved membership
+//! is distinct from a window on another desktop during an Explorer transition.
+//! The private Shell interfaces for navigation and enumeration live in [`shell`].
+
 pub(crate) mod occupancy;
 pub(crate) mod shell;
 

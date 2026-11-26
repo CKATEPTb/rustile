@@ -1,10 +1,13 @@
+//! Records one binding while its editor has focus. A recording owns temporary
+//! input hooks and a generation number so already queued events cannot edit
+//! the next binding. Releasing the last key completes the chord.
+
 use super::*;
 use crate::settings::{WHEEL_DOWN, WHEEL_UP};
 
 pub(super) const KEY_EVENT: u32 = WM_APP + 91;
 
-// The temporary hook runs on the editor's UI thread. Its messages belong to
-// one recording only, even if the user immediately starts editing another row.
+// Low-level hook callbacks execute on the thread that installed the hook.
 thread_local! {
     static TARGET: Cell<(HWND, usize)> = const { Cell::new((null_mut(), 0)) };
     static DELIVERY_FAILED: Cell<bool> = const { Cell::new(false) };

@@ -1,8 +1,15 @@
+//! Installs or replaces the single executable and forwards the original invocation.
+//!
+//! A copy launched outside the installation directory enters the update path,
+//! even for help or version requests. The installer serializes replacements,
+//! registers the CLI on PATH and hands control to the installed copy.
+//! The caller retains its own token when an elevated helper performs the copy.
+
 #[cfg(feature = "installation-fixture")]
 mod fixture;
 mod path_env;
 
-use crate::{cli, cli_error, runtime, startup};
+use crate::{cli, cli_error, launch_context::PACKAGE_ORIGIN, runtime, startup};
 use startup::consent;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -65,6 +72,12 @@ impl Destination {
             }
         };
         startup::migrate_user_startup(source)?;
+        if let Some(origin) = std::env::var_os(PACKAGE_ORIGIN).map(PathBuf::from)
+            && origin.is_absolute()
+            && origin != source
+        {
+            startup::migrate_user_startup(&origin)?;
+        }
         if let Some(owner) = previous
             && owner.image != source
             && owner.image != self.exe
@@ -128,6 +141,7 @@ fn at_destination(source: &Path, destination: &Path) -> bool {
 
 fn start_quietly(exe: &Path, args: &[String]) -> Result<(), String> {
     let result = Command::new(exe)
+        .env_remove(PACKAGE_ORIGIN)
         .arg("start")
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
@@ -188,6 +202,7 @@ pub(crate) fn launch(args: &[String], from_terminal: bool) -> Result<ExitCode, S
             start_quietly(&dest.exe, &[])?;
         }
         let status = Command::new(&dest.exe)
+            .env_remove(PACKAGE_ORIGIN)
             .args(args)
             .status()
             .map_err(cli_error::io)?;

@@ -1,3 +1,7 @@
+//! Pack the root tiles into bands before applying local BSP cuts. A band can
+//! have a different number of occupants from its neighbor, so an incomplete
+//! final band can still cover its full share of the work area.
+
 use super::{Axis, Direction, GAP, Rect};
 
 #[derive(Clone, Copy, Debug)]

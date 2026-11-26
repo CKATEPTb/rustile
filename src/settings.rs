@@ -1,3 +1,10 @@
+//! Reads, migrates and validates the per-user TOML configuration.
+//!
+//! The stored profile and the live settings can differ when a shortcut was
+//! supplied at launch. [`Settings::changed_for_save`] computes the persisted
+//! edit. [`Settings::prepare`] stages the file beside its destination so the
+//! runtime can validate the live change before committing the replacement.
+
 mod bindings;
 pub(crate) mod exclusions;
 mod scheme;
@@ -253,8 +260,8 @@ impl Settings {
         parsed.validated()
     }
 
-    // Prepare the file before changing live geometry; validation or I/O failure
-    // must leave the previous settings file intact.
+    /// Stages a complete, flushed settings file. The previous profile remains
+    /// readable until [`PendingSave::commit`] replaces it.
     pub fn prepare(&self, path: &Path) -> Result<PendingSave, String> {
         let content =
             toml::to_string_pretty(self).map_err(|e| file_error(Msg::ConfigWrite, path, &e))?;
@@ -273,6 +280,7 @@ fn file_error(msg: Msg, path: &Path, error: &dyn std::fmt::Display) -> String {
     )
 }
 
+/// A staged preference update. Dropping it discards the temporary file.
 pub(crate) struct PendingSave {
     tmp: PathBuf,
     path: PathBuf,

@@ -1,3 +1,7 @@
+//! Win32 adapter for discovering, identifying and positioning application windows.
+//! Layout coordinates describe the visible frame. Placement converts them to
+//! outer window bounds, which can include invisible resize borders.
+
 pub(crate) mod access;
 pub(crate) mod desktops;
 
@@ -828,6 +832,8 @@ impl TransferIdentity {
     }
 }
 
+/// Captured outer bounds, frame insets and identity of a window admitted to tiling.
+/// The identity marker lets delayed work detect a destroyed or reused HWND.
 pub struct Original {
     id: Id,
     marker: WindowMarker,
@@ -1188,30 +1194,74 @@ pub fn focus(id: Id) -> bool {
         && (foreground() == id || unsafe { SetForegroundWindow(id as HWND) } != 0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusMethod {
+    ApplicationView,
+    Foreground,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusAttempt {
+    Unavailable,
+    Submitted,
+    ShellAccepted,
+}
+
 pub(crate) fn focus_after_desktop_change(
     id: Id,
     previous: Id,
+    method: FocusMethod,
     may_activate: impl Fn() -> bool,
-) -> bool {
+) -> FocusAttempt {
     let hwnd = id as HWND;
     let can_activate = || may_activate() && window_enabled(id) && foreground() == previous;
     // Explorer can activate its own application view during a desktop change.
     // Recheck after RPC: input or desktop membership may already have changed.
-    let shell_accepted = if let Some(view) = desktops::shell::ApplicationView::lookup(hwnd) {
+    let shell_result = if method == FocusMethod::ApplicationView
+        && let Some(view) = desktops::shell::ApplicationView::lookup(hwnd)
+    {
         if !can_activate() {
-            return false;
+            return FocusAttempt::Unavailable;
         }
-        view.request_focus()
+        Some(view.request_focus())
     } else {
-        false
+        None
     };
-    if foreground() == id {
-        return true;
+    finish_desktop_activation(
+        shell_result,
+        || {
+            foreground() != id
+                && can_activate()
+                && unsafe { AllowSetForegroundWindow(std::process::id()) } != 0
+                && can_activate()
+        },
+        || {
+            unsafe { SetForegroundWindow(hwnd) };
+        },
+    )
+}
+
+fn finish_desktop_activation(
+    shell_result: Option<bool>,
+    allowed: impl FnOnce() -> bool,
+    request_foreground: impl FnOnce(),
+) -> FocusAttempt {
+    // This reports an attempt. Only the foreground HWND confirms delivery.
+    if shell_result == Some(true) {
+        return FocusAttempt::ShellAccepted;
     }
-    // S_OK can precede the actual focus change. While the previous window
-    // can still yield, also give Windows the regular foreground request.
-    let accepted = can_activate() && unsafe { SetForegroundWindow(hwnd) } != 0;
-    accepted || shell_accepted
+    // A hotkey or a CLI caller can grant foreground permission even while
+    // Explorer owns the foreground HWND. Windows denies a self-grant if we
+    // lack permission, without flashing a taskbar button.
+    if allowed() {
+        request_foreground();
+        return FocusAttempt::Submitted;
+    }
+    if shell_result.is_some() {
+        FocusAttempt::Submitted
+    } else {
+        FocusAttempt::Unavailable
+    }
 }
 
 #[cfg(test)]
@@ -1220,6 +1270,36 @@ mod work_area_tests {
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn desktop_focus_falls_back_only_with_windows_foreground_permission() {
+        let unexpected_request = || panic!("unexpected SetForegroundWindow request");
+        assert_eq!(
+            finish_desktop_activation(
+                Some(true),
+                || panic!("replaced Explorer's outstanding foreground grant"),
+                unexpected_request
+            ),
+            FocusAttempt::ShellAccepted
+        );
+        assert_eq!(
+            finish_desktop_activation(None, || false, unexpected_request),
+            FocusAttempt::Unavailable
+        );
+        // Even a declined view request counts, so a retry cannot flash a peer.
+        assert_eq!(
+            finish_desktop_activation(Some(false), || false, unexpected_request),
+            FocusAttempt::Submitted
+        );
+        for shell_result in [None, Some(false)] {
+            let mut requests = 0;
+            assert_eq!(
+                finish_desktop_activation(shell_result, || true, || requests += 1),
+                FocusAttempt::Submitted
+            );
+            assert_eq!(requests, 1);
+        }
     }
 
     #[test]

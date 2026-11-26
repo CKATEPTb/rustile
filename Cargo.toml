@@ -3,6 +3,7 @@ name = "rustile"
 version = "0.1.0"
 edition = "2024"
 description = "Event-driven tiling for Windows 11"
+license = "MIT"
 
 [features]
 installation-fixture = []

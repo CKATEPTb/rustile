@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="318" height="204" viewBox="0 0 318 204" role="img" aria-labelledby="title description">
+  <title id="title">Open Files from Browser</title>
+  <desc id="description">Editor and Terminal keep their places in the left column. Browser takes the top half of the right column and the new Files window takes the bottom half.</desc>
+  <style>
+    .surface { fill: #edf3f8; }
+    .desktop { fill: #cad7e2; }
+    .tile { fill: #fcfdff; stroke: #879eb1; }
+    .active { fill: #dff2ff; stroke: #2276ae; stroke-width: 3; }
+    text { fill: #26394b; font-family: "Segoe UI", system-ui, sans-serif; }
+    .heading { font-size: 21px; font-weight: 600; }
+    .label { font-size: 21px; font-weight: 500; text-anchor: middle; }
+    .compact { font-size: 16px; }
+    .focused-label { fill: #164f76; font-weight: 650; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #151e28; }
+      .desktop { fill: #0e1720; }
+      .tile { fill: #263341; stroke: #687d8f; }
+      .active { fill: #153f60; stroke: #53b9f7; }
+      text { fill: #e3ecf5; }
+      .focused-label { fill: #dcf4ff; }
+    }
+  </style>
+  <rect class="surface" width="318" height="204" rx="12"/>
+  <text class="heading" x="14" y="36">Open Files from Browser</text>
+  <rect class="desktop" x="8" y="52" width="302" height="140" rx="8"/>
+  <rect class="tile" x="14" y="58" width="142" height="61" rx="4"/>
+  <rect class="tile" x="14" y="125" width="142" height="61" rx="4"/>
+  <rect class="tile" x="162" y="58" width="142" height="61" rx="4"/>
+  <rect class="active" x="162" y="125" width="142" height="61" rx="4"/>
+  <text class="label" x="85" y="96">Editor</text>
+  <text class="label" x="85" y="163">Terminal</text>
+  <text class="label" x="233" y="96">Browser</text>
+  <text class="label focused-label" x="233" y="163">Files</text>
+</svg>

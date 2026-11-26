@@ -1226,14 +1226,15 @@ fn window_controls() {
     assert!(manager.restore_desktop_focus_with(
         destination,
         || foreground.get(),
-        |id, previous| {
+        |id, previous, method| {
+            assert_eq!(method, crate::native::FocusMethod::ApplicationView);
             assert_eq!(
                 previous, windows[0],
                 "the outgoing app still appears visible"
             );
             assert_eq!(id, active);
             foreground.set(id);
-            true
+            crate::native::FocusAttempt::Submitted
         }
     ));
     assert_eq!(foreground.get(), active);

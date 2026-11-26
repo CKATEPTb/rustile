@@ -13,8 +13,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::{PCWSTR, w};
 
-// Registry notifications only invalidate the Shell snapshot. Rearm before
-// reading that snapshot, including after returning from a native modal loop.
+/// A registry subscription that wakes the message loop when Explorer's desktop
+/// data changes. Rearm the subscription before taking a fresh Shell snapshot
+/// so an intervening change can signal the loop again.
 pub(super) struct DesktopWatch {
     key: Key,
     changed: OwnedHandle,

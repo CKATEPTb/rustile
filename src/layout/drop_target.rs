@@ -1,8 +1,11 @@
 use super::{Cut, Direction, Id, Layout, Rect, SharedPair, Vacancy, Window};
 
+/// Intent inferred from the pointer inside a visible target tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropZone {
+    /// Exchange occupants if they both fit in the other's frame.
     Center,
+    /// Place the dragged window along this edge of the destination.
     Edge(Direction),
 }
 
@@ -49,6 +52,8 @@ impl Layout {
             .find_map(|(w, rect)| DropZone::at(rect, point).map(|zone| (w.id, zone)))
     }
 
+    /// Return a candidate layout and the dragged window's resulting visible
+    /// frame. The manager can draw that frame before committing the layout.
     pub fn plan_drop(
         &self,
         source: Id,

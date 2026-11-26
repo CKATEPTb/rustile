@@ -1,6 +1,11 @@
+//! Apply tiling policy to the windows on the active virtual desktop.
+//! The manager retains each tracked window's original frame and each
+//! workspace's geometry and focus history across desktop switches.
+
 use crate::i18n::{Msg, tr};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
@@ -12,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::hud::{FocusOutline, ResizeHud};
 use crate::layout::{Direction, Id, Layout, Rect, ResizeStep, ResizeStops};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
-use crate::native::{self, Cloak, Original, TileState, WindowControl};
+use crate::native::{self, Cloak, FocusAttempt, FocusMethod, Original, TileState, WindowControl};
 use crate::settings::Settings;
 use crate::settings::exclusions::ExclusionMatcher;
 
@@ -124,6 +129,8 @@ impl WorkArea {
     }
 }
 
+/// State owned by the message loop. Crossing a desktop boundary parks the
+/// previous workspace. Only confirmed current-desktop placements reach Win32.
 pub struct Manager {
     settings: Settings,
     exclusions: ExclusionMatcher,
@@ -135,7 +142,7 @@ pub struct Manager {
     // A Shell-selected foreground during the switch must not change which
     // destination tile the transferred window was meant to split.
     transfer_anchor: Option<(Id, DesktopId, Id)>,
-    unconfirmed_focus: Cell<Option<(DesktopId, Id)>>,
+    desktop_focus_request: Cell<Option<DesktopFocusRequest>>,
     windows: HashMap<Id, TrackedWindow>,
     openings: Openings,
     expanded: HashSet<Id>,
@@ -147,6 +154,19 @@ pub struct Manager {
     session: Option<ResizeSession>,
     hud: ResizeHud,
     outline: FocusOutline,
+}
+
+#[derive(Clone, Copy)]
+struct DesktopFocusRequest {
+    home: DesktopId,
+    id: Id,
+    fallback_after: Option<Instant>,
+}
+
+impl DesktopFocusRequest {
+    fn fallback_due(self) -> bool {
+        self.fallback_after.is_some_and(|at| Instant::now() >= at)
+    }
 }
 
 impl Manager {
@@ -171,7 +191,7 @@ impl Manager {
             workspace: Workspace::new(native::spacing_px(settings.gap)),
             parked: HashMap::new(),
             transfer_anchor: None,
-            unconfirmed_focus: Cell::default(),
+            desktop_focus_request: Cell::default(),
             windows: HashMap::new(),
             openings: Openings::default(),
             expanded: HashSet::new(),
@@ -245,8 +265,12 @@ impl Manager {
         std::mem::take(&mut self.needs_desktop_retry)
     }
 
+    pub(crate) fn desktop_membership(&self, id: Id) -> DesktopMembership {
+        self.desktops.membership(id)
+    }
+
     fn on_current(&self, id: Id) -> bool {
-        matches!(self.desktops.membership(id), DesktopMembership::Current(key) if Some(key) == self.current)
+        matches!(self.desktop_membership(id), DesktopMembership::Current(key) if Some(key) == self.current)
     }
 
     fn detach(&mut self, id: Id, desktop: DesktopId) {
@@ -274,6 +298,13 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        if self
+            .desktop_focus_request
+            .get()
+            .is_some_and(|request| request.id == id)
+        {
+            self.desktop_focus_request.set(None);
+        }
         self.exclusion_cache.get_mut().remove(&id);
         self.openings.forget(id);
         if self
@@ -685,7 +716,7 @@ impl Manager {
         if !self.settings.enabled {
             self.dragging = None;
             self.transfer_anchor = None;
-            self.unconfirmed_focus.set(None);
+            self.desktop_focus_request.set(None);
             self.outline.hide();
         } else if resuming || system_changed || rules_changed {
             self.sync();
@@ -1303,6 +1334,12 @@ impl Manager {
         }
     }
 
+    /// A new navigation command may request focus again, including a return
+    /// to the same desktop after a rapid round trip.
+    pub(crate) fn begin_desktop_focus(&self) {
+        self.desktop_focus_request.set(None);
+    }
+
     /// A queued activation needs confirmation from the actual foreground HWND.
     pub(crate) fn restore_desktop_focus(
         &self,
@@ -1310,14 +1347,13 @@ impl Manager {
         uninterrupted: impl Fn() -> bool,
     ) -> bool {
         if !uninterrupted() {
-            self.unconfirmed_focus.set(None);
+            self.desktop_focus_request.set(None);
             return true;
         }
-        self.restore_desktop_focus_with(desktop, native::foreground, |id, previous| {
-            native::focus_after_desktop_change(id, previous, || {
-                self.focusable_on(id, desktop)
-                    && self.desktop_foreground_on(previous, desktop)
-                        == native::DesktopForeground::Vacant
+        self.restore_desktop_focus_with(desktop, native::foreground, |id, previous, method| {
+            native::focus_after_desktop_change(id, previous, method, || {
+                self.desktop_foreground_on(previous, desktop) == native::DesktopForeground::Vacant
+                    && self.focusable_on(id, desktop)
                     && uninterrupted()
             })
         })
@@ -1333,24 +1369,65 @@ impl Manager {
             return true;
         }
         let id = identity.id();
-        self.restore_transferred_focus_with(id, desktop, native::foreground, |previous| {
-            native::focus_after_desktop_change(id, previous, || {
-                self.transferable_on(id, desktop)
-                    && self.transfer_foreground_can_yield(previous, desktop)
+        self.restore_transferred_focus_with(id, desktop, native::foreground, |previous, method| {
+            native::focus_after_desktop_change(id, previous, method, || {
+                self.transfer_foreground_can_yield(previous, desktop, method)
+                    && self.transferable_on(id, desktop)
                     && identity.matches()
                     && uninterrupted()
             })
         })
     }
 
-    fn transfer_foreground_can_yield(&self, previous: Id, desktop: DesktopId) -> bool {
+    fn transfer_foreground_can_yield(
+        &self,
+        previous: Id,
+        desktop: DesktopId,
+        method: FocusMethod,
+    ) -> bool {
         match self.desktop_foreground_on(previous, desktop) {
             native::DesktopForeground::Vacant => true,
             native::DesktopForeground::Transient => false,
             native::DesktopForeground::Preserve => {
-                self.transferable_on(previous, desktop) && native::app_input_idle(previous)
+                method == FocusMethod::ApplicationView
+                    && self.transferable_on(previous, desktop)
+                    && native::app_input_idle(previous)
             }
         }
+    }
+
+    fn request_desktop_focus(
+        &self,
+        home: DesktopId,
+        id: Id,
+        activate: impl FnOnce(FocusMethod) -> FocusAttempt,
+    ) -> bool {
+        if let Some(request) = self.desktop_focus_request.get()
+            && (request.home, request.id) == (home, id)
+        {
+            if request.fallback_due() {
+                // Explorer accepted but focus still hasn't arrived. Only this
+                // same HWND can receive one permission-checked Win32 fallback.
+                self.desktop_focus_request.set(Some(DesktopFocusRequest {
+                    fallback_after: None,
+                    ..request
+                }));
+                activate(FocusMethod::Foreground);
+            }
+            return true;
+        }
+        let attempt = activate(FocusMethod::ApplicationView);
+        if attempt == FocusAttempt::Unavailable {
+            return false;
+        }
+        let fallback_after = (attempt == FocusAttempt::ShellAccepted)
+            .then(|| Instant::now() + Duration::from_millis(450));
+        self.desktop_focus_request.set(Some(DesktopFocusRequest {
+            home,
+            id,
+            fallback_after,
+        }));
+        true
     }
 
     fn restore_transferred_focus_with(
@@ -1358,7 +1435,7 @@ impl Manager {
         id: Id,
         desktop: DesktopId,
         foreground: impl Fn() -> Id,
-        activate: impl FnOnce(Id) -> bool,
+        activate: impl FnOnce(Id, FocusMethod) -> FocusAttempt,
     ) -> bool {
         if !self.transferable_on(id, desktop) {
             return false;
@@ -1367,19 +1444,23 @@ impl Manager {
         if previous == id {
             return true;
         }
-        if !self.transfer_foreground_can_yield(previous, desktop) {
+        if !self.transfer_foreground_can_yield(previous, desktop, FocusMethod::ApplicationView) {
             // A dialog or menu on the destination may retain legitimate input.
             return self.desktop_foreground_on(previous, desktop)
                 == native::DesktopForeground::Preserve;
         }
-        foreground() == previous && activate(previous) && foreground() == id
+        if foreground() != previous {
+            return false;
+        }
+        self.request_desktop_focus(desktop, id, |method| activate(previous, method));
+        foreground() == id
     }
 
     fn restore_desktop_focus_with(
         &self,
         desktop: DesktopId,
         foreground: impl Fn() -> Id,
-        mut activate: impl FnMut(Id, Id) -> bool,
+        mut activate: impl FnMut(Id, Id, FocusMethod) -> FocusAttempt,
     ) -> bool {
         if !self.settings.enabled {
             return true;
@@ -1387,11 +1468,33 @@ impl Manager {
         let previous = foreground();
         match self.desktop_foreground_on(previous, desktop) {
             native::DesktopForeground::Transient => return false,
-            native::DesktopForeground::Preserve => {
-                self.unconfirmed_focus.set(None);
-                return true;
-            }
+            native::DesktopForeground::Preserve => return true,
             native::DesktopForeground::Vacant => {}
+        }
+        if let Some(request) = self.desktop_focus_request.get() {
+            let id = request.id;
+            if request.home == desktop
+                && native::window_enabled(id)
+                && !native::hidden_or_minimized(id)
+                && !matches!(
+                    self.desktops.membership(id),
+                    DesktopMembership::Current(actual) | DesktopMembership::Other(actual)
+                        if actual != desktop
+                )
+            {
+                // Even a temporarily cloaked or unresolved view can still
+                // receive Explorer's queued activation.
+                if request.fallback_due()
+                    && self.focusable_on(id, desktop)
+                    && foreground() == previous
+                {
+                    self.request_desktop_focus(desktop, id, |method| {
+                        activate(id, previous, method)
+                    });
+                }
+                return foreground() == id;
+            }
+            self.desktop_focus_request.set(None);
         }
         let workspace = if self.current == Some(desktop) {
             Some(&self.workspace)
@@ -1415,12 +1518,6 @@ impl Manager {
         candidates.extend(native::enumerate().into_iter().rev());
         let mut seen = HashSet::new();
         candidates.retain(|&id| seen.insert(id));
-        if let Some((home, last)) = self.unconfirmed_focus.take()
-            && home == desktop
-            && let Some(index) = candidates.iter().position(|&id| id == last)
-        {
-            candidates.rotate_left(index + 1);
-        }
         for id in candidates {
             if !self.focusable_on(id, desktop) {
                 continue;
@@ -1428,19 +1525,11 @@ impl Manager {
             if foreground() != previous {
                 return false;
             }
-            let submitted = activate(id, previous);
+            let submitted =
+                self.request_desktop_focus(desktop, id, |method| activate(id, previous, method));
             let actual = foreground();
-            if actual == id {
-                return true;
-            }
-            if actual != previous {
-                return false;
-            }
-            if submitted {
-                // Let Windows deliver an accepted request before trying another
-                // HWND. A later retry can advance if focus never arrived.
-                self.unconfirmed_focus.set(Some((desktop, id)));
-                return false;
+            if submitted || actual != previous {
+                return actual == id;
             }
         }
         false

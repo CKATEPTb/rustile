@@ -1,3 +1,7 @@
+//! Position newly created windows early when their frame and desktop are known.
+//! A provisional position does not reserve a tile: peers move only after the
+//! normal admission path confirms the window.
+
 use super::{
     DesktopId, DesktopMembership, EVENT_OBJECT_LOCATIONCHANGE, HashMap, Id, Layout, Manager,
     Original, Rect, native,

@@ -1,5 +1,8 @@
 use super::{Axis, Direction, Rect};
 
+/// Neighbors that can fill the source rectangle during a move into another
+/// tile. Slot indices identify recipients; their geometric order determines
+/// how a contiguous band expands into the vacated space.
 #[derive(Clone, Debug)]
 pub(super) struct Vacancy {
     recipients: Vec<usize>,

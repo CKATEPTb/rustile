@@ -146,6 +146,47 @@ fn a_switch_before_explorer_reports_its_first_desktop_still_restores_focus() {
     assert_eq!(focus.pending, Some((DesktopId(3), 0)));
 }
 
+#[test]
+fn rapid_desktop_gestures_yield_foreground_to_explorer_until_the_final_arrival() {
+    let (a, b, c) = (DesktopId(1), DesktopId(2), DesktopId(3));
+    let now = Instant::now();
+    let grace = Duration::from_millis(SHELL_FOCUS_GRACE_MS.into());
+    let mut focus = DesktopFocus::default();
+    focus.requested(a, b);
+    focus.gesture = 1;
+    focus.observe(Some(b));
+    assert_eq!(
+        focus.wait_for_shell(Some(b), true, 2, now),
+        Some(FOCUS_SETTLE_MS)
+    );
+    assert!(
+        !focus.awaiting_switch(),
+        "next navigation can run immediately"
+    );
+    assert_eq!(
+        focus.pending,
+        Some((b, 0)),
+        "no focus attempt spent on the intermediate desktop"
+    );
+
+    focus.requested(b, c);
+    focus.gesture = 2;
+    focus.observe(Some(c));
+    focus.quiet_until = Some(now + grace);
+    assert!(focus.wait_for_shell(Some(c), false, 2, now).is_some());
+    // The input hook can hear the next press before its command is dequeued.
+    assert!(
+        focus
+            .wait_for_shell(Some(c), false, 3, now + grace)
+            .is_some()
+    );
+    assert_eq!(
+        focus.wait_for_shell(Some(c), false, 3, now + 2 * grace),
+        None
+    );
+    assert_eq!(focus.settle(Some(c), |id| id == c), None);
+}
+
 fn smoke_desktop() -> String {
     let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) }).unwrap();
     assert_eq!(desktop, std::env::var("RUSTILE_SMOKE_DESKTOP").unwrap());
@@ -179,6 +220,16 @@ fn isolated_shortcut_ownership() {
         crate::i18n::tr(crate::i18n::Msg::UiShortcutTitle)
     );
     let mut settings = Settings::default();
+    // Another owner of these test chords forces the low-level fallback. This
+    // process runs on a private Win32 desktop without interactive input.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+    let reserved = [VK_F16, VK_F17, VK_F18];
+    for key in reserved {
+        assert_ne!(
+            unsafe { RegisterHotKey(null_mut(), i32::from(key), 0, key.into()) },
+            0
+        );
+    }
     for (action, key) in [
         (Shortcut::FocusLeft, VK_F13),
         (Shortcut::ToggleMosaic, VK_F14),
@@ -341,6 +392,10 @@ fn isolated_shortcut_ownership() {
     release_after_scroll();
     plain_win(true);
     plain_win(false);
+    for key in reserved {
+        assert_ne!(unsafe { UnregisterHotKey(null_mut(), i32::from(key)) }, 0);
+    }
+    shortcuts::test_registered_ownership(&hook, &settings, owner);
 }
 
 #[test]

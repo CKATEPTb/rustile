@@ -1,3 +1,7 @@
+//! Maintain a trailing empty desktop using Explorer's order and window inventory.
+//! Preserve the selected desktop's position while it is empty. Recheck the
+//! inventory before applying a proposed creation, removal or reorder.
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -174,16 +178,45 @@ fn from_current(order: &[DesktopId], current: DesktopId) -> Option<&[DesktopId]>
     Some(&order[index..])
 }
 
-fn previous_transfer_target(
+#[derive(Debug, PartialEq, Eq)]
+enum RelativeTransfer {
+    Stay(usize),
+    Neighbor(DesktopId),
+    Prepend,
+    PrepareNext,
+}
+
+fn relative_transfer(
+    order: &[DesktopId],
+    current: DesktopId,
+    next: bool,
+    other_window: impl FnOnce(&[DesktopId]) -> Option<bool>,
+) -> Option<RelativeTransfer> {
+    let index = order.iter().position(|&id| id == current)?;
+    if !next && index > 0 {
+        return Some(RelativeTransfer::Neighbor(order[index - 1]));
+    }
+    // At the left edge, another window must remain on the first desktop.
+    // At the right edge, a window here or further right makes the move useful.
+    let candidates = if next { &order[index..] } else { &order[..1] };
+    if !other_window(candidates)? {
+        return Some(RelativeTransfer::Stay(index + 1));
+    }
+    Some(if next {
+        order
+            .get(index + 1)
+            .copied()
+            .map_or(RelativeTransfer::PrepareNext, RelativeTransfer::Neighbor)
+    } else {
+        RelativeTransfer::Prepend
+    })
+}
+
+fn prepend_transfer_target(
     mut order: Vec<DesktopId>,
-    from: DesktopId,
     create: impl FnOnce() -> Option<DesktopId>,
     place_first: impl FnOnce(DesktopId, &[DesktopId]) -> bool,
 ) -> Option<(DesktopId, Vec<DesktopId>)> {
-    if order.first() != Some(&from) {
-        let previous = neighbor(&order, from, false)?;
-        return Some((previous, order));
-    }
     let target = create()?;
     if order.contains(&target) {
         return None;
@@ -222,13 +255,12 @@ fn stationary_index(
     order: &[DesktopId],
     current: DesktopId,
     destination: DesktopDestination,
-    transferring_window: bool,
     occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
 ) -> Option<usize> {
     let index = order.iter().position(|&id| id == current)?;
     let empty_tail = || occupied(&order[index..]).map(|value| !value);
     let stationary = match destination {
-        DesktopDestination::Relative { next: false } => index == 0 && !transferring_window,
+        DesktopDestination::Relative { next: false } => index == 0,
         DesktopDestination::Relative { next: true } => empty_tail()?,
         DesktopDestination::Number(number) => {
             let target = number.checked_sub(1)?.min(order.len() - 1);
@@ -246,6 +278,11 @@ pub(super) struct WindowTransfer {
     pub(super) from: DesktopId,
     pub(super) to: DesktopId,
     pub(super) followed: bool,
+}
+
+pub(super) enum TransferOutcome {
+    Stayed(usize),
+    Moved(WindowTransfer),
 }
 
 impl WindowTransfer {
@@ -294,6 +331,12 @@ impl Workspaces {
         self.shell.is_some()
     }
 
+    pub(super) fn allow_shell_foreground(&self) {
+        if let Some(shell) = &self.shell {
+            shell.allow_shell_foreground();
+        }
+    }
+
     pub(super) fn current_desktop(&self) -> Option<DesktopId> {
         self.shell.as_ref()?.current()
     }
@@ -305,13 +348,9 @@ impl Workspaces {
         (order.contains(&current) && shell.current()? == current).then_some((current, order))
     }
 
-    pub(super) fn stationary_index(
-        &self,
-        destination: DesktopDestination,
-        transferring_window: bool,
-    ) -> Option<usize> {
+    pub(super) fn stationary_index(&self, destination: DesktopDestination) -> Option<usize> {
         let (current, order) = self.snapshot()?;
-        stationary_index(&order, current, destination, transferring_window, |tail| {
+        stationary_index(&order, current, destination, |tail| {
             occupancy::any_occupied(&order, tail)
         })
     }
@@ -424,8 +463,7 @@ impl Workspaces {
         let current = self.current_desktop()?;
         let (target, order) = self.resolve(current, destination)?;
         let shell = self.shell.as_ref()?;
-        (shell.current()? == current && shell.list()? == order && shell.switch(target))
-            .then_some((current, target))
+        (shell.list()? == order && shell.switch(current, target)).then_some((current, target))
     }
 
     pub(super) fn transfer(
@@ -434,34 +472,44 @@ impl Workspaces {
         destination: DesktopDestination,
         valid: impl Fn(DesktopId) -> bool,
         uninterrupted: impl Fn() -> bool,
-    ) -> Option<WindowTransfer> {
+    ) -> Option<TransferOutcome> {
         let from = self.current_desktop()?;
         let still_valid = || uninterrupted() && valid(from);
         if !still_valid() {
             return None;
         }
-        let (to, order) = if destination == (DesktopDestination::Relative { next: false }) {
+        let (to, order) = if let DesktopDestination::Relative { next } = destination {
             let shell = self.shell.as_ref()?;
-            previous_transfer_target(
-                shell.list()?,
-                from,
-                || {
-                    if shell.can_move_window(window, from) && still_valid() {
-                        shell.create()
-                    } else {
-                        None
-                    }
-                },
-                |created, expected| {
-                    if !still_valid() {
-                        return false;
-                    }
-                    // Explorer may commit a reorder even if its RPC reports an error.
-                    // Transfer only after observing the exact original order behind us.
-                    shell.move_before_first(created, from);
-                    shell.list().as_deref() == Some(expected)
-                },
-            )?
+            let order = shell.list()?;
+            let plan = relative_transfer(&order, from, next, |desktops| {
+                occupancy::any_other_occupied(&order, desktops, window)
+            })?;
+            if shell.current()? != from || shell.list()? != order || !still_valid() {
+                return None;
+            }
+            match plan {
+                RelativeTransfer::Stay(index) => return Some(TransferOutcome::Stayed(index)),
+                RelativeTransfer::Neighbor(to) => (to, order),
+                RelativeTransfer::PrepareNext => self.prepare_next(from, order)?,
+                RelativeTransfer::Prepend => prepend_transfer_target(
+                    order,
+                    || {
+                        if shell.can_move_window(window, from) && still_valid() {
+                            shell.create()
+                        } else {
+                            None
+                        }
+                    },
+                    |created, expected| {
+                        if !still_valid() {
+                            return false;
+                        }
+                        // Check the actual order even when the reorder RPC reports an error.
+                        shell.move_before_first(created, from);
+                        shell.list().as_deref() == Some(expected)
+                    },
+                )?,
+            }
         } else {
             self.resolve(from, destination)?
         };
@@ -475,8 +523,9 @@ impl Workspaces {
             },
             || shell.current(),
             &uninterrupted,
-            |target| shell.switch(target),
+            |target| shell.switch(from, target),
         )
+        .map(TransferOutcome::Moved)
     }
 }
 
@@ -746,30 +795,82 @@ mod tests {
     }
 
     #[test]
+    fn moving_the_only_window_outward_keeps_the_current_desktop() {
+        let (a, b, spare) = (DesktopId(9), DesktopId(4), DesktopId(2));
+        for order in [&[a][..], &[a, spare], &[a, b, spare]] {
+            // Even if later desktops are occupied, they cannot justify a prepend.
+            assert_eq!(
+                relative_transfer(order, a, false, |candidates| {
+                    assert_eq!(candidates, [a]);
+                    Some(false)
+                }),
+                Some(RelativeTransfer::Stay(1))
+            );
+        }
+        for order in [&[a, b][..], &[a, b, spare], &[a, b, spare, DesktopId(7)]] {
+            assert_eq!(
+                relative_transfer(order, b, true, |candidates| {
+                    assert_eq!(candidates, &order[1..]);
+                    Some(false)
+                }),
+                Some(RelativeTransfer::Stay(2))
+            );
+        }
+        for next in [false, true] {
+            assert_eq!(
+                relative_transfer(&[a], a, next, |_| Some(false)),
+                Some(RelativeTransfer::Stay(1))
+            );
+            assert_eq!(relative_transfer(&[a], a, next, |_| None), None);
+        }
+    }
+
+    #[test]
+    fn an_independent_window_or_an_interior_destination_allows_a_relative_transfer() {
+        let (a, b, spare) = (DesktopId(9), DesktopId(4), DesktopId(2));
+        let order = [a, b, spare];
+        assert_eq!(
+            relative_transfer(&order, a, false, |_| Some(true)),
+            Some(RelativeTransfer::Prepend)
+        );
+        assert_eq!(
+            relative_transfer(&order, b, false, |_| panic!(
+                "previous desktop already exists"
+            )),
+            Some(RelativeTransfer::Neighbor(a))
+        );
+        assert_eq!(
+            relative_transfer(&order, b, true, |_| Some(true)),
+            Some(RelativeTransfer::Neighbor(spare))
+        );
+        assert_eq!(
+            relative_transfer(&[a, b], b, true, |_| Some(true)),
+            Some(RelativeTransfer::PrepareNext)
+        );
+        // A transient empty desktop between two occupied ones is a valid destination.
+        assert_eq!(
+            relative_transfer(&order, a, true, |tail| Some(tail.contains(&spare))),
+            Some(RelativeTransfer::Neighbor(b))
+        );
+        assert_eq!(
+            relative_transfer(&order, DesktopId(99), true, |_| panic!("unknown source")),
+            None
+        );
+    }
+
+    #[test]
     fn transferring_before_the_first_desktop_inserts_one_slot_and_preserves_the_spare() {
         let (first, second, spare, new) =
             (DesktopId(31), DesktopId(8), DesktopId(42), DesktopId(17));
         for order in [vec![first], vec![first, second, spare]] {
             let expected: Vec<_> = std::iter::once(new).chain(order.iter().copied()).collect();
-            let target = previous_transfer_target(
+            let target = prepend_transfer_target(
                 order,
-                first,
                 || Some(new),
                 |created, proposed| created == new && proposed == expected,
             );
             assert_eq!(target, Some((new, expected)));
         }
-        let order = vec![first, second, spare];
-        let unexpected_create = || panic!("created a desktop without reaching the first one");
-        let unexpected_move = |_, _: &[DesktopId]| panic!("reordered an existing desktop");
-        assert_eq!(
-            previous_transfer_target(order.clone(), second, unexpected_create, unexpected_move),
-            Some((first, order.clone()))
-        );
-        assert_eq!(
-            previous_transfer_target(order, new, unexpected_create, unexpected_move),
-            None
-        );
     }
 
     #[test]
@@ -778,16 +879,15 @@ mod tests {
         let new = DesktopId(9);
         for returned in [None, Some(from)] {
             assert!(
-                previous_transfer_target(
+                prepend_transfer_target(
                     vec![from],
-                    from,
                     || returned,
                     |_, _| { panic!("only a newly created desktop may be repositioned") }
                 )
                 .is_none()
             );
         }
-        assert!(previous_transfer_target(vec![from], from, || Some(new), |_, _| false).is_none());
+        assert!(prepend_transfer_target(vec![from], || Some(new), |_, _| false).is_none());
     }
 
     #[test]
@@ -795,30 +895,22 @@ mod tests {
         use crate::cli::Destination;
 
         let order = [0x33, 0x55, 0x11].map(DesktopId);
-        let by_position = |from, destination: Destination, transferring_window| {
-            stationary_index(
-                &order,
-                from,
-                destination.into(),
-                transferring_window,
-                |_| panic!("position is sufficient"),
-            )
+        let by_position = |from, destination: Destination| {
+            stationary_index(&order, from, destination.into(), |_| {
+                panic!("position is sufficient")
+            })
         };
         let stationary = |from, destination: Destination, occupancy| {
-            stationary_index(&order, from, destination.into(), true, |tail| {
+            stationary_index(&order, from, destination.into(), |tail| {
                 assert_eq!(tail.first(), Some(&from));
                 occupancy
             })
         };
-        assert_eq!(
-            by_position(order[2], Destination::Number(50), true),
-            Some(3)
-        );
-        assert_eq!(by_position(order[0], Destination::Previous, false), Some(1));
-        assert_eq!(by_position(order[0], Destination::Previous, true), None);
-        assert_eq!(by_position(order[0], Destination::Number(1), true), Some(1));
-        assert_eq!(by_position(order[0], Destination::Number(0), true), None);
-        assert_eq!(by_position(DesktopId(999), Destination::Next, true), None);
+        assert_eq!(by_position(order[2], Destination::Number(50)), Some(3));
+        assert_eq!(by_position(order[0], Destination::Previous), Some(1));
+        assert_eq!(by_position(order[0], Destination::Number(1)), Some(1));
+        assert_eq!(by_position(order[0], Destination::Number(0)), None);
+        assert_eq!(by_position(DesktopId(999), Destination::Next), None);
         for destination in [Destination::Next, Destination::Number(99)] {
             assert_eq!(stationary(order[1], destination, Some(false)), Some(2));
             assert_eq!(stationary(order[1], destination, Some(true)), None);

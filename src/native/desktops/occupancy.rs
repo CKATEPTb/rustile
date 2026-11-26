@@ -1,6 +1,11 @@
+//! Decide whether a virtual desktop contains application windows across all
+//! monitors. Minimized windows still occupy their desktop. An unresolved
+//! window can prevent cleanup because it might belong to an apparently empty one.
+
 use std::cell::OnceCell;
 use std::collections::HashSet;
 
+use windows::core::{IUnknown, Interface};
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, TYPE_E_ELEMENTNOTFOUND};
 use windows_sys::Win32::Graphics::Dwm::DWM_CLOAKED_SHELL;
 use windows_sys::Win32::System::Threading::{
@@ -30,7 +35,9 @@ pub(crate) fn is_pinned(id: DesktopId) -> bool {
 /// Snapshot all monitors and virtual desktops independently of tiling eligibility.
 /// The caller owns the COM apartment. None means that emptiness is unproven.
 pub(crate) fn occupied(desktops: &[DesktopId]) -> Option<HashSet<DesktopId>> {
-    scan(desktops, |windows| occupied_set(windows, desktops))
+    scan(desktops, |windows, _| {
+        occupied_set(windows.map(|(_, home)| home), desktops)
+    })
 }
 
 fn occupied_set(
@@ -54,7 +61,70 @@ fn occupied_set(
 
 /// A known window suffices for navigation; proving emptiness requires every observation.
 pub(crate) fn any_occupied(desktops: &[DesktopId], candidates: &[DesktopId]) -> Option<bool> {
-    scan(desktops, |windows| any_match(windows, candidates))
+    scan(desktops, |windows, _| {
+        any_match(windows.map(|(_, home)| home), candidates)
+    })
+}
+
+/// Would the source (first in `candidates`) or any listed successor still
+/// contain a task if Explorer moved this view?
+pub(crate) fn any_other_occupied(
+    desktops: &[DesktopId],
+    candidates: &[DesktopId],
+    moving: Id,
+) -> Option<bool> {
+    scan(desktops, |windows, views| {
+        let moving_view = OnceCell::new();
+        any_other_match(windows, candidates, moving, |id| {
+            let views = views.get_or_init(ApplicationViews::connect).as_ref()?;
+            let identity = |hwnd| views.for_window(hwnd).ok()?.cast::<IUnknown>().ok();
+            let moving_view = moving_view
+                .get_or_init(|| identity(moving as HWND))
+                .as_ref()?;
+            let hwnd = id as HWND;
+            let other = match views.for_window(hwnd) {
+                Ok(view) => view.cast::<IUnknown>().ok()?,
+                Err(hr) if hr.0 == TYPE_E_ELEMENTNOTFOUND => {
+                    // An owned dialog may have no shell view of its own.
+                    let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+                    if owner.is_null() {
+                        return None;
+                    }
+                    if owner == moving as HWND || owner == hwnd {
+                        return Some(owner == moving as HWND);
+                    }
+                    identity(owner)?
+                }
+                Err(_) => return None,
+            };
+            Some(moving_view.as_raw() == other.as_raw())
+        })
+    })
+}
+
+fn any_other_match(
+    windows: impl Iterator<Item = (Id, Result<DesktopId, ()>)>,
+    candidates: &[DesktopId],
+    moving: Id,
+    mut shares_view: impl FnMut(Id) -> Option<bool>,
+) -> Option<bool> {
+    let source = *candidates.first()?;
+    let other = windows.filter_map(|(id, home)| {
+        if id == moving {
+            return None;
+        }
+        // A view assigned to a successor already proves that the source is
+        // not the last occupied desktop, even if its COM view is unavailable.
+        if home == Ok(source) {
+            match shares_view(id) {
+                Some(true) => return None,
+                None => return Some(Err(())),
+                Some(false) => {}
+            }
+        }
+        Some(home)
+    });
+    any_match(other, candidates)
 }
 
 fn any_match(
@@ -74,7 +144,10 @@ fn any_match(
 
 fn scan<T>(
     desktops: &[DesktopId],
-    inspect: impl FnOnce(&mut dyn Iterator<Item = Result<DesktopId, ()>>) -> Option<T>,
+    inspect: impl FnOnce(
+        &mut dyn Iterator<Item = (Id, Result<DesktopId, ()>)>,
+        &OnceCell<Option<ApplicationViews>>,
+    ) -> Option<T>,
 ) -> Option<T> {
     let service = Service::connect()?;
     if service.shell.is_null() {
@@ -87,10 +160,12 @@ fn scan<T>(
         return None;
     }
     let views = OnceCell::new();
-    let mut observations = windows
-        .into_iter()
-        .filter_map(|id| window_desktop(id as HWND, &service, &views, desktops).transpose());
-    let result = inspect(&mut observations)?;
+    let mut observations = windows.into_iter().filter_map(|id| {
+        window_desktop(id as HWND, &service, &views, desktops)
+            .transpose()
+            .map(|home| (id, home))
+    });
+    let result = inspect(&mut observations, &views)?;
     (shell_window() == service.shell).then_some(result)
 }
 
@@ -379,7 +454,7 @@ mod tests {
         assert!(!task_style(
             WS_VISIBLE,
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            "Yasb"
+            "DesktopPanel"
         ));
         assert!(!task_style(WS_VISIBLE, 0, "Progman"));
         assert!(!task_style(WS_VISIBLE, 0, "Rustile.ResizeHint"));
@@ -418,6 +493,44 @@ mod tests {
         );
         assert_eq!(any_match([Err(()), Ok(other)].into_iter(), &[target]), None);
         assert_eq!(any_match([Ok(other)].into_iter(), &[target]), Some(false));
+    }
+
+    #[test]
+    fn transfer_occupancy_counts_independent_views_and_skips_the_moving_window() {
+        let (source, elsewhere) = (DesktopId(1), DesktopId(2));
+        let moving = 100;
+        let owned_dialog = 101;
+        let peer = 102;
+        let query = |entries: &[(Id, Result<DesktopId, ()>)]| {
+            any_other_match(entries.iter().copied(), &[source], moving, |id| match id {
+                101 => Some(true),
+                102 => Some(false),
+                103 => None,
+                _ => panic!("only potential peers need a shell view lookup"),
+            })
+        };
+        let alone = [
+            (moving, Ok(source)),
+            (200, Ok(elsewhere)),
+            (owned_dialog, Ok(source)),
+        ];
+        assert_eq!(query(&alone), Some(false));
+        assert_eq!(
+            query(&[(moving, Ok(source)), (peer, Ok(source))]),
+            Some(true)
+        );
+        assert_eq!(query(&[(moving, Ok(source)), (103, Ok(source))]), None);
+        assert_eq!(query(&[(moving, Ok(source)), (200, Err(()))]), None);
+        assert_eq!(query(&[(200, Err(())), (peer, Ok(source))]), Some(true));
+        assert_eq!(
+            any_other_match(
+                [(200, Ok(elsewhere))].into_iter(),
+                &[source, elsewhere],
+                moving,
+                |_| panic!("view already belongs to another desktop")
+            ),
+            Some(true)
+        );
     }
 
     #[test]

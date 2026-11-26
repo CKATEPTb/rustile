@@ -1,1 +1,23 @@
-/target/
+# Cargo and local release builds
+target/
+/dist/
+*.rs.bk
+
+# Editor and OS files
+.idea/
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local environments and signing keys
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+
+# Icon generation
+__pycache__/
+*.py[cod]

@@ -1,8 +1,12 @@
+//! Route low-level keyboard and wheel input on a dedicated hook thread.
+//! A matched window command carries its target to the message loop, where
+//! foreground and eligibility can be checked again before touching the window.
+
 use crate::i18n::{Msg, render, tr};
 use std::cell::Cell;
 use std::io;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -12,7 +16,11 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+mod registered;
 mod wheel;
+
+#[cfg(test)]
+pub(super) use registered::test_registered_ownership;
 
 use super::{
     CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_FIRST, DESKTOP_NEXT, DESKTOP_PREVIOUS, DESKTOP_TENTH,
@@ -25,6 +33,11 @@ use crate::settings::{Chord, Settings, Shortcut};
 
 static TRANSFER_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
 static DESKTOP_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
+static DESKTOP_GESTURE: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn desktop_gesture_generation() -> usize {
+    DESKTOP_GESTURE.load(Ordering::Acquire)
+}
 
 pub(super) fn watch_desktop_focus() {
     DESKTOP_FOCUS_WATCH.store(true, Ordering::Relaxed);
@@ -262,6 +275,9 @@ enum Press {
     #[default]
     Up,
     Passed,
+    // Windows received the key-down for a hotkey registered by Rustile. Suppress
+    // repeats even if modifiers change, then let Windows see the matching up.
+    Registered,
     Consumed,
     ResizeStep(isize),
 }
@@ -319,6 +335,7 @@ struct Routing {
     focus: Snapshot,
     keys: Routes,
     revision: usize,
+    registered: registered::Hotkeys,
 }
 
 static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
@@ -333,6 +350,7 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         // Arm them only when the user's actual settings have been loaded.
         keys: Routes::EMPTY,
         revision: 0,
+        registered: registered::Hotkeys::default(),
     })
 });
 
@@ -466,16 +484,27 @@ impl BoundCommand {
         pending.transition(self.id, self.focus_epoch)
     }
 
-    fn post(self, pending: Pending) {
-        let Some(target) = self.target else { return };
+    fn record_gesture(self) {
         // Arm at the gesture so input arriving before the pump handles the
         // command can cancel automatic activation.
         if uses_desktop_focus(self.id) {
             watch_desktop_focus();
         }
+        if is_desktop_move(self.id) || DesktopDestination::from_command(self.id).is_some() {
+            DESKTOP_GESTURE.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn message(self, pending: Pending) -> (usize, Option<Pending>) {
         let transition = self.transition(pending);
         let ticket = transition.map_or(0, |next| next.ticket);
-        let command = (ticket << 8) | self.id as usize;
+        ((ticket << 8) | self.id as usize, transition)
+    }
+
+    fn post(self, pending: Pending) {
+        let Some(target) = self.target else { return };
+        self.record_gesture();
+        let (command, transition) = self.message(pending);
         if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
             && let Some(next) = transition
         {
@@ -532,6 +561,13 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
         {
             let slot = usize::from(vk);
             let previous = HELD.with(|held| held[slot].get());
+            if previous == Press::Registered {
+                if down {
+                    return 1;
+                }
+                HELD.with(|held| held[slot].set(Press::Up));
+                return unsafe { CallNextHookEx(null_mut(), code, message, data) };
+            }
             let pending = PENDING.get();
             let binding = if down && previous != Press::Passed && Chord::supports_key(vk.into()) {
                 bound_command(slot, pending)
@@ -556,6 +592,20 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             let mut press = previous;
             let action = press.route(down, binding);
             HELD.with(|held| held[slot].set(press));
+            if previous == Press::Up
+                && let Action::Command(_) = action
+                && let Some(binding) = binding
+                && let Some(chord) = registered::owned_chord(u16::from(vk), binding)
+            {
+                HELD.with(|held| held[slot].set(Press::Registered));
+                let result = unsafe { CallNextHookEx(null_mut(), code, message, data) };
+                // Older global hooks can still consume a key. Only stage it
+                // when Windows will receive the original physical input.
+                if result == 0 {
+                    registered::accept(chord, binding, pending, event.time);
+                }
+                return result;
+            }
             if action != Action::Pass {
                 if let Action::Command(_) = action
                     && let Some(binding) = binding
@@ -663,10 +713,19 @@ impl Hook {
             })
             .map_err(|e| render(Msg::SystemShortcutThread, &[("detail", &e.to_string())]))?;
         match status.recv() {
-            Ok(Ok(id)) => Ok(Self {
-                thread: Some(thread),
-                id,
-            }),
+            Ok(Ok(id)) => {
+                // Register on the manager's thread so Explorer's foreground
+                // permission accompanies the real WM_HOTKEY in the UI pump.
+                let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+                let Routing {
+                    keys, registered, ..
+                } = &mut *routing;
+                registered.configure(keys);
+                Ok(Self {
+                    thread: Some(thread),
+                    id,
+                })
+            }
             result => {
                 let _ = thread.join();
                 match result {
@@ -683,8 +742,21 @@ impl Hook {
     pub(super) fn set_settings(&self, settings: &Settings) {
         let keys = Routes::new(settings);
         let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+        routing.registered.configure(&keys);
         routing.keys = keys;
         routing.revision = routing.revision.wrapping_add(1);
+    }
+
+    /// Convert only a registered shortcut seen by our input hook. The caller
+    /// can pass foreground permission to Explorer immediately on success.
+    pub(super) fn translate_hotkey(&self, message: &mut MSG) -> bool {
+        message.message == WM_HOTKEY
+            && message.hwnd.is_null()
+            && ROUTING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .registered
+                .translate(message)
     }
 }
 
@@ -697,7 +769,9 @@ impl Drop for Hook {
         end_transfer_focus_watch();
         end_desktop_focus_watch();
         update(None, Mode::Normal, 0);
-        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
+        let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+        routing.registered.configure(&Routes::EMPTY);
+        routing.keys = Routes::EMPTY;
     }
 }
 

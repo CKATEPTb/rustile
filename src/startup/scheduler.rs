@@ -1,3 +1,7 @@
+//! Manages elevated logon through a Task Scheduler entry scoped to the user's
+//! SID. Its name alone is insufficient to claim it. The registration and its
+//! access controls are checked before an existing task can be updated or removed.
+
 use crate::i18n::{Msg, render, tr};
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};

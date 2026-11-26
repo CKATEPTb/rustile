@@ -1,3 +1,7 @@
+//! Visual feedback for window focus, drag targets and keyboard resizing. The
+//! resize popups display the current edge and configured keys without taking
+//! activation from the application being resized.
+
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::{

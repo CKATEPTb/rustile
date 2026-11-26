@@ -1,3 +1,8 @@
+//! Builds the Windows resources and translation tables embedded in rustile.exe.
+//! Each message has the same named parameters in all twelve languages, though
+//! translations may reorder them. The runtime indexes the generated UTF-8
+//! data directly, so the installed application needs no catalog files.
+
 use std::collections::BTreeMap;
 use std::{env, fs, path::PathBuf};
 
@@ -101,6 +106,7 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
         }
+        println!("cargo:rerun-if-changed=LICENSE");
         println!("cargo:rerun-if-changed=assets/rustile.rc");
         println!("cargo:rerun-if-changed=assets/rustile.manifest");
         println!("cargo:rerun-if-changed=assets/rustile.ico");

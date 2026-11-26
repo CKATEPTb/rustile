@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="208" viewBox="0 0 640 208" role="img" aria-labelledby="title description">
+  <title id="title">Opening a terminal from the editor</title>
+  <desc id="description">Before, the focused editor and the browser each occupy half the screen. After opening the terminal, the editor and terminal share the left column. The terminal has focus, and the browser stays in place.</desc>
+  <style>
+    .surface { fill: #edf3f8; }
+    .desktop { fill: #cad7e2; }
+    .tile { fill: #fcfdff; stroke: #879eb1; }
+    .active { fill: #dff2ff; stroke: #2276ae; stroke-width: 3; }
+    text { fill: #26394b; font-family: "Segoe UI", system-ui, sans-serif; }
+    .heading { font-size: 21px; font-weight: 600; }
+    .label { font-size: 21px; font-weight: 500; text-anchor: middle; }
+    .focused-label { fill: #164f76; font-weight: 650; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #151e28; }
+      .desktop { fill: #0e1720; }
+      .tile { fill: #263341; stroke: #687d8f; }
+      .active { fill: #153f60; stroke: #53b9f7; }
+      text { fill: #e3ecf5; }
+      .focused-label { fill: #dcf4ff; }
+    }
+  </style>
+  <rect class="surface" width="640" height="208" rx="12"/>
+  <g transform="translate(16 0)">
+    <text class="heading" x="4" y="37">Before</text>
+    <rect class="desktop" y="52" width="296" height="140" rx="8"/>
+    <rect class="active" x="6" y="58" width="139" height="128" rx="4"/>
+    <rect class="tile" x="151" y="58" width="139" height="128" rx="4"/>
+    <text class="label focused-label" x="75.5" y="129">Editor</text>
+    <text class="label" x="220.5" y="129">Browser</text>
+  </g>
+  <g transform="translate(328 0)">
+    <text class="heading" x="4" y="37">After opening Terminal</text>
+    <rect class="desktop" y="52" width="296" height="140" rx="8"/>
+    <rect class="tile" x="6" y="58" width="139" height="61" rx="4"/>
+    <rect class="active" x="6" y="125" width="139" height="61" rx="4"/>
+    <rect class="tile" x="151" y="58" width="139" height="128" rx="4"/>
+    <text class="label" x="75.5" y="96">Editor</text>
+    <text class="label focused-label" x="75.5" y="163">Terminal</text>
+    <text class="label" x="220.5" y="129">Browser</text>
+  </g>
+</svg>

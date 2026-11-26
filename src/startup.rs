@@ -1,3 +1,8 @@
+//! Owns the current user's logon registration and its disabled, normal and
+//! elevated states. Normal logon uses the per-user Run key. Elevated logon
+//! uses Task Scheduler and points at the protected installation. Reading the
+//! OS registration also picks up changes made outside the tray menu.
+
 pub(crate) mod consent;
 mod protected;
 mod scheduler;

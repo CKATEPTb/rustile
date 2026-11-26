@@ -1,3 +1,7 @@
+//! Maps window-manager actions to keyboard and wheel chords. Defaults from the
+//! scheme and per-action overrides feed both the editor and input hooks.
+//! Changing a chord can affect other actions that own it in the same mode.
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

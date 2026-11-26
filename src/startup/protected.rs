@@ -1,3 +1,8 @@
+//! Publishes the executable in the system Program Files directory. The elevated
+//! installer verifies the source against its loaded image, checks ownership and
+//! write permissions along the destination path, then replaces the installed
+//! file only after the staged copy has been flushed.
+
 use crate::i18n::{Msg, render, tr};
 use std::{
     ffi::{OsString, c_void},

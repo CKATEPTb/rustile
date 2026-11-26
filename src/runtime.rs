@@ -1,3 +1,7 @@
+//! Run the primary instance and dispatch work on its Windows message loop.
+//! Input hooks and the command pipe deliver requests to the loop; WinEvent
+//! callbacks enqueue observations for processing after the callback returns.
+
 mod cli_commands;
 mod desktop_watch;
 mod dynamic_desktops;
@@ -6,6 +10,7 @@ pub(crate) use instance::installation_lock;
 mod ipc;
 pub(crate) use ipc::{InstallOwner, owner_image, quit_owner};
 mod shortcuts;
+pub(crate) mod taskbar_attention;
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +68,7 @@ pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
 pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
 const DESKTOP_SETTLE_MS: u32 = 160;
 const FOCUS_SETTLE_MS: u32 = 40;
+const SHELL_FOCUS_GRACE_MS: u32 = 200;
 const FOCUS_CONFIRM_MS: u32 = 450;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,6 +547,8 @@ struct DesktopFocus {
     arrival: Option<DesktopId>,
     confirm_arrival: bool,
     switch_before_first_sample: bool,
+    gesture: usize,
+    quiet_until: Option<Instant>,
 }
 
 impl DesktopFocus {
@@ -558,6 +566,33 @@ impl DesktopFocus {
         self.pending = Some((target, 0));
         self.arrival = Some(target);
         self.confirm_arrival = true;
+        self.quiet_until = None;
+        self.gesture = shortcuts::desktop_gesture_generation();
+    }
+
+    // Explorer assigns foreground asynchronously, even after CurrentDesktop
+    // has changed. Give it first choice. The input hook can see a newer
+    // navigation gesture before this thread has processed its command.
+    fn wait_for_shell(
+        &mut self,
+        actual: Option<DesktopId>,
+        queued: bool,
+        generation: usize,
+        now: Instant,
+    ) -> Option<u32> {
+        let (target, _) = self.pending?;
+        if actual != Some(target) {
+            return None;
+        }
+        if queued {
+            return Some(FOCUS_SETTLE_MS);
+        }
+        if self.gesture != generation {
+            self.gesture = generation;
+            self.quiet_until = Some(now + Duration::from_millis(SHELL_FOCUS_GRACE_MS.into()));
+        }
+        let remaining = self.quiet_until?.saturating_duration_since(now);
+        (!remaining.is_zero()).then(|| remaining.as_millis().max(1) as u32)
     }
 
     fn stop_watching(&mut self) {
@@ -620,6 +655,8 @@ fn pump(
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
     let mut focus_timer = MessageTimer::default();
+    let mut attention = taskbar_attention::TaskbarAttention::default();
+    let mut attention_timer = MessageTimer::default();
     let mut navigation: VecDeque<QueuedStep> = VecDeque::new();
     let mut cli_arrival = None;
     let mut following: Option<Rc<TransferIdentity>> = None;
@@ -650,6 +687,9 @@ fn pump(
         if message.message == WM_QUIT {
             return Ok(None);
         }
+        if hook.translate_hotkey(&mut message) {
+            workspaces.allow_shell_foreground();
+        }
         let watching_desktops = desktop_watch
             .as_ref()
             .is_some_and(|w| w.watching_desktops());
@@ -659,6 +699,7 @@ fn pump(
         let timer_fired = desktop_timer.take(&message);
         let inventory_due = inventory_timer.take(&message);
         let focus_due = focus_timer.take(&message);
+        let attention_due = attention_timer.take(&message);
         let mut inventory_changed = desktops_changed;
         let work_area_changed = tray.take_work_area_change();
         // Some appbars reserve their edge without a settings broadcast. Read
@@ -669,8 +710,14 @@ fn pump(
         }
         let mut settling = desktops_changed;
         let mut desktop_switch_event = false;
+        let mut recheck_attention = desktops_changed || timer_fired || focus_due || attention_due;
         let mut focus_event = false;
         for (event, id) in events.drain(..) {
+            match event {
+                EVENT_OBJECT_DESTROY => attention.forget(id),
+                EVENT_OBJECT_CLOAKED | EVENT_SYSTEM_DESKTOPSWITCH => recheck_attention = true,
+                _ => {}
+            }
             // Child controls and focus changes don't change which desktops have
             // windows. A destroyed HWND can no longer be checked for a parent.
             let changed_window = matches!(
@@ -795,8 +842,15 @@ fn pump(
             } else {
                 manager.layout_desktop()
             };
-            if desktop_focus.observe(actual) {
+            let changed = actual.is_some() && actual != desktop_focus.observed;
+            recheck_attention |= changed;
+            if changed {
+                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
+            }
+            let external = desktop_focus.observe(actual);
+            if external {
                 // Task View or another program selected a different desktop.
+                manager.begin_desktop_focus();
                 shortcuts::watch_desktop_focus();
                 navigation.clear();
                 if destination
@@ -810,24 +864,43 @@ fn pump(
                 if actual != manager.layout_desktop() {
                     desktop_timer.schedule_within(FOCUS_SETTLE_MS);
                 }
-                focus_timer.schedule(FOCUS_SETTLE_MS);
-            } else if focus_due {
+            }
+            if changed && following.is_none() && desktop_focus.pending.is_some() {
+                desktop_focus.quiet_until =
+                    Some(Instant::now() + Duration::from_millis(SHELL_FOCUS_GRACE_MS.into()));
+                focus_timer.schedule(SHELL_FOCUS_GRACE_MS);
+            }
+            if focus_due && !external {
                 desktop_focus.recheck_arrival(actual);
                 let awaiting_switch = desktop_focus.awaiting_switch();
-                let delay = desktop_focus.settle(actual, |id| match &following {
-                    Some(window) => manager.restore_transferred_focus(
-                        window,
-                        id,
-                        shortcuts::transfer_focus_uninterrupted,
-                    ),
-                    None => {
-                        manager.restore_desktop_focus(id, shortcuts::desktop_focus_uninterrupted)
-                    }
+                let deferred = if following.is_none() {
+                    desktop_focus.wait_for_shell(
+                        actual,
+                        !navigation.is_empty() || destination.is_some(),
+                        shortcuts::desktop_gesture_generation(),
+                        Instant::now(),
+                    )
+                } else {
+                    None
+                };
+                let gesture = desktop_focus.gesture;
+                let delay = deferred.or_else(|| {
+                    desktop_focus.settle(actual, |id| match &following {
+                        Some(window) => manager.restore_transferred_focus(
+                            window,
+                            id,
+                            shortcuts::transfer_focus_uninterrupted,
+                        ),
+                        None => manager.restore_desktop_focus(id, || {
+                            shortcuts::desktop_focus_uninterrupted()
+                                && gesture == shortcuts::desktop_gesture_generation()
+                        }),
+                    })
                 });
                 if let Some(delay) = delay {
                     focus_timer.schedule(delay);
                 } else {
-                    // One check after the Shell animation also catches a late
+                    // One check after Explorer settles also catches a late
                     // loss without a foreground event. Further checks need an event.
                     if std::mem::take(&mut desktop_focus.confirm_arrival)
                         && desktop_focus.arrival == actual
@@ -875,7 +948,6 @@ fn pump(
                         explicit_window,
                         client: Some(request),
                     });
-                    inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 }
                 Err(error) => request.respond(Err(error)),
             }
@@ -908,7 +980,6 @@ fn pump(
                     explicit_window: false,
                     client: None,
                 });
-                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 if ticket != 0 {
                     refresh(manager, ticket);
                 }
@@ -931,6 +1002,7 @@ fn pump(
                     {
                         // With no starting tile, this press selects an app.
                         // Subsequent directional presses navigate from it.
+                        manager.begin_desktop_focus();
                         desktop_focus.arrived_or_requested(actual);
                         focus_timer.schedule_within(1);
                     }
@@ -943,8 +1015,19 @@ fn pump(
                 DispatchMessageW(&message);
             }
         }
-        // A wheel can send several detents before Explorer reports the first
-        // switch. Resolve the next step against its confirmed destination.
+        if attention.update(
+            tray.take_taskbar_flashes(),
+            recheck_attention,
+            |window| {
+                (taskbar_attention::FlashWindow::capture(window.id) == Some(window))
+                    .then(|| manager.desktop_membership(window.id))
+            },
+            taskbar_attention::FlashWindow::stop,
+        ) {
+            attention_timer.schedule_within(DESKTOP_SETTLE_MS);
+        }
+        // Rapid arrows or wheel detents can precede Explorer's first arrival.
+        // Resolve each relative step from the last confirmed desktop.
         while !desktop_focus.awaiting_switch()
             && cli_arrival.is_none()
             && !following.as_ref().is_some_and(|window| {
@@ -984,7 +1067,12 @@ fn pump(
                     ));
                     continue;
                 }
-                if let Some(index) = workspaces.stationary_index(destination, window.is_some()) {
+                // Relative window transfers decide their edge using the other
+                // windows on the desktop, in the same path as a keyboard move.
+                let relative_transfer =
+                    window.is_some() && matches!(destination, DesktopDestination::Relative { .. });
+                if !relative_transfer && let Some(index) = workspaces.stationary_index(destination)
+                {
                     request.respond(Ok(index.to_string()));
                     continue;
                 }
@@ -993,22 +1081,11 @@ fn pump(
             } else {
                 None
             };
-            // Preparing a destination at either end can change the desktop
-            // order even if the transfer or switch does not finish.
-            if workspaces.supported {
-                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
-            }
-            let (from, to, followed) = match &window {
-                None => {
-                    let Some((from, to)) = workspaces.navigate(destination) else {
-                        if let Some(request) = client {
-                            request
-                                .respond(Err("Could not switch to the requested desktop.".into()));
-                        }
-                        continue;
-                    };
-                    (from, to, true)
-                }
+            let gesture = shortcuts::desktop_gesture_generation();
+            let movement = match &window {
+                None => workspaces
+                    .navigate(destination)
+                    .map(|(from, to)| (from, to, true)),
                 Some(window) => {
                     shortcuts::watch_transfer_focus();
                     let moved = workspaces.transfer(
@@ -1017,21 +1094,44 @@ fn pump(
                         |from| valid_target(window, from),
                         shortcuts::transfer_focus_uninterrupted,
                     );
-                    let Some(moved) = moved else {
-                        shortcuts::end_transfer_focus_watch();
-                        if let Some(request) = client {
-                            request.respond(Err(
-                                "Windows could not move the window to the requested desktop."
-                                    .into(),
-                            ));
+                    match moved {
+                        Some(dynamic_desktops::TransferOutcome::Stayed(index)) => {
+                            if following.is_none() {
+                                shortcuts::end_transfer_focus_watch();
+                            }
+                            if let Some(request) = client {
+                                request.respond(Ok(index.to_string()));
+                            }
+                            continue;
                         }
-                        continue;
-                    };
-                    if window.matches() {
-                        manager.transferred_window(window.id(), moved.to);
+                        Some(dynamic_desktops::TransferOutcome::Moved(moved)) => {
+                            if window.matches() {
+                                manager.transferred_window(window.id(), moved.to);
+                            }
+                            Some((moved.from, moved.to, moved.followed))
+                        }
+                        None => {
+                            shortcuts::end_transfer_focus_watch();
+                            None
+                        }
                     }
-                    (moved.from, moved.to, moved.followed)
                 }
+            };
+            // Even a failed attempt can leave a partially prepared desktop.
+            // A confirmed stationary transfer above needs no reconciliation.
+            if workspaces.supported {
+                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
+            }
+            let Some((from, to, followed)) = movement else {
+                if let Some(request) = client {
+                    let error = if window.is_some() {
+                        "Windows could not move the window to the requested desktop."
+                    } else {
+                        "Could not switch to the requested desktop."
+                    };
+                    request.respond(Err(error.into()));
+                }
+                continue;
             };
             following = window.filter(|_| followed);
             if following.is_none() {
@@ -1041,7 +1141,9 @@ fn pump(
             manager.cancel_mouse_move();
             desktop_timer.schedule_within(FOCUS_SETTLE_MS);
             if followed {
+                manager.begin_desktop_focus();
                 desktop_focus.requested(from, to);
+                desktop_focus.gesture = gesture;
                 focus_timer.schedule(FOCUS_SETTLE_MS);
             }
             if let Some(request) = client {

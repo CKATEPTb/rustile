@@ -1,0 +1,4 @@
+#include <windows.h>
+1 RT_MANIFEST "../assets/rustile.manifest"
+101 ICON "../assets/rustile.ico"
+RUSTILE_LICENSE RCDATA "../LICENSE"

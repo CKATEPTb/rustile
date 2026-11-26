@@ -1,3 +1,7 @@
+//! Lays out the shortcut editor by topic, then paginates its action rows to
+//! fit the available work area. Placement and painting share the same groups
+//! and order as keyboard navigation.
+
 use super::slots::{button, create};
 use super::*;
 use Shortcut::*;

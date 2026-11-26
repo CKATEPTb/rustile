@@ -8,6 +8,9 @@ enum Gesture {
     Resize,
 }
 
+/// An in-progress native move/size gesture. Preview frames are evaluated
+/// against the committed layout so dragging a divider back to its origin can
+/// restore the initial proportions even after reaching a size limit.
 pub(super) struct MouseDrag {
     pub target: Id,
     tile: Option<Rect>,

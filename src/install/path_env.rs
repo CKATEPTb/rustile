@@ -1,3 +1,7 @@
+//! Registers the installation directory in the machine PATH. The duplicate
+//! check recognizes the Program Files variable aliases in expandable values.
+//! Appending preserves the original registry type and existing entries.
+
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;

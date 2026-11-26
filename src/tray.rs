@@ -1,3 +1,7 @@
+//! Owns the notification icon, tray popup and settings editors on the UI thread.
+//! Control callbacks queue edits for the runtime. The runtime applies the
+//! change and returns the effective settings for the tray to display.
+
 mod exclusion_window;
 mod menu;
 mod paint;
@@ -27,6 +31,7 @@ use windows_sys::Win32::{
 use windows_sys::core::w;
 
 use crate::i18n::{Msg, render, tr};
+use crate::runtime::taskbar_attention::FlashWindow;
 use crate::settings::{Command, Settings, exclusions::ExclusionRule};
 use crate::startup::Startup;
 use exclusion_window::ExclusionWindow;
@@ -41,6 +46,7 @@ const RELEASE_HIDDEN_CONTROLS: u32 = WM_APP + 21;
 const ICON_ID: u32 = 1;
 const HEADER_ICON_DIP: i32 = 20;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+const HSHELL_FLASH: usize = (HSHELL_REDRAW | HSHELL_HIGHBIT) as usize;
 const RETRY: usize = 1;
 const DISMISS_AFTER_ICON_PRESS: usize = 2;
 const CLASS: *const u16 = w!("Rustile.Tray");
@@ -71,6 +77,8 @@ struct State {
     tray_icon: HICON,
     header_icon: Cell<Option<(i32, HICON)>>,
     taskbar_created: u32,
+    shell_hook: u32,
+    taskbar_flashes: RefCell<Vec<FlashWindow>>,
     work_area_changed: Cell<bool>,
     registered: Cell<bool>,
     choosing_language: Cell<bool>,
@@ -134,6 +142,8 @@ impl Tray {
                 tray_icon: icon,
                 header_icon: Cell::default(),
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+                shell_hook: RegisterWindowMessageW(w!("SHELLHOOK")),
+                taskbar_flashes: RefCell::default(),
                 work_area_changed: Cell::new(false),
                 registered: Cell::new(false),
                 choosing_language: Cell::new(false),
@@ -173,6 +183,7 @@ impl Tray {
                     &[("error", &io::Error::last_os_error().to_string())],
                 ));
             }
+            state.register_shell_hook(hwnd);
             state.register_icon(hwnd);
             Ok(Self { hwnd, state })
         }
@@ -285,6 +296,10 @@ impl Tray {
         self.state.work_area_changed.take()
     }
 
+    pub(crate) fn take_taskbar_flashes(&self) -> Vec<FlashWindow> {
+        self.state.taskbar_flashes.take()
+    }
+
     pub fn take_command(&self) -> Option<Command> {
         let command = self
             .state
@@ -301,6 +316,7 @@ impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
             KillTimer(self.hwnd, RETRY);
+            DeregisterShellHookWindow(self.hwnd);
             if self.state.registered.get() {
                 Shell_NotifyIconW(NIM_DELETE, &self.state.icon_data(self.hwnd));
             }
@@ -345,6 +361,23 @@ pub(crate) fn check_work_area_notifications() {
         assert!(!tray.take_work_area_change());
         assert_eq!(drain_wakes(), 1, "one wake-up per notification burst");
     }
+    let shell_hook = tray.state.shell_hook;
+    assert_ne!(shell_hook, 0);
+    unsafe {
+        SendMessageW(hwnd, shell_hook, HSHELL_REDRAW as usize, hwnd as isize);
+        SendMessageW(hwnd, shell_hook, HSHELL_FLASH, 0);
+    }
+    assert!(tray.take_taskbar_flashes().is_empty());
+    assert_eq!(drain_wakes(), 0);
+    for _ in 0..3 {
+        unsafe { SendMessageW(hwnd, shell_hook, HSHELL_FLASH, hwnd as isize) };
+    }
+    assert_eq!(drain_wakes(), 1, "one wake-up per flash burst");
+    assert_eq!(
+        tray.take_taskbar_flashes(),
+        [FlashWindow::capture(hwnd as isize).unwrap()]
+    );
+    assert!(tray.take_taskbar_flashes().is_empty());
     assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
     assert_eq!(unsafe { GetForegroundWindow() }, foreground);
 }
@@ -395,6 +428,12 @@ impl State {
             *out = c;
         }
         data
+    }
+
+    fn register_shell_hook(&self, hwnd: HWND) {
+        if self.shell_hook != 0 {
+            unsafe { RegisterShellHookWindow(hwnd) };
+        }
     }
 
     fn register_icon(&self, hwnd: HWND) {
@@ -965,6 +1004,21 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         let Some(state) = ptr.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
+        if msg != 0 && msg == state.shell_hook {
+            if wp == HSHELL_FLASH
+                && let Some(window) = FlashWindow::capture(lp)
+            {
+                let mut flashes = state.taskbar_flashes.borrow_mut();
+                if !flashes.contains(&window) {
+                    flashes.push(window);
+                    if flashes.len() == 1 {
+                        // Desktop membership is queried by the pump, outside this callback.
+                        PostMessageW(hwnd, WM_NULL, 0, 0);
+                    }
+                }
+            }
+            return 0;
+        }
         // This top-level window receives broadcasts even when its flyout is
         // closed. A sent message alone does not return control to GetMessage.
         if (matches!(msg, WM_SETTINGCHANGE | WM_DISPLAYCHANGE | WM_DPICHANGED)
@@ -1009,6 +1063,8 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 0
             }
             m if m != 0 && m == state.taskbar_created => {
+                DeregisterShellHookWindow(hwnd);
+                state.register_shell_hook(hwnd);
                 state.registered.set(false);
                 state.attempts.set(0);
                 state.register_icon(hwnd);

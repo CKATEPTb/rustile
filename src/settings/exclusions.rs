@@ -1,3 +1,8 @@
+//! Compiles user rules for opting windows out of tiling. Constraints within a
+//! rule must all match, and any matching rule excludes the window. The compiled
+//! matcher records which properties to query so ordinary window events can
+//! avoid reading unused process names, titles or classes.
+
 use crate::i18n::{Msg, render, tr};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};

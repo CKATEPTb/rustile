@@ -1,3 +1,5 @@
+//! Formats OS failures for the English CLI while retaining the Win32 error code.
+
 use std::io::Error;
 
 /// Windows formats OS errors in the user's display language. Use Rust's

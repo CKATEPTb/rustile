@@ -23,6 +23,8 @@ fn gutter<T>(
     best.map(|(_, split, edge)| (split, edge))
 }
 
+/// Split the leaf currently at `at`. Its first child's share of the space
+/// left after the gutter is `part / whole`, so the cut scales with its parent.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Cut {
     pub at: usize,
@@ -51,9 +53,9 @@ impl Cut {
     }
 }
 
-// Roots are the packed grid cells. Each cut keeps its first child at the
-// original index and appends the second. Resolving the BSP takes one linear
-// pass without allocating a boxed node for each window.
+/// A sequence of binary cuts rooted in the packed grid cells. Each cut leaves
+/// its first child at the original index and appends its second child, so a
+/// single forward pass resolves all leaf rectangles.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Bsp(pub Vec<Cut>);
 

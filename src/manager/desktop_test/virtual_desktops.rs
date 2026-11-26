@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use windows_sys::Win32::{
     Foundation::RECT,
     Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
@@ -12,6 +14,7 @@ use windows_sys::Win32::{
 
 use super::{Direction, Id, Manager, Rect, frame, set_visible, settle, until};
 use crate::native::desktops::{DesktopId, DesktopMembership};
+use crate::native::{FocusAttempt, FocusMethod};
 
 const A: DesktopId = DesktopId(1);
 const B: DesktopId = DesktopId(2);
@@ -313,12 +316,14 @@ fn first_show_after_all_hide(
 // foreground reads and the final activation so the user's desktop stays active.
 fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], floating: Id) {
     use std::cell::Cell;
+    manager.begin_desktop_focus();
     let [other, remembered] = tiles;
     let foreground = Cell::new(0);
-    let activate = |id, previous| {
+    let activate = |id, previous, method| {
+        assert_eq!(method, FocusMethod::ApplicationView);
         assert_eq!(foreground.get(), previous);
         foreground.set(id);
-        true
+        FocusAttempt::Submitted
     };
     assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
     assert_eq!(foreground.get(), remembered);
@@ -326,6 +331,7 @@ fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], fl
     let history = std::mem::take(&mut manager.workspace.focus_history);
     let first_tile = manager.workspace.layout.placements(manager.area.unwrap())[0].0;
     foreground.set(0);
+    manager.begin_desktop_focus();
     assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
     assert_eq!(
         foreground.get(),
@@ -334,44 +340,94 @@ fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], fl
     );
     manager.workspace.focus_history = history;
     foreground.set(0);
-    let mut refused = Vec::new();
+    manager.begin_desktop_focus();
+    let mut candidates = Vec::new();
     assert!(manager.restore_desktop_focus_with(
         desktop,
         || foreground.get(),
-        |id, previous| {
-            refused.push(id);
-            id != remembered && activate(id, previous)
+        |id, previous, method| {
+            candidates.push(id);
+            if id == remembered {
+                FocusAttempt::Unavailable
+            } else {
+                activate(id, previous, method)
+            }
         }
     ));
     assert_eq!(
-        refused,
+        candidates,
         [remembered, other],
-        "a rejected tile cannot starve its peer"
+        "a tile with no available activation path cannot starve its peer"
     );
     foreground.set(0);
+    manager.begin_desktop_focus();
     assert!(!manager.restore_desktop_focus_with(
         desktop,
         || foreground.get(),
-        |id, _| {
+        |id, _, method| {
             assert_eq!(id, remembered);
-            true // Shell accepted the request, but no window received focus.
+            assert_eq!(method, FocusMethod::ApplicationView);
+            FocusAttempt::ShellAccepted
         }
     ));
-    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
-    assert_eq!(
-        foreground.get(),
-        other,
-        "an unconfirmed request advances on retry"
-    );
+    let mut request = manager.desktop_focus_request.get().unwrap();
+    // Control expiration explicitly while the real DWM cloak settles.
+    assert!(request.fallback_after.is_some());
+    request.fallback_after = Some(Instant::now() + Duration::from_secs(60));
+    manager.desktop_focus_request.set(Some(request));
+    for _ in 0..3 {
+        assert!(!manager.restore_desktop_focus_with(
+            desktop,
+            || foreground.get(),
+            |_, _, _| panic!("activated another window while waiting for Explorer"),
+        ));
+    }
+    cloak(remembered, true);
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |_, _, _| panic!("competed with a queued request during a transient cloak"),
+    ));
+    cloak(remembered, false);
+    foreground.set(remembered);
+    assert!(manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |_, _, _| panic!("reissued a satisfied request"),
+    ));
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || 0,
+        |_, _, _| panic!("a transient loss after confirmation reissued the same activation"),
+    ));
+    request.fallback_after = Some(Instant::now());
+    manager.desktop_focus_request.set(Some(request));
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || 0,
+        |id, previous, method| {
+            assert_eq!(
+                (id, previous, method),
+                (remembered, 0, FocusMethod::Foreground)
+            );
+            FocusAttempt::Unavailable // Background caller lacks foreground permission.
+        },
+    ));
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || 0,
+        |_, _, _| panic!("repeated the denied foreground fallback"),
+    ));
+    manager.begin_desktop_focus();
     assert!(
-        !manager.restore_desktop_focus_with(desktop, || 0, |_, _| false),
-        "Windows can decline foreground activation during a switch"
+        !manager.restore_desktop_focus_with(desktop, || 0, |_, _, _| FocusAttempt::Unavailable),
+        "no window had an available activation path"
     );
 
     assert!(manager.restore_desktop_focus_with(
         desktop,
         || floating,
-        |_, _| panic!("floating app lost focus")
+        |_, _, _| panic!("floating app lost focus")
     ));
     let first_read = Cell::new(true);
     assert!(!manager.restore_desktop_focus_with(
@@ -381,17 +437,51 @@ fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], fl
         } else {
             floating
         },
-        |_, _| panic!("overrode a user click during candidate selection"),
+        |_, _, _| panic!("overrode a user click during candidate selection"),
     ));
     set_visible(remembered, false);
     foreground.set(0);
+    manager.begin_desktop_focus();
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |id, _, method| {
+            assert_eq!(id, other);
+            assert_eq!(method, FocusMethod::ApplicationView);
+            FocusAttempt::Submitted
+        },
+    ));
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |_, _, _| panic!("repeated activation of the only visible app"),
+    ));
+    manager.begin_desktop_focus();
     assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
     assert_eq!(foreground.get(), other);
+    foreground.set(0);
+    manager.begin_desktop_focus();
+    assert!(!manager.restore_desktop_focus_with(
+        desktop,
+        || foreground.get(),
+        |id, _, _| {
+            assert_eq!(id, other);
+            FocusAttempt::Submitted
+        },
+    ));
     set_visible(other, false);
+    set_visible(remembered, true);
+    assert!(manager.restore_desktop_focus_with(desktop, || foreground.get(), activate));
+    assert_eq!(
+        foreground.get(),
+        remembered,
+        "the pending target disappeared"
+    );
+    set_visible(remembered, false);
     assert!(!manager.restore_desktop_focus_with(
         desktop,
         || 0,
-        |_, _| panic!("activated a hidden tile")
+        |_, _, _| panic!("activated a hidden tile")
     ));
     set_visible(other, true);
     set_visible(remembered, true);
@@ -440,28 +530,54 @@ pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area
     assert!(identity.matches());
 
     let foreground = Cell::new(other);
+    manager.begin_desktop_focus();
+    assert!(!manager.restore_transferred_focus_with(
+        moving,
+        B,
+        || foreground.get(),
+        |previous, method| {
+            assert_eq!(method, FocusMethod::ApplicationView);
+            assert_eq!(previous, other);
+            FocusAttempt::ShellAccepted
+        }
+    ));
+    assert!(!manager.restore_transferred_focus_with(
+        moving,
+        B,
+        || foreground.get(),
+        |_, _| panic!("resent activation of a transferred window"),
+    ));
+    let mut request = manager.desktop_focus_request.get().unwrap();
+    request.fallback_after = Some(Instant::now());
+    manager.desktop_focus_request.set(Some(request));
+    foreground.set(0);
     assert!(manager.restore_transferred_focus_with(
         moving,
         B,
         || foreground.get(),
-        |previous| {
-            assert_eq!(previous, other);
+        |previous, method| {
+            assert_eq!((previous, method), (0, FocusMethod::Foreground));
             foreground.set(moving);
-            true
-        }
+            FocusAttempt::Submitted
+        },
     ));
-    assert_eq!(foreground.get(), moving);
+    assert!(manager.restore_transferred_focus_with(
+        moving,
+        B,
+        || foreground.get(),
+        |_, _| panic!("lost confirmed transfer focus"),
+    ));
     assert!(manager.restore_transferred_focus_with(
         moving,
         B,
         || floating,
-        |_| panic!("floating focus stolen")
+        |_, _| panic!("floating focus stolen")
     ));
     assert!(!manager.restore_transferred_focus_with(
         moving,
         A,
         || 0,
-        |_| panic!("activated on wrong desktop")
+        |_, _| panic!("activated on wrong desktop")
     ));
     assert!(manager.restore_transferred_focus(&identity, B, || false));
     drop(identity);
@@ -481,19 +597,20 @@ pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area
     manager.reconcile_desktop();
     assert_eq!(windows.map(frame), before);
     let foreground = Cell::new(0);
+    manager.begin_desktop_focus();
     assert!(manager.restore_desktop_focus_with(
         A,
         || foreground.get(),
-        |_, _| panic!("ordinary desktop navigation must leave focus to Windows while paused"),
+        |_, _, _| panic!("ordinary desktop navigation must leave focus to Windows while paused"),
     ));
     assert_eq!(foreground.get(), 0);
     assert!(manager.restore_transferred_focus_with(
         moving,
         A,
         || foreground.get(),
-        |_| {
+        |_, _| {
             foreground.set(moving);
-            true
+            FocusAttempt::Submitted
         }
     ));
     assert_eq!(
@@ -543,13 +660,14 @@ fn focus_owned_dialog(manager: &mut Manager, owner: Id) {
             && !crate::native::hidden_or_minimized(dialog)
             && !crate::native::window_enabled(owner)
     });
+    manager.begin_desktop_focus();
     let foreground = Cell::new(0);
     let recovered = manager.restore_desktop_focus_with(
         A,
         || foreground.get(),
-        |id, _| {
+        |id, _, _| {
             foreground.set(id);
-            true
+            FocusAttempt::Submitted
         },
     );
     // The dialog inherits the owner's GUID only while its own membership is unknown.
@@ -617,14 +735,15 @@ pub(super) fn fullscreen_transfer(manager: &mut Manager, windows: [Id; 6], _area
             assert_eq!([left, right].map(frame), peers);
         }
         let foreground = Cell::new(0);
+        manager.begin_desktop_focus();
         assert!(identity.matches());
         assert!(manager.restore_transferred_focus_with(
             identity.id(),
             destination,
             || foreground.get(),
-            |_| {
+            |_, _| {
                 foreground.set(game);
-                true
+                FocusAttempt::Submitted
             },
         ));
         assert_eq!(foreground.get(), game);
@@ -728,7 +847,7 @@ pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     assert!(!manager.restore_desktop_focus_with(
         B,
         || 0,
-        |_, _| panic!("activated an outgoing tile")
+        |_, _, _| panic!("activated an outgoing tile")
     ));
 
     manager.move_window(a[0], Direction::Right);

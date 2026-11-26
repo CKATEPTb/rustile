@@ -1,8 +1,15 @@
+//! Private Explorer COM interfaces for creating, ordering and switching desktops.
+//! Register a build in `supported_abi` only after checking the interface IDs
+//! and vtable slots. A failed mutation may already have reached Explorer; the
+//! caller must observe the new state before deciding whether to retry.
+
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
-use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, IServiceProvider};
+use windows::Win32::System::Com::{
+    CLSCTX_LOCAL_SERVER, CoAllowSetForegroundWindow, CoCreateInstance, IServiceProvider,
+};
 use windows::Win32::UI::Shell::Common::IObjectArray;
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
 use windows_sys::Win32::Foundation::{
@@ -98,7 +105,7 @@ impl ApplicationViews {
         unsafe { shell_provider()?.QueryService(&Self::IID).ok() }
     }
 
-    fn for_window(&self, hwnd: HWND) -> Result<ApplicationView, HRESULT> {
+    pub(super) fn for_window(&self, hwnd: HWND) -> Result<ApplicationView, HRESULT> {
         let mut view = None;
         let hr = unsafe { (self.vtable().for_window)(self.as_raw(), hwnd, &mut view) };
         if hr.0 != 0 {
@@ -179,10 +186,6 @@ struct ManagerVtable {
 }
 
 impl ShellManager {
-    fn connect() -> Option<Self> {
-        unsafe { shell_provider()?.QueryService(&DESKTOP_SERVICE).ok() }
-    }
-
     fn object<T>(&self, method: Out<T>) -> Option<T> {
         let mut result = None;
         unsafe { method(self.as_raw(), &mut result) }.ok().ok()?;
@@ -279,8 +282,20 @@ fn supports_installed_shell() -> bool {
         .is_some_and(|build| supported_abi(build, revision))
 }
 
+struct ShellConnection {
+    tray: HWND,
+    provider: IServiceProvider,
+    manager: ShellManager,
+}
+
+impl ShellConnection {
+    fn allow_foreground(&self) -> bool {
+        unsafe { CoAllowSetForegroundWindow(&self.provider, None) }.is_ok()
+    }
+}
+
 pub(crate) struct DesktopShell {
-    service: RefCell<Option<(HWND, ShellManager)>>,
+    service: RefCell<Option<ShellConnection>>,
     // Release the COM interfaces before leaving their apartment.
     _apartment: Apartment,
 }
@@ -305,20 +320,27 @@ impl DesktopShell {
     }
 
     fn with_manager<T>(&self, call: impl FnOnce(&ShellManager) -> Option<T>) -> Option<T> {
+        self.with_connection(|shell| call(&shell.manager))
+    }
+
+    fn with_connection<T>(&self, call: impl FnOnce(&ShellConnection) -> Option<T>) -> Option<T> {
         let tray = shell_window();
         let mut service = self.service.borrow_mut();
         if tray.is_null() {
             service.take();
             return None;
         }
-        if service
-            .as_ref()
-            .is_none_or(|(old_tray, _)| *old_tray != tray)
-        {
+        if service.as_ref().is_none_or(|shell| shell.tray != tray) {
             service.take();
-            *service = Some((tray, ShellManager::connect()?));
+            let provider = shell_provider()?;
+            let manager = unsafe { provider.QueryService(&DESKTOP_SERVICE) }.ok()?;
+            *service = Some(ShellConnection {
+                tray,
+                provider,
+                manager,
+            });
         }
-        let result = call(&service.as_ref()?.1);
+        let result = call(service.as_ref()?);
         if result.is_none() {
             // Reconnect on a subsequent observation. Never replay a Shell
             // mutation: an RPC failure can arrive after Explorer committed it.
@@ -345,6 +367,11 @@ impl DesktopShell {
 
     pub(crate) fn current(&self) -> Option<DesktopId> {
         self.with_manager(ShellManager::current)
+    }
+
+    pub(crate) fn allow_shell_foreground(&self) -> bool {
+        self.with_connection(|shell| Some(shell.allow_foreground()))
+            .unwrap_or(false)
     }
 
     pub(crate) fn create(&self) -> Option<DesktopId> {
@@ -389,14 +416,27 @@ impl DesktopShell {
         .unwrap_or(false)
     }
 
-    pub(crate) fn switch(&self, id: DesktopId) -> bool {
-        self.with_manager(|manager| {
-            let desktop = manager.find(id)?;
+    pub(crate) fn switch(&self, from: DesktopId, to: DesktopId) -> bool {
+        self.with_connection(|shell| {
+            let manager = &shell.manager;
+            if from == to {
+                return Some(manager.current()? == from);
+            }
+            let desktop = manager.find(to)?;
+            // Pass the caller's foreground permission to the local server that
+            // will select the arriving window. A denied grant still permits
+            // the desktop switch itself.
+            shell.allow_foreground();
+            if manager.current()? != from {
+                return Some(false);
+            }
+            // Both relative and numbered shortcuts use the direct Shell switch.
             unsafe { (manager.vtable().switch)(manager.as_raw(), desktop.as_raw()) }
                 .ok()
-                .ok()
+                .ok()?;
+            Some(true)
         })
-        .is_some()
+        .unwrap_or(false)
     }
 
     pub(crate) fn can_move_window(&self, id: Id, from: DesktopId) -> bool {
@@ -477,11 +517,12 @@ mod tests {
     }
 
     #[test]
-    fn move_view_slots_match_the_supported_shell_manager() {
+    fn move_and_switch_slots_match_the_supported_shell_manager() {
         let slot = size_of::<usize>();
         assert_eq!(std::mem::offset_of!(ManagerVtable, move_view), 4 * slot);
         assert_eq!(std::mem::offset_of!(ManagerVtable, can_move_view), 5 * slot);
         assert_eq!(std::mem::offset_of!(ManagerVtable, current), 6 * slot);
+        assert_eq!(std::mem::offset_of!(ManagerVtable, switch), 9 * slot);
     }
 
     fn move_for_test(shell: &DesktopShell, id: DesktopId, index: u32) -> bool {
@@ -497,6 +538,23 @@ mod tests {
         assert!(supported_abi(26100, 2605));
         assert!(supported_abi(26200, 9974));
         assert!(!supported_abi(26201, 9000));
+    }
+
+    #[test]
+    #[ignore = "read-only COM probe for a supported live Explorer session"]
+    fn shell_exposes_foreground_transfer() {
+        use windows::Win32::System::Com::IForegroundTransfer;
+        let shell = DesktopShell::connect().expect("supported Explorer");
+        assert_eq!(
+            shell.with_connection(|shell| Some(
+                shell.provider.cast::<IForegroundTransfer>().is_ok()
+            )),
+            Some(true)
+        );
+        let current = shell.current().expect("current desktop");
+        assert!(shell.switch(current, current));
+        let stale = DesktopId(!current.0);
+        assert!(!shell.switch(stale, stale));
     }
 
     #[test]

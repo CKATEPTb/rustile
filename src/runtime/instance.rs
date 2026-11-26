@@ -1,3 +1,7 @@
+//! Elect one manager for a Windows session's window station and Win32 desktop.
+//! Explorer virtual desktops share that manager. A separate installation mutex
+//! serializes competing replacements of the installed executable.
+
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

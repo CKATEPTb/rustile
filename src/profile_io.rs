@@ -1,3 +1,7 @@
+//! Runs operations on the user's writable profile with that user's ordinary
+//! privileges. In an elevated manager the scope is thread-local. On leaving
+//! the scope, the guard restores the thread's prior impersonation state.
+
 use std::{
     io,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},

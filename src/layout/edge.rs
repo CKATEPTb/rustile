@@ -1,9 +1,9 @@
 use super::{Bsp, Cut, Direction, Grid, Layout, Rect, Shape};
 
 impl Layout {
-    // Moving outwards can turn a split: two windows beside one another become
-    // a stack. Start with an adjacent pair, then try the enclosing BSP branches
-    // from smallest to largest when the pair's native minima prevent that turn.
+    /// Give the active tile an edge of the smallest region that can accommodate
+    /// the move. Two windows beside each other can become a stack. Larger
+    /// enclosing branches are tried when the pair's native minima prevent it.
     pub(super) fn move_to_edge(&mut self, slot: usize, dir: Direction, area: Rect) -> bool {
         let cells = self.cell_rects(area);
         let from = cells[slot];

@@ -1,3 +1,8 @@
+//! Tiling geometry independent of Win32. Callers supply window IDs, minimum
+//! frame sizes and the usable screen rectangle, all dimensions in pixels.
+//! Read [`Layout::placements`] to obtain the frames visible to the user,
+//! including the intermediate arrangement of a directional move.
+
 mod bsp;
 mod drop_target;
 mod edge;
@@ -22,11 +27,13 @@ pub use drop_target::DropZone;
 use grid::{Grid, Shape};
 use vacancy::Vacancy;
 
+/// Opaque window identity for geometry computations. On Windows this is an HWND value.
 pub type Id = isize;
 const GAP: i32 = 8;
 const MIN_WIDTH: i32 = 160;
 const MIN_HEIGHT: i32 = 100;
 
+/// A screen-space rectangle with an origin and a size, in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -546,6 +553,8 @@ pub(crate) enum ResizeStep {
     },
 }
 
+/// One workspace's root grid, ordered binary cuts and window assignments.
+/// An intermediate move keeps the underlying slots for the second keypress.
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
     grid: Grid,
@@ -659,6 +668,7 @@ impl Layout {
         released
     }
 
+    /// Resolve permanent cells before applying intermediate moves.
     pub fn cell_rects(&self, area: Rect) -> Vec<Rect> {
         self.bsp.rects(self.grid.rects(area), self.grid.gap)
     }
@@ -672,6 +682,7 @@ impl Layout {
         visible
     }
 
+    /// Resolve each occupant's visible frame, including any shared regions.
     pub fn placements(&self, area: Rect) -> Vec<(Id, Rect)> {
         self.occupants
             .iter()

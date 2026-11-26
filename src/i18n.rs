@@ -1,3 +1,7 @@
+//! Selects the interface language and reads translations embedded by the build.
+//! Language discriminants index the TSV columns. With no stored preference,
+//! the first supported Windows UI language wins, with English as the fallback.
+
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
