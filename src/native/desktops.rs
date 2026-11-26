@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CO_E_OBJNOTCONNECTED, CO_E_SERVER_STOPPING, HANDLE, HWND, RPC_E_CHANGED_MODE,
-    RPC_E_DISCONNECTED, RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE,
+    RPC_E_DISCONNECTED, RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE, TYPE_E_ELEMENTNOTFOUND,
 };
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -119,20 +119,21 @@ impl Service {
         ))
     }
 
+    fn is_current(&self, hwnd: HWND) -> Result<bool, HRESULT> {
+        let mut current = 0;
+        let result = unsafe {
+            (self.vtable().is_current)(self.interface.as_ptr().cast(), hwnd, &mut current)
+        };
+        (result == 0).then_some(current != 0).ok_or(result)
+    }
+
     fn query(&self, hwnd: HWND) -> Result<DesktopMembership, HRESULT> {
         let id = self.desktop_id(hwnd)?;
         // The shell also returns GUID_NULL for windows without a workspace.
         if id.0 == 0 {
             return Ok(DesktopMembership::Unknown);
         }
-        let mut current = 0;
-        let result = unsafe {
-            (self.vtable().is_current)(self.interface.as_ptr().cast(), hwnd, &mut current)
-        };
-        if result < 0 {
-            return Err(result);
-        }
-        Ok(if current != 0 {
+        Ok(if self.is_current(hwnd)? {
             DesktopMembership::Current(id)
         } else {
             DesktopMembership::Other(id)
@@ -146,13 +147,45 @@ impl Drop for Service {
     }
 }
 
+fn opening_membership(
+    assigned: Result<DesktopId, HRESULT>,
+    is_current: impl FnOnce() -> Result<bool, HRESULT>,
+    current_desktop: impl Fn() -> Option<DesktopId>,
+) -> Result<DesktopMembership, HRESULT> {
+    use DesktopMembership::*;
+    match assigned {
+        Ok(id) if occupancy::is_pinned(id) => Ok(Unknown),
+        Ok(id) if id.0 != 0 => Ok(if is_current()? {
+            Current(id)
+        } else {
+            Other(id)
+        }),
+        Ok(_) | Err(TYPE_E_ELEMENTNOTFOUND) => {
+            // An ordinary new HWND can have no registered Shell view until
+            // ShowWindow. Only speculate while Explorer's selection is stable.
+            let Some(before) = current_desktop() else {
+                return Ok(Unknown);
+            };
+            Ok(if is_current()? && current_desktop() == Some(before) {
+                Current(before)
+            } else {
+                Unknown
+            })
+        }
+        Err(hr) => Err(hr),
+    }
+}
+
 pub(crate) struct Desktops {
     isolated: bool,
     com_result: HRESULT,
     service: RefCell<Option<Service>>,
+    opening_shell: RefCell<Option<shell::DesktopShell>>,
     retry_after: Cell<Option<Instant>>,
     #[cfg(test)]
     fixture: Option<std::collections::HashMap<Id, DesktopMembership>>,
+    #[cfg(test)]
+    pub(crate) opening_hint_fixture: Option<(Id, DesktopId)>,
 }
 
 impl Desktops {
@@ -167,13 +200,55 @@ impl Desktops {
             isolated,
             com_result,
             service: RefCell::default(),
+            opening_shell: RefCell::default(),
             retry_after: Cell::default(),
             #[cfg(test)]
             fixture: None,
+            #[cfg(test)]
+            opening_hint_fixture: None,
         }
     }
 
     pub fn membership(&self, id: Id) -> DesktopMembership {
+        self.lookup(id, Service::query)
+    }
+
+    /// A placement hint for a newly created HWND. Admission and
+    /// changes to a workspace always require the regular membership query.
+    pub(crate) fn opening_desktop(&self, id: Id) -> Option<DesktopId> {
+        #[cfg(test)]
+        if let Some((window, desktop)) = self.opening_hint_fixture
+            && window == id
+        {
+            return Some(desktop);
+        }
+        let membership = self.lookup(id, |service, hwnd| {
+            if service.shell.is_null() || shell_window() != service.shell {
+                return Err(CO_E_OBJNOTCONNECTED);
+            }
+            opening_membership(
+                service.desktop_id(hwnd),
+                || service.is_current(hwnd),
+                || {
+                    let mut cached = self.opening_shell.borrow_mut();
+                    if cached.is_none() {
+                        *cached = shell::DesktopShell::connect();
+                    }
+                    cached.as_ref()?.current()
+                },
+            )
+        });
+        match membership {
+            DesktopMembership::Current(id) if !occupancy::is_pinned(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn lookup(
+        &self,
+        id: Id,
+        query: impl Fn(&Service, HWND) -> Result<DesktopMembership, HRESULT>,
+    ) -> DesktopMembership {
         #[cfg(test)]
         if let Some(fixture) = &self.fixture {
             return fixture
@@ -197,7 +272,7 @@ impl Desktops {
             let Some(service) = cached.as_ref() else {
                 break;
             };
-            match service.query(id as HWND) {
+            match query(service, id as HWND) {
                 Ok(membership) => return membership,
                 Err(code)
                     if matches!(
@@ -232,10 +307,117 @@ impl Desktops {
 impl Drop for Desktops {
     fn drop(&mut self) {
         self.service.get_mut().take();
+        self.opening_shell.get_mut().take();
         // S_OK and S_FALSE both need balancing on this thread. An apartment
         // already initialized in a different model remains owned by its caller.
         if self.com_result >= 0 {
             unsafe { CoUninitialize() };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use DesktopMembership::*;
+
+    #[test]
+    #[ignore = "requires interactive Explorer; creates and destroys a never-shown test HWND"]
+    fn hidden_opening_hint_identifies_the_selected_desktop_before_admission() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, IsWindowVisible, WS_OVERLAPPEDWINDOW,
+        };
+        let desktops = Desktops::new();
+        let shell = shell::DesktopShell::connect().expect("supported interactive Explorer");
+        let current = shell.current().expect("selected desktop");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("Rustile hidden opening test"),
+                WS_OVERLAPPEDWINDOW,
+                150,
+                150,
+                640,
+                480,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let opening = desktops.opening_desktop(hwnd as Id);
+        let membership = desktops.membership(hwnd as Id);
+        let still_hidden = unsafe { IsWindowVisible(hwnd) } == 0;
+        unsafe { DestroyWindow(hwnd) };
+        assert_eq!(
+            shell.current(),
+            Some(current),
+            "selection changed during the probe"
+        );
+        assert!(still_hidden);
+        assert_eq!(opening, Some(current));
+        // Whichever registration timing Explorer used, the hint cannot assign
+        // this HWND to a different real workspace.
+        assert!(membership == Unknown || membership == Current(current));
+    }
+
+    #[test]
+    fn unregistered_openings_require_a_positive_current_check_between_matching_selections() {
+        let home = DesktopId(10);
+        for missing in [Ok(DesktopId(0)), Err(TYPE_E_ELEMENTNOTFOUND)] {
+            assert_eq!(
+                opening_membership(missing, || Ok(true), || Some(home)),
+                Ok(Current(home))
+            );
+            assert_eq!(
+                opening_membership(missing, || Ok(false), || Some(home)),
+                Ok(Unknown)
+            );
+            assert_eq!(
+                opening_membership(missing, || Err(-1), || Some(home)),
+                Err(-1)
+            );
+            assert_eq!(
+                opening_membership(missing, || panic!(), || None),
+                Ok(Unknown)
+            );
+            let first = Cell::new(true);
+            assert_eq!(
+                opening_membership(
+                    missing,
+                    || Ok(true),
+                    || {
+                        Some(if first.replace(false) {
+                            home
+                        } else {
+                            DesktopId(20)
+                        })
+                    }
+                ),
+                Ok(Unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_other_and_pinned_windows_and_query_errors_do_not_borrow_the_current_desktop() {
+        let home = DesktopId(10);
+        let pinned = DesktopId(0xc2ddea68_66f2_4cf9_8264_1bfd00fbbbac);
+        let no_shell = || panic!("explicit association must not sample the selected desktop");
+        assert_eq!(
+            opening_membership(Ok(home), || Ok(true), no_shell),
+            Ok(Current(home))
+        );
+        assert_eq!(
+            opening_membership(Ok(home), || Ok(false), no_shell),
+            Ok(Other(home))
+        );
+        assert_eq!(
+            opening_membership(Ok(pinned), || panic!(), no_shell),
+            Ok(Unknown)
+        );
+        assert_eq!(opening_membership(Err(-1), || panic!(), no_shell), Err(-1));
     }
 }

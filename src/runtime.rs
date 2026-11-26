@@ -561,6 +561,7 @@ fn pump(
     let mut message = MSG::default();
     let mut events = Vec::new();
     let mut desktop_timer = MessageTimer::default();
+    let mut opening_timer = MessageTimer::default();
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
     let mut focus_timer = MessageTimer::default();
@@ -601,6 +602,7 @@ fn pump(
         }
         PENDING.with_borrow_mut(|pending| std::mem::swap(pending, &mut events));
         let has_events = !events.is_empty();
+        let opening_due = opening_timer.take(&message);
         let timer_fired = desktop_timer.take(&message);
         let inventory_due = inventory_timer.take(&message);
         let focus_due = focus_timer.take(&message);
@@ -648,8 +650,18 @@ fn pump(
             if event == EVENT_SYSTEM_DESKTOPSWITCH || id == 0 {
                 manager.finish_mode();
                 manager.cancel_mouse_move();
-            } else {
+            } else if event != EVENT_OBJECT_CREATE || changed_window {
                 manager.event(event, id);
+            }
+        }
+        if opening_due {
+            manager.check_openings();
+        }
+        if has_events || opening_due {
+            if let Some(delay) = manager.next_opening_check() {
+                opening_timer.schedule_within(delay);
+            } else {
+                opening_timer.cancel();
             }
         }
         let unresolved = manager.take_desktop_retry();
@@ -675,7 +687,7 @@ fn pump(
                 desktop_timer.schedule(DESKTOP_SETTLE_MS * delay);
             }
         }
-        if has_events || reconcile {
+        if has_events || reconcile || opening_due {
             refresh(manager, 0);
         }
         let needs_scan = inventory_changed && workspaces.activity();

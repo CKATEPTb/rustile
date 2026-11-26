@@ -19,7 +19,7 @@ internal static class DesktopSmoke {
     const int TraySelect = 0x400, TrayContext = 0x7b, TrayKeyboard = 0x401;
     const int ShowFixtureDialog = 0x8001, RequestFocus = 0x8002;
     const int ReadGeometryChanges = 0x8003, SetFixtureCloak = 0x8004;
-    const int SetFixtureMode = 0x8005;
+    const int SetFixtureMode = 0x8005, ShowPreparedFixture = 0x8006;
     enum FixtureMode { Normal, Borderless, Maximize, AppBounds, RestoreNormalStyle }
     const int ExtendedFrameBounds = 9, WindowCornerPreference = 33;
     static readonly int[] FixtureCorners = { 2, 3, 1 }; // round, small, square
@@ -125,6 +125,7 @@ internal static class DesktopSmoke {
 
     class Fixture : Form {
         Rectangle lastBounds;
+        Rectangle firstShownBounds;
         readonly Rectangle normalBounds;
         int normalStyle;
         int geometryChanges;
@@ -132,12 +133,16 @@ internal static class DesktopSmoke {
             Text = "Rustile fixture " + index;
             var work = Screen.PrimaryScreen.WorkingArea;
             StartPosition = FormStartPosition.Manual;
-            Bounds = new Rectangle(work.X + 30 + index * 28, work.Y + 25 + index * 25, 320 + index * 15, 230);
+            Bounds = InitialBounds(index);
             if (index == 5) MinimumSize = new Size(160, TallMinimum(work));
             if (dragPeer) MinimumSize = DragPeerMinimum(work);
             int corners = FixtureCorners[index % FixtureCorners.Length];
             Require(DwmSetWindowAttribute(Handle, WindowCornerPreference, ref corners, sizeof(int)) == 0, "Cannot configure fixture corners");
             normalBounds = DesktopSmoke.Bounds(Handle);
+        }
+        public static Rectangle InitialBounds(int index) {
+            var work = Screen.PrimaryScreen.WorkingArea;
+            return new Rectangle(work.X + 30 + index * 28, work.Y + 25 + index * 25, 320 + index * 15, 230);
         }
         bool ApplyMode(FixtureMode mode) {
             var bounds = normalBounds;
@@ -188,6 +193,10 @@ internal static class DesktopSmoke {
                 m.Result = (IntPtr)DwmSetWindowAttribute(Handle, 13 /* DWMWA_CLOAK */, ref value, sizeof(int));
             } else if (m.Msg == SetFixtureMode) {
                 m.Result = ApplyMode((FixtureMode)m.WParam.ToInt32()) ? (IntPtr)1 : IntPtr.Zero;
+            } else if (m.Msg == ShowPreparedFixture) {
+                var before = DesktopSmoke.Bounds(Handle);
+                Show();
+                m.Result = firstShownBounds == before ? (IntPtr)1 : IntPtr.Zero;
             } else {
                 if (m.Msg == 0x112 /* WM_SYSCOMMAND */ && (m.WParam.ToInt64() & 0xfff0) == 0xf030 /* SC_MAXIMIZE */)
                     RemoveProp(m.HWnd, "Rustile.Smoke.ExpectNoMaximize");
@@ -196,6 +205,8 @@ internal static class DesktopSmoke {
                     Rect rect;
                     if (GetWindowRect(m.HWnd, out rect)) {
                         var bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+                        if (firstShownBounds.IsEmpty && IsWindowVisible(m.HWnd))
+                            firstShownBounds = bounds;
                         if (bounds != lastBounds) {
                             lastBounds = bounds;
                             geometryChanges++;
@@ -495,6 +506,53 @@ internal static class DesktopSmoke {
         Rect r;
         Require(GetWindowRect(window, out r), "Cannot read fixture window bounds");
         return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+    }
+    static void VerifyFirstPlacement(string rustile, string self, string desktop, IntPtr peer, Rectangle peerOriginal) {
+        using (var manager = new Child(rustile, "", desktop, true)) {
+            var area = Screen.PrimaryScreen.WorkingArea;
+            int gap = (int)((8 * GetDpiForSystem() + 48) / 96);
+            var whole = Rectangle.Inflate(area, -gap, -gap);
+            Until("First placement fixture needs a settled full-size peer", () => VisibleFrame(peer) == whole);
+            var focus = GetForegroundWindow();
+            using (var fixture = new Child(self, "fixture 1 hidden", desktop)) {
+                IntPtr hwnd = IntPtr.Zero;
+                Until("Hidden fixture should create its framed HWND",
+                    () => (hwnd = FindWindow(null, "Rustile fixture 1")) != IntPtr.Zero);
+                var original = Fixture.InitialBounds(1);
+                Until("A newly created hidden window should reach a prospective tile before first show", () => {
+                    Require(!IsWindowVisible(hwnd) && GetForegroundWindow() == focus, "Preparing a hidden window changed visibility or focus");
+                    Require(VisibleFrame(peer) == whole, "Preparing a hidden window shrank its visible peer");
+                    return Bounds(hwnd) != original;
+                });
+                var prepared = Bounds(hwnd);
+                UIntPtr shownInPlace;
+                Require(SendMessageTimeout(hwnd, ShowPreparedFixture, IntPtr.Zero, IntPtr.Zero,
+                    2 /* SMTO_ABORTIFHUNG */, 3000, out shownInPlace) != IntPtr.Zero && shownInPlace != UIntPtr.Zero,
+                    "The first visible fixture bounds must match the prepared bounds");
+                Until("Showing the prepared fixture should split its peer", () => PairFills(whole, gap, peer, hwnd));
+                var final = Bounds(hwnd);
+                int tolerance = (int)((16 * GetDpiForSystem() + 95) / 96);
+                Require(Math.Abs(final.Left - prepared.Left) <= tolerance && Math.Abs(final.Right - prepared.Right) <= tolerance
+                    && Math.Abs(final.Top - prepared.Top) <= tolerance && Math.Abs(final.Bottom - prepared.Bottom) <= tolerance,
+                    "Prepared and final bounds differed by more than the non-client frame: " + prepared + " / " + final);
+                using (var abandoned = new Child(self, "fixture 2 hidden", desktop)) {
+                    var abandonedOriginal = Fixture.InitialBounds(2);
+                    IntPtr pending = IntPtr.Zero;
+                    var peerBefore = Bounds(peer);
+                    Until("A second hidden fixture should be prepared without disturbing its peers", () => {
+                        pending = FindWindow(null, "Rustile fixture 2");
+                        Require(Bounds(hwnd) == final && Bounds(peer) == peerBefore, "Preparing a second hidden window changed existing tiles");
+                        return pending != IntPtr.Zero && Bounds(pending) != abandonedOriginal;
+                    });
+                    manager.Send(0x12 /* WM_QUIT */, 0);
+                    Require(manager.Exited(5000), "First placement manager did not quit");
+                    Until("First placement must preserve original floating rectangles even for a never-shown window",
+                        () => !IsWindowVisible(pending) && Bounds(pending) == abandonedOriginal
+                            && Bounds(hwnd) == original && Bounds(peer) == peerOriginal);
+                }
+                Console.WriteLine("PASS  Hidden CREATE reaches the eventual tile before SHOW; peer, activation and original bounds preserved");
+            }
+        }
     }
     static bool Tiled(Rectangle area, IntPtr[] windows) {
         var rectangles = windows.Select(Bounds).ToArray();
@@ -1998,7 +2056,9 @@ internal static class DesktopSmoke {
                 originals[index] = Bounds(windows[index]);
             };
             Action<int> launch = index => launchFixture(index, false);
-            launch(0); launch(1);
+            launch(0);
+            VerifyFirstPlacement(rustile, self, desktopName, windows[0], originals[0]);
+            launch(1);
             try {
                 VerifyCli(rustile, desktopName, children, windows.Take(2).ToArray(), originals.Take(2).ToArray(), Screen.PrimaryScreen.WorkingArea);
             } finally { ReapTestOwner(rustile); }
@@ -2160,8 +2220,12 @@ internal static class DesktopSmoke {
     static int Main(string[] args) {
         try {
             SetProcessDpiAwarenessContext((IntPtr)(-4));
-            if ((args.Length == 2 || args.Length == 3) && args[0] == "fixture")
-                Application.Run(new Fixture(int.Parse(args[1]), args.Length == 3 && args[2] == "drag-peer"));
+            if ((args.Length == 2 || args.Length == 3) && args[0] == "fixture") {
+                using (var fixture = new Fixture(int.Parse(args[1]), args.Length == 3 && args[2] == "drag-peer")) {
+                    if (args.Length == 3 && args[2] == "hidden") Application.Run();
+                    else Application.Run(fixture);
+                }
+            }
             else if (args.Length == 2) {
                 // A WinForms STA may already own an OLE window, which prevents
                 // switching its desktop. Start a clean worker before using USER.

@@ -479,13 +479,20 @@ fn untracked_in_reserved_strip(frame: Rect, screen: Rect, work: Rect, tracked: b
             || frame.y >= bottom(work))
 }
 
-fn visible_app_style(id: Id) -> Option<(u32, u32)> {
+fn covers_monitor(frame: Rect, screen: Rect) -> bool {
+    frame.x <= screen.x
+        && frame.y <= screen.y
+        && frame.x + frame.w >= screen.x + screen.w
+        && frame.y + frame.h >= screen.y + screen.h
+}
+
+fn app_style(id: Id, visible: bool) -> Option<(u32, u32)> {
     let hwnd = id as HWND;
     if hwnd.is_null() {
         return None;
     }
     unsafe {
-        if IsWindowVisible(hwnd) == 0
+        if (IsWindowVisible(hwnd) != 0) != visible
             || IsIconic(hwnd) != 0
             || GetAncestor(hwnd, GA_ROOT) != hwnd
             || !GetWindow(hwnd, GW_OWNER).is_null()
@@ -515,7 +522,7 @@ pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
         return None;
     }
     let root = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
-    visible_app_style(root as Id)?;
+    app_style(root as Id, true)?;
     if root != hwnd {
         let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
         if owner.is_null()
@@ -544,8 +551,15 @@ pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowUse {
     Tiling,
+    Opening(OpeningStage),
     Maximize,
     CloseOrTransfer,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpeningStage {
+    Hidden,
+    Shown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,19 +578,25 @@ pub(crate) fn can_close_or_transfer(id: Id) -> bool {
 
 fn classify_window(id: Id, usage: WindowUse) -> TileState {
     let hwnd = id as HWND;
-    let Some((style, extended)) = visible_app_style(id) else {
+    let opening = matches!(usage, WindowUse::Opening(_));
+    let visible = usage != WindowUse::Opening(OpeningStage::Hidden);
+    let Some((style, extended)) = app_style(id, visible) else {
         return TileState::Excluded;
     };
+    if opening && (!opening_style(style, extended, visible) || is_snapped(id)) {
+        return TileState::Excluded;
+    }
     let resizable = style & WS_THICKFRAME != 0;
     let borderless = style & WS_CAPTION != WS_CAPTION;
-    if usage == WindowUse::Tiling && !resizable && !borderless {
+    let tiling = usage == WindowUse::Tiling || opening;
+    if tiling && !resizable && !borderless {
         return TileState::Excluded;
     }
     unsafe {
         let Some(info) = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)) else {
             return TileState::Excluded;
         };
-        if usage == WindowUse::Tiling && info.dwFlags & MONITORINFOF_PRIMARY == 0 {
+        if tiling && info.dwFlags & MONITORINFOF_PRIMARY == 0 {
             return TileState::Excluded;
         }
         let Some(outer) = outer_bounds(hwnd) else {
@@ -589,15 +609,12 @@ fn classify_window(id: Id, usage: WindowUse) -> TileState {
         if work.w > 0 && work.h > 0 && untracked_in_reserved_strip(frame, screen, work, tracked) {
             return TileState::Excluded;
         }
-        let covers_monitor = frame.x <= screen.x
-            && frame.y <= screen.y
-            && frame.x + frame.w >= screen.x + screen.w
-            && frame.y + frame.h >= screen.y + screen.h;
         let compact = frame.w <= screen.w / 2 && frame.h <= screen.h / 2;
         // Browsers can drop WS_THICKFRAME on F11. DWM may still report the
         // old resize border briefly after the outer window reaches the screen.
-        let fullscreen =
-            (covers_monitor && (borderless || work != screen)) || (borderless && outer == screen);
+        let fullscreen = (covers_monitor(frame, screen)
+            && (opening || borderless || work != screen))
+            || (borderless && outer == screen);
         // Our own tile may have made an ordinary topmost window compact.
         let floating_panel = extended & WS_EX_TOPMOST != 0 && (borderless || (compact && !tracked));
         // With no reserved screen edge, even a normal maximized custom frame
@@ -605,7 +622,7 @@ fn classify_window(id: Id, usage: WindowUse) -> TileState {
         let fullscreen_only =
             borderless && fullscreen && (work != screen || style & WS_MAXIMIZEBOX == 0);
         let normal_frame = match usage {
-            WindowUse::Tiling => resizable,
+            WindowUse::Tiling | WindowUse::Opening(_) => resizable,
             WindowUse::Maximize => resizable || !borderless,
             // Closing and moving to another desktop also work for games
             // that use a fixed-size borderless window.
@@ -630,6 +647,16 @@ fn classify_window(id: Id, usage: WindowUse) -> TileState {
 
 pub fn eligible(id: Id) -> bool {
     tile_state(id) == TileState::Eligible
+}
+
+// A new HWND can be a splash screen, an off-screen renderer, or a window
+// initializing its fullscreen styles. Speculate only on decorated app windows.
+fn opening_style(style: u32, extended: u32, visible: bool) -> bool {
+    const FRAME: u32 = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU;
+    style & FRAME == FRAME
+        && (style & WS_VISIBLE != 0) == visible
+        && style & (WS_POPUP | WS_DISABLED | WS_MAXIMIZE | WS_MINIMIZE) == 0
+        && extended & (WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT) == 0
 }
 
 fn marker_name() -> *const u16 {
@@ -784,6 +811,28 @@ fn floating_frame(frame: Rect, work: Rect, minimum: (i32, i32)) -> Rect {
 }
 
 impl Original {
+    pub(crate) fn confirm_opening(&mut self, provisional: Rect) -> bool {
+        if !self.matches(self.id) || !eligible(self.id) {
+            return false;
+        }
+        let Some(marker) = WindowMarker::attach(self.id, marker_name()) else {
+            return false;
+        };
+        if !self.matches(self.id) {
+            return false;
+        }
+        self.marker = marker;
+        // Some apps choose their own normal bounds between CREATE and SHOW.
+        // Preserve that later choice when the app superseded our placement.
+        if let Some(bounds) = outer_bounds(self.id as HWND)
+            && bounds != provisional
+        {
+            self.outer = bounds;
+        }
+        self.refresh_frame();
+        true
+    }
+
     /// Read the live drag rectangle in the same visible-frame coordinates used by `place`.
     pub fn visible_frame(&self) -> Option<Rect> {
         // DWM can still report the preceding frame while the window's edge is moving.
@@ -901,6 +950,51 @@ impl Original {
         self.place_frame(self.insets.outer_for(target))
     }
 
+    /// Return the exact outer bounds sent to Windows for a possible rollback.
+    pub(crate) fn place_opening(&self, target: Rect, stage: OpeningStage) -> Option<Rect> {
+        if target.w <= 0
+            || target.h <= 0
+            || !self.matches(self.id)
+            || classify_window(self.id, WindowUse::Opening(stage)) != TileState::Eligible
+        {
+            return None;
+        }
+        let bounds = self.insets.outer_for(target);
+        position(self.id as HWND, bounds, 0).then_some(bounds)
+    }
+
+    pub(crate) fn restore_opening(&self, placed_outer: Rect) {
+        let hwnd = self.id as HWND;
+        if !self.matches(self.id)
+            || unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
+            || minimized_or_maximized(self.id)
+            || is_snapped(self.id)
+        {
+            return;
+        }
+        let Some(bounds) = outer_bounds(hwnd) else {
+            return;
+        };
+        let Some(monitor) = monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) })
+        else {
+            return;
+        };
+        let screen = rect(monitor.rcMonitor);
+        // The app may have entered fullscreen or supplied its own newer bounds.
+        if covers_monitor(frame_bounds(hwnd, bounds), screen)
+            && ((unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_CAPTION) != WS_CAPTION
+                || rect(monitor.rcWork) != screen)
+        {
+            return;
+        }
+        // A desktop switch can cloak this window before its Shell assignment
+        // arrives. Positioning it back without showing/activating it is safe.
+        // Queue behind our move even if GetWindowRect still shows the original.
+        if bounds == self.outer || bounds == placed_outer {
+            position(hwnd, self.outer, 0);
+        }
+    }
+
     fn place_frame(&self, bounds: Rect) -> bool {
         if !self.matches(self.id) || !eligible(self.id) {
             return false;
@@ -914,13 +1008,29 @@ impl Original {
 }
 
 pub fn capture(id: Id) -> Option<Original> {
-    if !eligible(id) {
+    capture_for(id, WindowUse::Tiling)
+}
+
+pub(crate) fn capture_opening(id: Id, stage: OpeningStage) -> Option<Original> {
+    capture_for(id, WindowUse::Opening(stage))
+}
+
+fn capture_for(id: Id, usage: WindowUse) -> Option<Original> {
+    if classify_window(id, usage) != TileState::Eligible {
         return None;
     }
     let outer = outer_bounds(id as HWND)?;
+    // A speculative placement must not relax normal admission rules for
+    // reserved strips or small topmost panels. Promote the marker on SHOW.
+    static OPENING_MARKER: OnceLock<Vec<u16>> = OnceLock::new();
+    let name = if matches!(usage, WindowUse::Opening(_)) {
+        process_marker_name(&OPENING_MARKER, "Opening")
+    } else {
+        marker_name()
+    };
     let original = Original {
         id,
-        marker: WindowMarker::attach(id, marker_name())?,
+        marker: WindowMarker::attach(id, name)?,
         outer,
         insets: FrameInsets::measure(id as HWND, outer).unwrap_or_default(),
     };
@@ -1065,6 +1175,24 @@ mod work_area_tests {
             DesktopForeground::Vacant,
             "a hidden dialog cannot keep the incoming desktop waiting"
         );
+    }
+
+    #[test]
+    fn early_placement_requires_a_normal_frame_in_the_expected_visibility_state() {
+        for visible in [false, true] {
+            let frame = WS_OVERLAPPEDWINDOW | if visible { WS_VISIBLE } else { 0 };
+            assert!(opening_style(frame, WS_EX_APPWINDOW, visible));
+            assert!(!opening_style(frame, WS_EX_APPWINDOW, !visible));
+            for flag in [WS_POPUP, WS_MINIMIZE, WS_MAXIMIZE, WS_DISABLED] {
+                assert!(!opening_style(frame | flag, 0, visible));
+            }
+            for decoration in [WS_THICKFRAME, WS_CAPTION, WS_SYSMENU] {
+                assert!(!opening_style(frame & !decoration, 0, visible));
+            }
+            for flag in [WS_EX_TOPMOST, WS_EX_LAYERED, WS_EX_TRANSPARENT] {
+                assert!(!opening_style(frame, flag, visible));
+            }
+        }
     }
 
     #[test]

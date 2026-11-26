@@ -680,6 +680,10 @@ impl Layout {
             .collect()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.occupants.is_empty()
+    }
+
     fn slot(&self, id: Id) -> Option<usize> {
         self.occupants.iter().position(|w| w.id == id)
     }

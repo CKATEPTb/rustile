@@ -523,6 +523,67 @@ fn set_visible(id: Id, visible: bool) {
     });
 }
 
+fn immediately_shown_arrival(manager: &mut Manager, windows: [Id; 6], area: Rect) {
+    use super::{DesktopId, DesktopMembership};
+    use windows_sys::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_CREATE;
+
+    let [peer, arrival, returning, ..] = windows;
+    let desktop = DesktopId(1);
+    let home = DesktopMembership::Current(desktop);
+    manager.desktops.set_memberships([(peer, home)]);
+    manager.event(EVENT_OBJECT_SHOW, peer);
+    settle(manager, 1);
+
+    // An existing window can SHOW again during a desktop switch. A matching
+    // opening hint alone must not move it, even while the retry is pending.
+    let returning_frame = frame(returning);
+    manager.desktops.opening_hint_fixture = Some((returning, desktop));
+    manager.event(EVENT_OBJECT_SHOW, returning);
+    manager.check_openings();
+
+    let floating = frame(arrival);
+    manager.desktops.opening_hint_fixture = Some((arrival, desktop));
+    manager.event(EVENT_OBJECT_CREATE, arrival);
+    until(
+        "an already visible CREATE reaches the upcoming tile",
+        || {
+            let r = frame(arrival);
+            r != floating && r.x > area.x && r.y == area.y && r.x + r.w == area.x + area.w
+        },
+    );
+    let staged = frame(arrival);
+    manager.event(EVENT_OBJECT_SHOW, arrival);
+    assert!(!manager.tracks_window(arrival));
+    assert_eq!(manager.workspace.layout.placements(area), [(peer, area)]);
+    assert_eq!(frame(peer), area);
+    assert_eq!(frame(returning), returning_frame);
+
+    // A late authoritative answer may put the HWND on another desktop.
+    manager.desktops.set_memberships([
+        (peer, home),
+        (arrival, DesktopMembership::Other(DesktopId(2))),
+    ]);
+    manager.check_openings();
+    until("a different desktop restores the floating frame", || {
+        frame(arrival) == floating
+    });
+    assert!(!manager.tracks_window(arrival));
+    assert_eq!(frame(peer), area);
+
+    manager.desktops.set_memberships([(peer, home)]);
+    manager.event(EVENT_OBJECT_CREATE, arrival);
+    manager.event(EVENT_OBJECT_SHOW, arrival);
+    until("the new opening is staged", || frame(arrival) == staged);
+    manager
+        .desktops
+        .set_memberships([(peer, home), (arrival, home)]);
+    manager.check_openings();
+    settle(manager, 2);
+    assert!(manager.tracks_window(arrival));
+    assert_eq!(frame(arrival), staged);
+    assert_split(area, peer, arrival, true);
+}
+
 fn focused_arrivals(manager: &mut Manager, windows: [Id; 6], area: Rect) {
     let [a, b, c, d, e, _] = windows;
     manager.event(EVENT_SYSTEM_FOREGROUND, a);
@@ -1292,6 +1353,7 @@ fn move_windows() {
         five_windows(manager, &fixtures[..5], area);
         six_windows(manager, fixtures, area);
     });
+    run(immediately_shown_arrival);
     run(focused_arrivals);
     run(move_left_past_tall_window);
     run(move_down_beside_tall_window);

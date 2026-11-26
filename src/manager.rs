@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-    EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
 };
 
@@ -15,6 +15,8 @@ use crate::settings::Settings;
 
 mod mouse;
 use mouse::MouseDrag;
+mod opening;
+use opening::{Openings, insert_tile};
 
 #[cfg(test)]
 mod desktop_test;
@@ -130,6 +132,7 @@ pub struct Manager {
     transfer_anchor: Option<(Id, DesktopId, Id)>,
     unconfirmed_focus: Cell<Option<(DesktopId, Id)>>,
     windows: HashMap<Id, TrackedWindow>,
+    openings: Openings,
     expanded: HashSet<Id>,
     pending_app_cloaks: HashSet<Id>,
     needs_desktop_retry: bool,
@@ -157,6 +160,7 @@ impl Manager {
             transfer_anchor: None,
             unconfirmed_focus: Cell::default(),
             windows: HashMap::new(),
+            openings: Openings::default(),
             expanded: HashSet::new(),
             pending_app_cloaks: HashSet::new(),
             needs_desktop_retry: false,
@@ -176,6 +180,7 @@ impl Manager {
         if self.current == Some(desktop) {
             return;
         }
+        self.openings.leave_other_desktops(desktop);
         self.pending_app_cloaks.clear();
         self.finish_mode();
         self.dragging = None;
@@ -237,6 +242,7 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        self.openings.forget(id);
         if self
             .transfer_anchor
             .is_some_and(|(target, _, anchor)| target == id || anchor == id)
@@ -334,6 +340,7 @@ impl Manager {
         if self.work_area == Some(work) {
             return;
         }
+        self.openings.clear();
         self.finish_mode();
         let dpi_changed = self
             .work_area
@@ -481,7 +488,7 @@ impl Manager {
             self.workspace.last_foreground = Some(foreground);
         }
         self.remember_tile(foreground);
-        self.place_tiles(true);
+        self.place_tiles(true, None);
     }
 
     fn settle_hidden(&mut self, desktop_confirmed: bool) {
@@ -580,6 +587,9 @@ impl Manager {
             None
         };
         persist()?;
+        if geometry || !updated.enabled {
+            self.openings.clear();
+        }
         let system_changed = proposed
             .as_ref()
             .is_some_and(|(work, ..)| Some(*work) != self.work_area);
@@ -645,6 +655,15 @@ impl Manager {
                 return true;
             }
         }
+        let Some(area) = self.area else { return false };
+        let anchor = self.insertion_anchor(area);
+        if anchor.is_none() && !self.workspace.layout.is_empty() {
+            return false;
+        }
+        self.admit(id, anchor)
+    }
+
+    fn insertion_anchor(&self, area: Rect) -> Option<Id> {
         if let Some(anchor) = self
             .workspace
             .focus_history
@@ -653,18 +672,15 @@ impl Manager {
             .copied()
             .find(|&prior| self.can_act_on(prior))
         {
-            return self.admit(id, Some(anchor));
+            return Some(anchor);
         }
-        let Some(area) = self.area else { return false };
-        let tiles = self.workspace.layout.placements(area);
-        if tiles.is_empty() {
-            return self.admit(id, None);
-        }
-        let largest = tiles
+        self.workspace
+            .layout
+            .placements(area)
             .into_iter()
             .filter(|&(prior, _)| self.can_act_on(prior))
-            .max_by_key(|(_, rect)| i64::from(rect.w) * i64::from(rect.h));
-        largest.is_some_and(|(anchor, _)| self.admit(id, Some(anchor)))
+            .max_by_key(|(_, rect)| i64::from(rect.w) * i64::from(rect.h))
+            .map(|(anchor, _)| anchor)
     }
 
     fn admit(&mut self, id: Id, anchor: Option<Id>) -> bool {
@@ -677,15 +693,13 @@ impl Manager {
         }
         if self.current != Some(desktop)
             || self.workspace.layout.contains(id)
-            || !native::eligible(id)
+            || (self.windows.contains_key(&id) && !native::eligible(id))
         {
             return false;
         }
         self.migrate(id, desktop);
-        let mut insert = |minimum| match anchor {
-            Some(anchor) => self.workspace.layout.insert_near(id, anchor, area, minimum),
-            None => self.workspace.layout.insert_with_minimum(id, area, minimum),
-        };
+        let mut insert =
+            |minimum| insert_tile(&mut self.workspace.layout, id, anchor, area, minimum);
         let entry = match self.windows.entry(id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let tracked = entry.get_mut();
@@ -698,10 +712,17 @@ impl Manager {
             }
             std::collections::hash_map::Entry::Vacant(entry) => entry,
         };
-        let Some(original) = native::capture(id) else {
+        let prepared = self.openings.take_for_admission(id, desktop);
+        let Some((original, provisional_bounds)) = prepared
+            .map(|(original, bounds)| (original, Some(bounds)))
+            .or_else(|| native::capture(id).map(|original| (original, None)))
+        else {
             return false;
         };
         if !insert(original.minimum_frame_size()) {
+            if let Some(bounds) = provisional_bounds {
+                original.restore_opening(bounds);
+            }
             return false;
         }
         entry.insert(TrackedWindow {
@@ -737,6 +758,12 @@ impl Manager {
                 return;
             }
         }
+        if event == EVENT_OBJECT_CREATE && native::hidden_or_minimized(id) {
+            self.prepare_opening(id, native::OpeningStage::Hidden);
+            if native::hidden_or_minimized(id) {
+                return;
+            }
+        }
 
         let finished_drag = self
             .dragging
@@ -748,6 +775,9 @@ impl Manager {
         }
         let state = self.observe(id);
         let eligible = state == TileState::Eligible;
+        if !eligible {
+            self.openings.cancel_if_visible(id);
+        }
         if !eligible || event == EVENT_OBJECT_CLOAKED {
             self.hide_drop_for(id);
         }
@@ -771,6 +801,7 @@ impl Manager {
         }
         let desktop = match self.desktops.membership(id) {
             DesktopMembership::Other(key) => {
+                self.openings.cancel(id);
                 // A cloak for an existing desktop is visibility noise. Only an
                 // actual change of the HWND's GUID releases its old tile.
                 if self.migrate(id, key) {
@@ -780,6 +811,17 @@ impl Manager {
             }
             DesktopMembership::Unknown => {
                 self.needs_desktop_retry |= eligible || self.tracks_window(id);
+                if eligible
+                    && matches!(event, EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW)
+                    && !self.tracks_window(id)
+                {
+                    // A standalone SHOW may be an existing window returning
+                    // from another desktop. Only CREATE identifies a newcomer.
+                    if event == EVENT_OBJECT_CREATE {
+                        self.prepare_opening(id, native::OpeningStage::Shown);
+                    }
+                    self.openings.retry_show(id);
+                }
                 return;
             }
             DesktopMembership::Current(key) => key,
@@ -847,10 +889,12 @@ impl Manager {
             self.finish_mode();
             // A newly shown window can be the first visible peer after all
             // others hid to the tray. Reconcile their stale slots before retrying.
-            if !self.admit_new(id) {
+            if self.admit_new(id) {
+                self.place_tiles(false, Some(id));
+            } else {
                 self.needs_desktop_retry = true;
+                self.apply();
             }
-            self.apply();
         } else if event == EVENT_SYSTEM_MOVESIZEEND
             && !switched
             && let Some(drag) = finished_drag
@@ -896,10 +940,10 @@ impl Manager {
     }
 
     fn apply(&mut self) {
-        self.place_tiles(false);
+        self.place_tiles(false, None);
     }
 
-    fn place_tiles(&mut self, verify: bool) {
+    fn place_tiles(&mut self, verify: bool, first: Option<Id>) {
         let Some(area) = self.area else { return };
         self.refresh_drop_preview(true);
         let preview = self
@@ -908,7 +952,13 @@ impl Manager {
             .and_then(|drag| drag.resized_layout(&self.workspace.layout, area));
         let layout = preview.as_ref().unwrap_or(&self.workspace.layout);
         let drag_target = self.drag_target();
-        for (id, rect) in layout.placements(area) {
+        let mut placements = layout.placements(area);
+        if let Some(index) =
+            first.and_then(|target| placements.iter().position(|&(id, _)| id == target))
+        {
+            placements.swap(0, index);
+        }
+        for (id, rect) in placements {
             let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
@@ -920,7 +970,9 @@ impl Manager {
                 continue;
             }
             if window.requested != Some(rect) {
-                if window.original.place(rect) {
+                let already_placed =
+                    first == Some(id) && window.original.is_at(rect) && !native::is_snapped(id);
+                if already_placed || window.original.place(rect) {
                     window.requested = Some(rect);
                     window.repairs = 0;
                 }
@@ -1411,6 +1463,7 @@ impl Manager {
     }
 
     pub fn shutdown(&mut self) {
+        self.openings.clear();
         self.session = None;
         self.outline.hide();
         self.hud.hide();
