@@ -37,7 +37,9 @@ If N exceeds the desktop count, Rustile switches to the last desktop.";
 const TRANSFER_HELP: &str = "rustile transfer next|previous|N
 
 Move the focused window to the destination and follow it. Desktop numbers start
-at 1. Numbers above the desktop count select the last desktop.";
+at 1. Numbers above the desktop count select the last desktop.
+On desktop 1, transfer previous creates a new first desktop for the window.
+Without a focused window, transfer previous acts like desktop previous.";
 const RESIZE_HELP: &str = "rustile resize left|right left|right
 rustile resize top|bottom up|down
 

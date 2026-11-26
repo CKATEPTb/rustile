@@ -922,7 +922,7 @@ fn pump(
                     ));
                     continue;
                 }
-                if let Some(index) = workspaces.stationary_index(destination) {
+                if let Some(index) = workspaces.stationary_index(destination, window.is_some()) {
                     request.respond(Ok(index.to_string()));
                     continue;
                 }
@@ -931,8 +931,8 @@ fn pump(
             } else {
                 None
             };
-            // Resolving Next may create or reorder the spare even if the
-            // subsequent window transfer or desktop switch does not finish.
+            // Preparing a destination at either end can change the desktop
+            // order even if the transfer or switch does not finish.
             if workspaces.supported {
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
             }

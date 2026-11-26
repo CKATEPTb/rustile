@@ -174,6 +174,24 @@ fn from_current(order: &[DesktopId], current: DesktopId) -> Option<&[DesktopId]>
     Some(&order[index..])
 }
 
+fn previous_transfer_target(
+    mut order: Vec<DesktopId>,
+    from: DesktopId,
+    create: impl FnOnce() -> Option<DesktopId>,
+    place_first: impl FnOnce(DesktopId, &[DesktopId]) -> bool,
+) -> Option<(DesktopId, Vec<DesktopId>)> {
+    if order.first() != Some(&from) {
+        let previous = neighbor(&order, from, false)?;
+        return Some((previous, order));
+    }
+    let target = create()?;
+    if order.contains(&target) {
+        return None;
+    }
+    order.insert(0, target);
+    place_first(target, &order).then_some((target, order))
+}
+
 fn forward_neighbor(
     tail: &[DesktopId],
     occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
@@ -204,12 +222,13 @@ fn stationary_index(
     order: &[DesktopId],
     current: DesktopId,
     destination: DesktopDestination,
+    transferring_window: bool,
     occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
 ) -> Option<usize> {
     let index = order.iter().position(|&id| id == current)?;
     let empty_tail = || occupied(&order[index..]).map(|value| !value);
     let stationary = match destination {
-        DesktopDestination::Relative { next: false } => index == 0,
+        DesktopDestination::Relative { next: false } => index == 0 && !transferring_window,
         DesktopDestination::Relative { next: true } => empty_tail()?,
         DesktopDestination::Number(number) => {
             let target = number.checked_sub(1)?.min(order.len() - 1);
@@ -286,9 +305,13 @@ impl Workspaces {
         (order.contains(&current) && shell.current()? == current).then_some((current, order))
     }
 
-    pub(super) fn stationary_index(&self, destination: DesktopDestination) -> Option<usize> {
+    pub(super) fn stationary_index(
+        &self,
+        destination: DesktopDestination,
+        transferring_window: bool,
+    ) -> Option<usize> {
         let (current, order) = self.snapshot()?;
-        stationary_index(&order, current, destination, |tail| {
+        stationary_index(&order, current, destination, transferring_window, |tail| {
             occupancy::any_occupied(&order, tail)
         })
     }
@@ -413,17 +436,42 @@ impl Workspaces {
         uninterrupted: impl Fn() -> bool,
     ) -> Option<WindowTransfer> {
         let from = self.current_desktop()?;
-        if !uninterrupted() || !valid(from) {
+        let still_valid = || uninterrupted() && valid(from);
+        if !still_valid() {
             return None;
         }
-        let (to, order) = self.resolve(from, destination)?;
+        let (to, order) = if destination == (DesktopDestination::Relative { next: false }) {
+            let shell = self.shell.as_ref()?;
+            previous_transfer_target(
+                shell.list()?,
+                from,
+                || {
+                    if shell.can_move_window(window, from) && still_valid() {
+                        shell.create()
+                    } else {
+                        None
+                    }
+                },
+                |created, expected| {
+                    if !still_valid() {
+                        return false;
+                    }
+                    // Explorer may commit a reorder even if its RPC reports an error.
+                    // Transfer only after observing the exact original order behind us.
+                    shell.move_before_first(created, from);
+                    shell.list().as_deref() == Some(expected)
+                },
+            )?
+        } else {
+            self.resolve(from, destination)?
+        };
         let shell = self.shell.as_ref()?;
         WindowTransfer::perform(
             from,
             to,
             || {
                 shell.list().as_ref() == Some(&order)
-                    && shell.move_window(window, from, to, || valid(from) && uninterrupted())
+                    && shell.move_window(window, from, to, still_valid)
             },
             || shell.current(),
             &uninterrupted,
@@ -698,33 +746,79 @@ mod tests {
     }
 
     #[test]
+    fn transferring_before_the_first_desktop_inserts_one_slot_and_preserves_the_spare() {
+        let (first, second, spare, new) =
+            (DesktopId(31), DesktopId(8), DesktopId(42), DesktopId(17));
+        for order in [vec![first], vec![first, second, spare]] {
+            let expected: Vec<_> = std::iter::once(new).chain(order.iter().copied()).collect();
+            let target = previous_transfer_target(
+                order,
+                first,
+                || Some(new),
+                |created, proposed| created == new && proposed == expected,
+            );
+            assert_eq!(target, Some((new, expected)));
+        }
+        let order = vec![first, second, spare];
+        let unexpected_create = || panic!("created a desktop without reaching the first one");
+        let unexpected_move = |_, _: &[DesktopId]| panic!("reordered an existing desktop");
+        assert_eq!(
+            previous_transfer_target(order.clone(), second, unexpected_create, unexpected_move),
+            Some((first, order.clone()))
+        );
+        assert_eq!(
+            previous_transfer_target(order, new, unexpected_create, unexpected_move),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_create_or_unconfirmed_prepend_cannot_supply_a_transfer_destination() {
+        let from = DesktopId(7);
+        let new = DesktopId(9);
+        for returned in [None, Some(from)] {
+            assert!(
+                previous_transfer_target(
+                    vec![from],
+                    from,
+                    || returned,
+                    |_, _| { panic!("only a newly created desktop may be repositioned") }
+                )
+                .is_none()
+            );
+        }
+        assert!(previous_transfer_target(vec![from], from, || Some(new), |_, _| false).is_none());
+    }
+
+    #[test]
     fn cli_recognizes_only_proven_noop_desktop_moves_and_transfers() {
         use crate::cli::Destination;
 
         let order = [0x33, 0x55, 0x11].map(DesktopId);
-        let no_scan = |_: &[DesktopId]| panic!("position is sufficient");
+        let by_position = |from, destination: Destination, transferring_window| {
+            stationary_index(
+                &order,
+                from,
+                destination.into(),
+                transferring_window,
+                |_| panic!("position is sufficient"),
+            )
+        };
         let stationary = |from, destination: Destination, occupancy| {
-            stationary_index(&order, from, destination.into(), |tail| {
+            stationary_index(&order, from, destination.into(), true, |tail| {
                 assert_eq!(tail.first(), Some(&from));
                 occupancy
             })
         };
         assert_eq!(
-            stationary_index(&order, order[2], Destination::Number(50).into(), no_scan),
+            by_position(order[2], Destination::Number(50), true),
             Some(3)
         );
-        assert_eq!(
-            stationary_index(&order, order[0], Destination::Previous.into(), no_scan),
-            Some(1)
-        );
-        assert_eq!(
-            stationary_index(&order, order[0], DesktopDestination::Number(0), no_scan),
-            None
-        );
-        assert_eq!(
-            stationary_index(&order, DesktopId(999), Destination::Next.into(), no_scan),
-            None
-        );
+        assert_eq!(by_position(order[0], Destination::Previous, false), Some(1));
+        assert_eq!(by_position(order[0], Destination::Previous, true), None);
+        assert_eq!(by_position(order[0], Destination::Number(1), true), Some(1));
+        assert_eq!(by_position(order[0], Destination::Number(0), true), None);
+        assert_eq!(by_position(DesktopId(999), Destination::Next, true), None);
         for destination in [Destination::Next, Destination::Number(99)] {
             assert_eq!(stationary(order[1], destination, Some(false)), Some(2));
             assert_eq!(stationary(order[1], destination, Some(true)), None);

@@ -148,6 +148,10 @@ impl ShellDesktop {
     }
 }
 
+fn desktop_id_at(order: &IObjectArray, index: u32) -> Option<DesktopId> {
+    unsafe { order.GetAt::<ShellDesktop>(index) }.ok()?.id()
+}
+
 #[repr(transparent)]
 #[derive(Clone)]
 struct ShellManager(IUnknown);
@@ -195,6 +199,19 @@ impl ShellManager {
 
     fn current(&self) -> Option<DesktopId> {
         self.object(self.vtable().current)?.id()
+    }
+
+    fn can_move_view(&self, hwnd: HWND, view: &ApplicationView, from: DesktopId) -> Option<bool> {
+        let mut movable = 0;
+        unsafe { (self.vtable().can_move_view)(self.as_raw(), view.as_raw(), &mut movable) }
+            .ok()
+            .ok()?;
+        // Pinned windows and apps have special GUIDs and never match the source.
+        Some(
+            movable != 0
+                && self.current()? == from
+                && Service::connect()?.desktop_id(hwnd).ok()? == from,
+        )
     }
 
     fn move_desktop(&self, desktop: &ShellDesktop, index: u32) -> Option<()> {
@@ -316,8 +333,7 @@ impl DesktopShell {
             let count = unsafe { array.GetCount() }.ok()?;
             let mut ids = Vec::new();
             for index in 0..count {
-                let desktop = unsafe { array.GetAt::<ShellDesktop>(index) }.ok()?;
-                let id = desktop.id()?;
+                let id = desktop_id_at(&array, index)?;
                 if ids.contains(&id) {
                     return None;
                 }
@@ -335,12 +351,32 @@ impl DesktopShell {
         self.with_manager(|manager| manager.object(manager.vtable().create)?.id())
     }
 
+    pub(crate) fn move_before_first(&self, id: DesktopId, first: DesktopId) -> bool {
+        if id == first {
+            return false;
+        }
+        self.with_manager(|manager| {
+            let desktop = manager.find(id)?;
+            let order = manager.object(manager.vtable().list)?;
+            let head = desktop_id_at(&order, 0)?;
+            if head == id {
+                return Some(desktop_id_at(&order, 1)? == first && manager.current()? == first);
+            }
+            if head != first || manager.current()? != first {
+                return Some(false);
+            }
+            manager.move_desktop(&desktop, 0)?;
+            Some(true)
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn move_to_end(&self, id: DesktopId) -> bool {
         self.with_manager(|manager| {
             let desktop = manager.find(id)?;
             let order = manager.object(manager.vtable().list)?;
             let last = unsafe { order.GetCount() }.ok()?.checked_sub(1)?;
-            if unsafe { order.GetAt::<ShellDesktop>(last) }.ok()?.id()? == id {
+            if desktop_id_at(&order, last)? == id {
                 return Some(true);
             }
             // The user can select the spare after the occupancy scan.
@@ -363,6 +399,17 @@ impl DesktopShell {
         .is_some()
     }
 
+    pub(crate) fn can_move_window(&self, id: Id, from: DesktopId) -> bool {
+        let hwnd = id as HWND;
+        if hwnd.is_null() {
+            return false;
+        }
+        self.with_manager(|manager| {
+            manager.can_move_view(hwnd, &ApplicationView::lookup(hwnd)?, from)
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn move_window(
         &self,
         id: Id,
@@ -379,18 +426,9 @@ impl DesktopShell {
             let view = ApplicationView::lookup(hwnd)?;
             let destination = manager.find(to)?;
             let table = manager.vtable();
-            let mut movable = 0;
-            let check =
-                unsafe { (table.can_move_view)(manager.as_raw(), view.as_raw(), &mut movable) };
-            check.ok().ok()?;
-            if movable == 0 || manager.current()? != from {
-                return Some(false);
-            }
-            // The public API returns a special GUID for app and window pins.
-            // A pinned HWND or a window already moved by Explorer has no match.
             // The caller validates the exact identity here, including foreground
             // ownership for hotkeys and implicit CLI targets.
-            if Service::connect()?.desktop_id(hwnd).ok()? != from || !validate() {
+            if !manager.can_move_view(hwnd, &view, from)? || !validate() {
                 return Some(false);
             }
             let moved =
@@ -482,6 +520,8 @@ mod tests {
             .find(|id| *id != source)
             .expect("another existing desktop");
         let foreground = unsafe { GetForegroundWindow() };
+        assert!(shell.can_move_window(foreground as Id, source));
+        assert!(!shell.can_move_window(foreground as Id, destination));
         let mut validated = false;
         assert!(
             !shell.move_window(foreground as Id, source, destination, || {
@@ -500,11 +540,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "creates and removes its own background desktop on a supported Explorer session"]
+    #[ignore = "creates and removes its own background desktop; start on the first desktop"]
     fn desktop_shell_background_round_trip() {
         let shell = DesktopShell::connect().expect("supported Explorer on the interactive desktop");
         let original = shell.current().expect("initial desktop");
         let before = shell.list().expect("initial desktop list");
+        assert_eq!(
+            before.first(),
+            Some(&original),
+            "start on the first desktop"
+        );
         let created = shell.create().expect("new desktop ID");
         assert!(!before.contains(&created));
         let after = shell.list().expect("desktop list after creation");
@@ -514,23 +559,21 @@ mod tests {
             Some(original),
             "creation unexpectedly switched desktops"
         );
-        let occupied = occupied(&after).expect("complete occupancy inventory");
-        assert!(
-            !occupied.contains(&created),
-            "new desktop acquired a window"
-        );
-        assert!(move_for_test(&shell, created, 0));
-        assert_eq!(shell.list().expect("moved desktop").first(), Some(&created));
+        let used = occupied(&after).expect("complete occupancy inventory");
+        assert!(!used.contains(&created), "new desktop acquired a window");
+        assert!(shell.move_before_first(created, original));
+        let mut prepended = before.clone();
+        prepended.insert(0, created);
+        assert_eq!(shell.list().as_ref(), Some(&prepended));
+        assert_eq!(shell.current(), Some(original));
+        assert!(shell.move_before_first(created, original));
+        assert_eq!(shell.list().as_ref(), Some(&prepended));
         assert!(shell.move_to_end(created));
         assert_eq!(shell.list().expect("original order restored"), after);
         assert_eq!(shell.current(), Some(original));
+        assert!(occupied(&after).is_some_and(|used| !used.contains(&created)));
         assert!(shell.remove(created, original));
-        assert!(
-            !shell
-                .list()
-                .expect("desktop list after removal")
-                .contains(&created)
-        );
+        assert_eq!(shell.list().as_ref(), Some(&before));
         assert_eq!(shell.current(), Some(original));
     }
 
