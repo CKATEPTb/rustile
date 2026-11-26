@@ -99,6 +99,12 @@ fn compile_messages() {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=VERSION");
+    assert_eq!(
+        env!("CARGO_PKG_VERSION"),
+        include_str!("VERSION").trim(),
+        "refresh Cargo metadata with scripts/sync-version.ps1"
+    );
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         compile_messages();
         // Portable and installed copies only import system DLLs, including

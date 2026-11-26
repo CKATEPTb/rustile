@@ -52,10 +52,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/production'
         id: asset
         run: |
-          $metadata = cargo +stable-x86_64-pc-windows-msvc metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $version = ($metadata.packages | Where-Object name -eq 'rustile').version
-          if (-not $version) { throw 'Missing rustile package version' }
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
           $separator = if ($version.Contains('+')) { '.' } else { '+' }
           $binary = 'target/dist/rustile.exe'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()

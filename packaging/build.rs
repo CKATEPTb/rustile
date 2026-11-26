@@ -1,6 +1,12 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=../VERSION");
+    assert_eq!(
+        env!("CARGO_PKG_VERSION"),
+        include_str!("../VERSION").trim(),
+        "refresh Cargo metadata with scripts/sync-version.ps1"
+    );
     println!("cargo:rerun-if-env-changed=RUSTILE_RELEASE_CAB");
     println!("cargo:rerun-if-env-changed=RUSTILE_RELEASE_SHA256");
     let cabinet =

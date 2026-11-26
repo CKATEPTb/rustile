@@ -517,7 +517,10 @@ mod tests {
                 invocation(&format!("{topic} -h"))
             );
         }
-        assert!(matches!(invocation("--version"), Ok(Invocation::Print(_))));
+        let expected = format!("rustile {}", include_str!("../VERSION").trim());
+        for flag in ["--version", "-V"] {
+            assert!(matches!(invocation(flag), Ok(Invocation::Print(text)) if text == expected));
+        }
         for (key, m) in [
             ("Win+Enter", Modifier::Win),
             ("CTRL+ALT+ENTER", Modifier::CtrlAlt),

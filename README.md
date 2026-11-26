@@ -90,6 +90,8 @@ With the Rust MSVC toolchain and Windows SDK installed, build the same LZX-compr
 
 The result is `target\dist\rustile.exe`. It unpacks Rustile during installation. For a regular development build without packaging, run `cargo build --release`.
 
+To change the release version, edit [VERSION](VERSION) and run `.\scripts\sync-version.ps1` to regenerate the Cargo package versions and lockfiles.
+
 ## License
 
 Rustile is free to use, modify and redistribute under the [MIT License](LICENSE).
