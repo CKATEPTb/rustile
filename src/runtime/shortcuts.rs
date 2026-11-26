@@ -643,7 +643,7 @@ impl Drop for Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Command, Modifier};
+    use crate::settings::{Command, Modifier, SchemeKey};
 
     const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
@@ -706,6 +706,65 @@ mod tests {
             }
             action
         }
+    }
+
+    #[test]
+    fn shared_roles_rebuild_normal_modal_and_wheel_routes_together() {
+        let mut keyboard = Keyboard::new();
+        keyboard.assign(Shortcut::MoveRight, MOD_CONTROL, VK_F9);
+        for (role, key) in [
+            (SchemeKey::Base, VK_MENU),
+            (SchemeKey::Grab, VK_CONTROL),
+            (SchemeKey::Left, VK_H),
+        ] {
+            keyboard.settings = keyboard
+                .settings
+                .changed(Command::SchemeKey(role, key))
+                .unwrap();
+        }
+        let routes = Routes::new(keyboard.settings);
+        let command = |mode, key: u16, mods| {
+            let state = Snapshot {
+                mode,
+                ..keyboard.state
+            };
+            let bound = routes.0[usize::from(key)]?.binding(state, Pending::NEW, mods, || 100)?;
+            bound.target.map(|_| bound.id)
+        };
+        for (key, mods, id) in [
+            (VK_H, MOD_ALT, FOCUS),
+            (VK_H, MOD_ALT | MOD_CONTROL, MOVE),
+            (VK_H, MOD_ALT | MOD_SHIFT, DESKTOP_PREVIOUS),
+            (
+                VK_H,
+                MOD_ALT | MOD_SHIFT | MOD_CONTROL,
+                MOVE_DESKTOP_PREVIOUS,
+            ),
+            (VK_H, MOD_ALT | MOD_WIN, QUICK_RESIZE),
+            (VK_H, MOD_ALT | MOD_WIN | MOD_CONTROL, QUICK_REVERSE),
+            (VK_1, MOD_ALT, DESKTOP_FIRST),
+            (crate::settings::WHEEL_DOWN, MOD_ALT, DESKTOP_NEXT),
+            (VK_F9, MOD_CONTROL, MOVE + 1),
+        ] {
+            assert_eq!(command(Mode::Normal, key, mods), Some(id));
+        }
+        for (key, mods) in [
+            (VK_LEFT, MOD_WIN),
+            (VK_H, MOD_WIN),
+            (VK_RIGHT, MOD_ALT | MOD_CONTROL),
+            (crate::settings::WHEEL_DOWN, MOD_WIN),
+        ] {
+            assert_eq!(command(Mode::Normal, key, mods), None);
+        }
+        for (mods, id) in [
+            (0, EXPAND),
+            (MOD_ALT, EXPAND),
+            (MOD_CONTROL, SHRINK),
+            (MOD_ALT | MOD_CONTROL, SHRINK),
+        ] {
+            assert_eq!(command(Mode::Resize, VK_H, mods), Some(id));
+        }
+        assert_eq!(command(Mode::Resize, VK_LEFT, 0), None);
     }
 
     #[test]

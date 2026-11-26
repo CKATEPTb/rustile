@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
-use super::Settings;
+use super::{Command, Modifier, SchemeKey, Settings};
 
 // Wheel directions share the binding table with keyboard virtual keys,
 // which occupy 0x00..=0xff.
@@ -125,20 +125,29 @@ impl Shortcut {
 
     fn inherited(self, settings: &Settings) -> Chord {
         let (_, group, key) = self.spec();
-        let mods = match group {
-            Group::Focus => settings.focus.bits(),
-            Group::Move => settings.movement.bits(),
-            Group::StartResize => settings.resize.bits(),
-            Group::Grow | Group::Finish => 0,
-            Group::Shrink => MOD_SHIFT,
-            Group::Quick => MOD_WIN | MOD_ALT,
-            Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
-            Group::DesktopMove => MOD_WIN | MOD_CONTROL | MOD_SHIFT,
-            Group::Desktop if matches!(key, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN) => {
-                MOD_WIN | MOD_CONTROL
-            }
-            Group::Window | Group::Desktop => MOD_WIN,
+        let base = settings.scheme_modifier(SchemeKey::Base);
+        let grab = settings.scheme_modifier(SchemeKey::Grab);
+        let desktop = settings.scheme_modifier(SchemeKey::Desktop);
+        let quick = settings.scheme_modifier(SchemeKey::Resize);
+        let direction = match key {
+            VK_LEFT => Some(SchemeKey::Left),
+            VK_RIGHT => Some(SchemeKey::Right),
+            VK_UP => Some(SchemeKey::Up),
+            VK_DOWN => Some(SchemeKey::Down),
+            _ => None,
         };
+        let mods = match group {
+            Group::Focus | Group::StartResize | Group::Window => base,
+            Group::Move => base | grab,
+            Group::Grow | Group::Finish => 0,
+            Group::Shrink => grab,
+            Group::Quick => base | quick,
+            Group::QuickReverse => base | quick | grab,
+            Group::DesktopMove => base | desktop | grab,
+            Group::Desktop if direction.is_some() => base | desktop,
+            Group::Desktop => base,
+        };
+        let key = direction.map_or(key, |role| settings.scheme_key(role));
         Chord { mods, key }
     }
 }
@@ -193,6 +202,10 @@ impl Chord {
 
     pub fn key_label(key: u16) -> String {
         match key {
+            VK_LWIN | VK_RWIN => "Win",
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => "Shift",
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => "Ctrl",
+            VK_MENU | VK_LMENU | VK_RMENU => "Alt",
             VK_A..=VK_Z | VK_0..=VK_9 => {
                 return layout_key_name(key).unwrap_or_else(|| char::from(key as u8).to_string());
             }
@@ -390,6 +403,18 @@ impl From<StoredOverrides> for Overrides {
         for (action, chord) in stored.bindings {
             overrides.0[action.index()] = Some(chord);
         }
+        overrides
+    }
+}
+
+impl Settings {
+    pub(super) fn import_legacy_bindings(
+        &mut self,
+        focus: Option<Modifier>,
+        movement: Option<Modifier>,
+        resize: Option<Modifier>,
+    ) {
+        let overrides = &mut self.shortcuts;
         // Older profiles may already assign the default chord of a new action.
         // Keep the user's binding and leave the newly introduced action unassigned.
         for action in Shortcut::ALL {
@@ -411,7 +436,27 @@ impl From<StoredOverrides> for Overrides {
                 overrides.0[action.index()] = Some(Binding::Disabled);
             }
         }
-        overrides
+        for action in Shortcut::ALL {
+            if overrides.0[action.index()].is_some() {
+                continue;
+            }
+            let (_, group, key) = action.spec();
+            let legacy = match group {
+                Group::Focus => focus,
+                Group::Move => movement,
+                Group::StartResize => resize,
+                _ => None,
+            };
+            if let Some(modifier) = legacy {
+                let chord = Chord {
+                    mods: modifier.bits(),
+                    key,
+                };
+                if chord != action.default_chord() {
+                    overrides.0[action.index()] = Some(Binding::Assigned(chord));
+                }
+            }
+        }
     }
 }
 
@@ -425,6 +470,27 @@ impl From<Overrides> for BTreeMap<Shortcut, Binding> {
 }
 
 impl Settings {
+    pub fn inherited_chord(&self, action: Shortcut) -> Chord {
+        action.inherited(self)
+    }
+
+    pub fn has_shortcut_override(&self, action: Shortcut) -> bool {
+        self.shortcuts.0[action.index()].is_some()
+    }
+
+    pub fn with_resize_override(self, modifier: Modifier) -> Result<Self, String> {
+        let opener = Shortcut::StartResize;
+        let chord = Chord {
+            mods: modifier.bits(),
+            key: VK_RETURN,
+        };
+        let mut live = self.changed(Command::Shortcut(opener, chord))?;
+        // Even if the command line matches today's scheme, keep that explicit
+        // launch choice when the user edits a shared role later in this session.
+        live.shortcuts.0[opener.index()] = Some(Binding::Assigned(chord));
+        Ok(live)
+    }
+
     pub fn binding(&self, action: Shortcut) -> Option<Chord> {
         match self.shortcuts.0[action.index()] {
             None => Some(action.inherited(self)),
@@ -493,19 +559,22 @@ impl Settings {
     // The original resize mode also accepts its default keys while the opener's
     // modifiers remain held. An explicit modal binding replaces those aliases.
     pub fn resize_alias(&self, action: Shortcut, input: Chord) -> bool {
-        let (_, group, key) = action.spec();
+        let (_, group, _) = action.spec();
+        let key = self.inherited_chord(action).key;
         if key != input.key || self.shortcuts.0[action.index()].is_some() {
             return false;
         }
+        let base = self.scheme_modifier(SchemeKey::Base);
+        let grab = self.scheme_modifier(SchemeKey::Grab);
         let opener = self.binding(Shortcut::StartResize).map(|chord| chord.mods);
         match group {
             Group::Grow | Group::Shrink => {
-                let shift = if group == Group::Shrink { MOD_SHIFT } else { 0 };
-                input.mods == MOD_WIN | shift
-                    || opener.is_some_and(|mods| input.mods == (mods & !MOD_SHIFT) | shift)
+                let inverse = if group == Group::Shrink { grab } else { 0 };
+                input.mods == base | inverse
+                    || opener.is_some_and(|mods| input.mods == (mods & !grab) | inverse)
             }
             Group::Finish => {
-                Some(input.mods) == opener || (action == Shortcut::Cancel && input.mods == MOD_WIN)
+                Some(input.mods) == opener || (action == Shortcut::Cancel && input.mods == base)
             }
             _ => false,
         }

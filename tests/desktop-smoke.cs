@@ -475,6 +475,68 @@ internal static class DesktopSmoke {
     static string[] ShortcutLabels(IntPtr editor) {
         return Enumerable.Range(1000, 50).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
+    static void ShowShortcutPage(IntPtr editor, bool advanced) {
+        var action = EditorControl(editor, 1000);
+        var role = EditorControl(editor, 1200);
+        if (IsWindowVisible(action) != advanced) ClickControl(editor, 512);
+        Until("Switching shortcut pages should expose the selected controls", () =>
+            IsWindowVisible(action) == advanced && IsWindowVisible(role) != advanced);
+    }
+    static void RecordSchemeKey(IntPtr editor, int role, Keys key) {
+        var row = EditorControl(editor, 1200 + role);
+        BeginRecording(row);
+        CaptureKey(row, key, true);
+        CaptureKey(row, key, false);
+    }
+    static void VerifySchemeEditor(Child manager, IntPtr editor, string file) {
+        var view = EditorControl(editor, 510);
+        var defaults = new[] { "Win", "Shift", "Ctrl", "Alt", "←", "→", "↑", "↓" };
+        string before = File.ReadAllText(file);
+        var rows = Enumerable.Range(1200, 8).Select(id => EditorControl(editor, id)).ToArray();
+        var initial = rows.Select(ControlText).ToArray();
+        var desktopExample = EditorControl(editor, 1242);
+        Require(rows.All(IsWindowVisible) && !IsWindowVisible(EditorControl(editor, 1000))
+            && IsWindowVisible(EditorControl(editor, 512)), "The editor should open on its compact eight-key scheme");
+        Require(initial.Select((s, i) => s.EndsWith(defaults[i])).All(x => x), "Unexpected factory roles or direction keys");
+        Require(ControlText(desktopExample).Split(',').Last().TrimStart().StartsWith("Win+"),
+            "Desktop navigation should show its primary role first");
+        var viewport = Bounds(view);
+        if (viewport.Width * 96 >= 750 * GetDpiForWindow(editor) && viewport.Height * 96 >= 420 * GetDpiForWindow(editor))
+            Require(rows.All(row => viewport.Contains(Bounds(row))), "The eight shared keys should fit on the default page");
+        // Choosing Q for Left would generate the close-window chord in the same mode.
+        RecordSchemeKey(editor, 4, Keys.Q);
+        var error = EditorControl(editor, 506);
+        Until("A conflicting generated chord should explain the rejected role edit", () =>
+            IsWindowVisible(error) && ControlText(error).Length > 0);
+        Require(File.ReadAllText(file) == before && rows.Select(ControlText).SequenceEqual(initial),
+            "A conflicting direction must leave the shared scheme intact");
+        var names = new[] { initial[0].Split(',')[0], initial[3].Split(',')[0], "Alt", "Win" };
+        RecordSchemeKey(editor, 0, Keys.Menu);
+        ChooseConflict(manager, editor, ConflictChoice.Escape, names);
+        Require(File.ReadAllText(file) == before && rows.Select(ControlText).SequenceEqual(initial),
+            "Cancelling a modifier swap must preserve both roles and the saved scheme");
+        RecordSchemeKey(editor, 0, Keys.Menu);
+        ChooseConflict(manager, editor, ConflictChoice.ClickAssign, names);
+        Until("Accepting a role swap must update both modifier fields and the primary key in examples", () =>
+            ControlText(rows[0]).EndsWith("Alt") && ControlText(rows[3]).EndsWith("Win")
+            && ControlText(desktopExample).Split(',').Last().TrimStart().StartsWith("Alt+"));
+        ClickControl(editor, 505);
+        Until("Resetting the scheme should restore its default role assignments", () =>
+            rows.Select(ControlText).SequenceEqual(initial) && File.ReadAllText(file) == before);
+        RecordSchemeKey(editor, 4, Keys.F10);
+        Until("Recording a direction should update a real live example", () =>
+            ControlText(rows[4]).EndsWith("F10")
+            && Enumerable.Range(1240, 5).Any(id => ControlText(EditorControl(editor, id)).Contains("F10")));
+        ShowShortcutPage(editor, true);
+        var derived = ShortcutLabels(editor);
+        foreach (var id in new[] { 0, 4, 9, 13, 19, 23, 30, 46 })
+            Require(derived[id].EndsWith("F10"), "Changing one direction did not reach action " + id);
+        ShowShortcutPage(editor, false);
+        ClickControl(editor, 1214);
+        Until("A direction reset should restore the previous profile", () =>
+            ControlText(rows[4]) == initial[4] && File.ReadAllText(file) == before);
+        ShowShortcutPage(editor, true);
+    }
     static void VerifyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
         Require(status == IntPtr.Zero || !IsWindowVisible(status) || ControlText(status).Length == 0,
@@ -528,7 +590,7 @@ internal static class DesktopSmoke {
         SendTrayMessage(view, 0x0115, (IntPtr)6, IntPtr.Zero);
     }
     enum ConflictChoice { DefaultEnter, TabEnter, Escape, ClickAssign }
-    static void ChooseConflict(Child manager, IntPtr editor, ConflictChoice choice) {
+    static void ChooseConflict(Child manager, IntPtr editor, ConflictChoice choice, string[] roleSwap = null) {
         IntPtr dialog = IntPtr.Zero;
         Until("The assignment conflict should appear over its editor", () => {
             Require(!manager.Exited(0), "Rustile exited before showing the conflict");
@@ -551,12 +613,12 @@ internal static class DesktopSmoke {
             return true;
         }, IntPtr.Zero);
         string message = copy.ToString();
-        Require(new[] { "Фокус влево", "Переместить влево", "Win+←" }
+        Require((roleSwap ?? new[] { "Фокус влево", "Переместить влево", "Win+←" })
             .All(label => message.IndexOf(label, StringComparison.OrdinalIgnoreCase) >= 0),
             "Conflict prompt must identify the chord and both actions: " + message);
         var cancel = EditorControl(dialog, 2 /* IDCANCEL */);
         var assign = EditorControl(dialog, 1 /* IDOK */);
-        Require(ControlText(cancel) == "Отмена" && ControlText(assign) == "Переназначить",
+        Require(ControlText(cancel) == "Отмена" && ControlText(assign) == (roleSwap == null ? "Переназначить" : "Поменять"),
             "The conflict dialog should offer cancel and reassign");
         int owner;
         int dialogThread = (int)GetWindowThreadProcessId(dialog, out owner);
@@ -881,6 +943,8 @@ internal static class DesktopSmoke {
         var beforeEditor = pair.Select(VisibleFrame).ToArray();
         var editor = OpenShortcutEditor(manager, tray, area);
         Require(GetWindow(editor, 4 /* GW_OWNER */) == IntPtr.Zero, "Shortcut editor should be an independent window");
+        var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
+        VerifySchemeEditor(manager, editor, file);
         var initial = ShortcutLabels(editor);
         VerifyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
@@ -909,7 +973,6 @@ internal static class DesktopSmoke {
         var right = EditorControl(editor, 1005);
         var up = EditorControl(editor, 1006);
         var focusLeft = EditorControl(editor, 1000);
-        var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
         var beforeCapture = File.ReadAllText(file);
         var toggle = EditorControl(editor, 1029);
         BeginRecording(toggle);
@@ -986,11 +1049,22 @@ internal static class DesktopSmoke {
         expected[4] = ControlText(left);
         expected[6] = punctuation;
         Require(ShortcutLabels(editor).SequenceEqual(expected), "A row reset changed a neighboring shortcut");
+        ShowShortcutPage(editor, false);
+        RecordSchemeKey(editor, 6 /* Up */, Keys.F10);
+        Until("Editing a role after an individual assignment should save the new direction", () =>
+            ControlText(EditorControl(editor, 1206)).EndsWith("F10"));
+        ShowShortcutPage(editor, true);
+        var remapped = ShortcutLabels(editor);
+        Require(remapped[2].EndsWith("F10") && remapped[32].EndsWith("F10")
+            && remapped[6] == punctuation && remapped[0] == expected[0] && remapped[4] == expected[4],
+            "A scheme edit must keep explicit and unbound shortcuts while the inherited commands change");
+        expected = remapped;
         Require(pair.Select(VisibleFrame).SequenceEqual(beforeEditor), "Shortcut editor changed the tiled layout");
         Message(editor, WmClose);
         Until("Closing the editor should leave Rustile running", () => !IsWindowVisible(editor) && !manager.Exited(0));
         TrayOpen(tray, TraySelect, area);
         editor = OpenShortcutEditor(manager, tray, area);
+        ShowShortcutPage(editor, true);
         Require(ShortcutLabels(editor).SequenceEqual(expected), "Reopening lost the transferred chord, disabled action or OEM key");
         VerifyIdleHeader(editor);
         Message(editor, WmClose);
@@ -1030,6 +1104,9 @@ internal static class DesktopSmoke {
         TrayButton(tray, "Толщина обводки, 3 px");
         Require(pair.Select(Bounds).SequenceEqual(originals), "Disabled startup tiled the windows");
         editor = OpenShortcutEditor(restarted, tray, area);
+        Require(IsWindowVisible(EditorControl(editor, 1206)) && ControlText(EditorControl(editor, 1206)).EndsWith("F10"),
+            "The remapped scheme key should survive application restart");
+        ShowShortcutPage(editor, true);
         var restored = ShortcutLabels(editor);
         Require(restored.SequenceEqual(expected), "Shortcut labels changed after restart: " +
             string.Join(", ", restored.Select((label, i) => label == expected[i] ? null :
@@ -1066,6 +1143,8 @@ internal static class DesktopSmoke {
         tray = TrayWindow(defaults);
         TrayOpen(tray, TraySelect, area);
         editor = OpenShortcutEditor(defaults, tray, area);
+        Require(ControlText(EditorControl(editor, 1206)).EndsWith("↑"), "Reset all did not restore the saved direction");
+        ShowShortcutPage(editor, true);
         Require(ShortcutLabels(editor).SequenceEqual(initial), "Reset all did not survive restart");
         Message(editor, WmClose);
         Until("The final shortcut editor should close", () => !IsWindowVisible(editor));
@@ -1074,6 +1153,7 @@ internal static class DesktopSmoke {
         Until("Exit after resetting shortcuts should restore fixture frames", () =>
             pair.Select(Bounds).SequenceEqual(originals));
         Console.WriteLine("PASS  Shortcut editor reflows, keeps the selection visible in its header, records on last release, resolves conflicts and persists resets");
+        Console.WriteLine("PASS  Eight shared keys, live examples, confirmed modifier swaps, directional inheritance and individual exceptions survive restart and reset");
         Console.WriteLine("PASS  Tray pause, exit while paused, saved shortcut/outline/spacing, paused restart and resume");
         Console.WriteLine("PASS  The mosaic shortcut resumes without a target and pauses again, in sync with the open tray and saved state");
     }

@@ -31,7 +31,8 @@ impl ShortcutWindow {
             };
         let action = row_action(id);
         let selected = action == Some(self.selected.get());
-        let reset = reset_action(id).is_some() && !disabled;
+        let reset =
+            (reset_action(id).is_some() || scheme::reset_from_id(id).is_some()) && !disabled;
         let recording = action.is_some_and(|a| self.recording(a));
         let highlighted = colors.high_contrast && (selected || hovered || pressed);
         let surface = if highlighted {

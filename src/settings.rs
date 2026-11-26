@@ -1,8 +1,11 @@
 mod bindings;
+mod scheme;
 
 use crate::profile_io;
 use bindings::Overrides;
 pub(crate) use bindings::{BindingOwners, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
+use scheme::Scheme;
+pub(crate) use scheme::SchemeKey;
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
 
@@ -17,9 +20,7 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_RETURN,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) enum Modifier {
@@ -60,6 +61,7 @@ pub(crate) enum Command {
     Outline(u8),
     Gap(u8),
     Padding(u8),
+    SchemeKey(SchemeKey, u16),
     Shortcut(Shortcut, Chord),
     ReassignShortcut(Shortcut, Chord, BindingOwners),
     ResetShortcut(Shortcut),
@@ -71,7 +73,8 @@ impl Command {
     pub fn changes_shortcuts(self) -> bool {
         matches!(
             self,
-            Self::Shortcut(..)
+            Self::SchemeKey(..)
+                | Self::Shortcut(..)
                 | Self::ReassignShortcut(..)
                 | Self::ResetShortcut(_)
                 | Self::ResetShortcuts
@@ -80,16 +83,15 @@ impl Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(from = "StoredSettings")]
 pub(crate) struct Settings {
     version: u16,
     pub enabled: bool,
     pub outline: u8,
     pub gap: u8,
     pub padding: u8,
-    pub focus: Modifier,
-    pub movement: Modifier,
-    pub resize: Modifier,
+    #[serde(skip_serializing_if = "Scheme::is_default")]
+    scheme: Scheme,
     #[serde(skip_serializing_if = "Overrides::is_empty")]
     shortcuts: Overrides,
 }
@@ -102,11 +104,46 @@ impl Default for Settings {
             outline: 1,
             gap: 8,
             padding: 8,
-            focus: Modifier::Win,
-            movement: Modifier::WinShift,
-            resize: Modifier::Win,
+            scheme: Scheme::default(),
             shortcuts: Overrides::default(),
         }
+    }
+}
+
+// Pre-scheme profiles stored three independent modifier groups. Import those
+// groups as individual exceptions so unrelated rules keep their original keys.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSettings {
+    version: Option<u16>,
+    enabled: Option<bool>,
+    outline: Option<u8>,
+    gap: Option<u8>,
+    padding: Option<u8>,
+    focus: Option<Modifier>,
+    movement: Option<Modifier>,
+    resize: Option<Modifier>,
+    scheme: Option<Scheme>,
+    #[serde(default)]
+    shortcuts: Overrides,
+}
+
+impl From<StoredSettings> for Settings {
+    fn from(file: StoredSettings) -> Self {
+        let defaults = Self::default();
+        let mut settings = Self {
+            version: file.version.unwrap_or(defaults.version),
+            enabled: file.enabled.unwrap_or(defaults.enabled),
+            outline: file.outline.unwrap_or(defaults.outline),
+            gap: file.gap.unwrap_or(defaults.gap),
+            padding: file.padding.unwrap_or(defaults.padding),
+            scheme: file.scheme.unwrap_or_default(),
+            shortcuts: file.shortcuts,
+        };
+        if file.scheme.is_none() {
+            settings.import_legacy_bindings(file.focus, file.movement, file.resize);
+        }
+        settings
     }
 }
 
@@ -128,6 +165,7 @@ impl Settings {
                 Self::MAX_OUTLINE
             ));
         }
+        self.scheme.validate()?;
         self.validate_shortcuts()?;
         Ok(self)
     }
@@ -138,6 +176,7 @@ impl Settings {
             Command::Outline(value) => self.outline = value,
             Command::Gap(value) => self.gap = value,
             Command::Padding(value) => self.padding = value,
+            Command::SchemeKey(role, key) => self.set_scheme_key(role, key)?,
             Command::Shortcut(action, chord) => self.assign(action, chord)?,
             Command::ReassignShortcut(action, chord, owner) => {
                 if self.conflict(action, chord) != Some(owner) {
@@ -145,12 +184,10 @@ impl Settings {
                 }
                 self.transfer_confirmed(action, chord, owner)?;
             }
-            Command::ResetShortcut(action) => self.assign(action, action.default_chord())?,
+            Command::ResetShortcut(action) => self.assign(action, self.inherited_chord(action))?,
             Command::ResetShortcuts => {
                 let defaults = Self::default();
-                self.focus = defaults.focus;
-                self.movement = defaults.movement;
-                self.resize = defaults.resize;
+                self.scheme = defaults.scheme;
                 self.shortcuts = defaults.shortcuts;
             }
             Command::SetStartup(_) | Command::Exit => {}
@@ -173,16 +210,6 @@ impl Settings {
             return self.validated();
         }
         self.changed(command)
-    }
-
-    pub fn with_resize_override(self, modifier: Modifier) -> Result<Self, String> {
-        self.changed(Command::Shortcut(
-            Shortcut::StartResize,
-            Chord {
-                mods: modifier.bits(),
-                key: VK_RETURN,
-            },
-        ))
     }
 
     pub fn path() -> Result<PathBuf, String> {
@@ -559,7 +586,7 @@ mod tests {
 
     #[test]
     fn individual_bindings_roundtrip_without_changing_legacy_profile_or_neighbors() {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_LEFT, VK_RIGHT};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_H, VK_LEFT, VK_RETURN, VK_RIGHT};
         let profile: Settings = toml::from_str(
             "focus = 'ctrl+alt'\nmovement = 'alt+shift'\nresize = 'ctrl+shift'\npadding = 12",
         )

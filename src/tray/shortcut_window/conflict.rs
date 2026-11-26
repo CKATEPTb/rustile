@@ -11,10 +11,28 @@ impl ShortcutWindow {
         chord: Chord,
         previous: BindingOwners,
     ) -> Result<(), String> {
-        let owner = self.hwnd.get();
         let transfer = Command::ReassignShortcut(action, chord, previous);
+        let verb = match previous {
+            BindingOwners::One(_) => "останется",
+            BindingOwners::Both(_, _) => "останутся",
+        };
+        let message = format!(
+            "Назначить действию «{}»?\r\n{} {verb} без сочетания.",
+            action.label(),
+            previous.labels(),
+        );
+        self.confirm_change(transfer, &chord.label(), &message)
+    }
+
+    pub(super) fn confirm_change(
+        &self,
+        command: Command,
+        key_label: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let owner = self.hwnd.get();
         // Validate against the live profile before offering a destructive change.
-        self.settings.get().changed(transfer)?;
+        self.settings.get().changed(command)?;
         let dialog = unsafe {
             CreateDialogParamW(
                 GetModuleHandleW(null()),
@@ -30,26 +48,21 @@ impl ShortcutWindow {
                 io::Error::last_os_error()
             ));
         }
-        self.transfer.set(Some(transfer));
+        self.transfer.set(Some(command));
         self.conflict.set(dialog);
-        caption(child(dialog, CHORD), &chord.label());
-        let verb = match previous {
-            BindingOwners::One(_) => "останется",
-            BindingOwners::Both(_, _) => "останутся",
-        };
-        let message = format!(
-            "Назначить действию «{}»?\r\n{} {verb} без сочетания.",
-            action.label(),
-            previous.labels(),
-        );
-        caption(child(dialog, BODY), &message);
+        if matches!(command, Command::SchemeKey(..)) {
+            caption(dialog, "Поменять клавиши местами?");
+            caption(child(dialog, IDOK), "Поменять");
+        }
+        caption(child(dialog, CHORD), key_label);
+        caption(child(dialog, BODY), message);
         unsafe {
             let mut owner_rect = RECT::default();
             let mut rect = RECT::default();
             GetWindowRect(owner, &mut owner_rect);
             GetWindowRect(dialog, &mut rect);
             let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top + fit_message(dialog, &message);
+            let height = rect.bottom - rect.top + fit_message(dialog, message);
             let mut x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
             let mut y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
             let mut info = MONITORINFO {
@@ -81,7 +94,7 @@ impl ShortcutWindow {
             DestroyWindow(dialog);
             if return_focus {
                 SetActiveWindow(owner);
-                SetFocus(self.row(self.selected.get()));
+                SetFocus(self.selected_control());
             }
         }
         if accept && let Some(command) = command {
@@ -177,8 +190,11 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 paint::fill(dc, &r, colors.background, 0);
                 SetBkMode(dc, TRANSPARENT as i32);
                 if item.CtlID == CHORD as u32 {
-                    if let Some(Command::ReassignShortcut(_, chord, _)) = ui.transfer.get() {
-                        let label = chord.label();
+                    let mut buffer = vec![0; GetWindowTextLengthW(item.hwndItem) as usize + 1];
+                    let length =
+                        GetWindowTextW(item.hwndItem, buffer.as_mut_ptr(), buffer.len() as i32);
+                    if length > 0 {
+                        let label = String::from_utf16_lossy(&buffer[..length as usize]);
                         let font = if appearance::text_width(dc, fonts.display, &label)
                             > r.right - r.left
                         {
@@ -227,7 +243,9 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 paint::text(
                     dc,
                     r,
-                    if accept {
+                    if accept && matches!(ui.transfer.get(), Some(Command::SchemeKey(..))) {
+                        "Поменять"
+                    } else if accept {
                         "Переназначить"
                     } else {
                         "Отмена"
