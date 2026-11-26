@@ -341,11 +341,16 @@ impl DesktopShell {
             let order = manager.object(manager.vtable().list)?;
             let last = unsafe { order.GetCount() }.ok()?.checked_sub(1)?;
             if unsafe { order.GetAt::<ShellDesktop>(last) }.ok()?.id()? == id {
-                return Some(());
+                return Some(true);
             }
-            manager.move_desktop(&desktop, last)
+            // The user can select the spare after the occupancy scan.
+            if manager.current()? == id {
+                return Some(false);
+            }
+            manager.move_desktop(&desktop, last)?;
+            Some(true)
         })
-        .is_some()
+        .unwrap_or(false)
     }
 
     pub(crate) fn switch(&self, id: DesktopId) -> bool {
