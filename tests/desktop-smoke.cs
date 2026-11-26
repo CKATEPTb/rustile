@@ -70,6 +70,7 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr hwnd, int index);
     [DllImport("user32.dll")] static extern int SetWindowLongW(IntPtr hwnd, int index, int value);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after,
@@ -84,6 +85,11 @@ internal static class DesktopSmoke {
     [DllImport("user32.dll")] static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetDCEx(IntPtr hwnd, IntPtr region, uint flags);
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);
+    [DllImport("user32.dll")] static extern bool GetUpdateRect(IntPtr hwnd, IntPtr rect, bool erase);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dest, int x, int y, int width, int height,
+        IntPtr source, int srcX, int srcY, uint op);
     [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
     [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -611,6 +617,91 @@ internal static class DesktopSmoke {
             .GroupBy(action => action.rect.Left).OrderBy(column => column.Key)
             .Select(column => column.OrderBy(action => action.rect.Top).Select(action => action.id).ToArray()).ToArray();
     }
+    static int[] PaintedPixels(IntPtr editor) {
+        Rect client;
+        Require(GetClientRect(editor, out client), "Cannot measure the shortcut editor");
+        var size = new Size(client.Right, client.Bottom);
+        // Read the backing DC without WS_CLIPCHILDREN. Asking controls to draw
+        // into a bitmap here would erase the very artifacts this test observes.
+        var source = GetDCEx(editor, IntPtr.Zero, 2 /* DCX_CACHE */);
+        Require(source != IntPtr.Zero, "Cannot read the shortcut editor's client area");
+        try {
+            using (var bitmap = new Bitmap(size.Width, size.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb)) {
+                using (var graphics = Graphics.FromImage(bitmap)) {
+                    var target = graphics.GetHdc();
+                    try { Require(BitBlt(target, 0, 0, size.Width, size.Height, source, 0, 0, 0x00cc0020), "Cannot copy the existing viewport pixels"); }
+                    finally { graphics.ReleaseHdc(target); }
+                }
+                var data = bitmap.LockBits(new Rectangle(Point.Empty, size), System.Drawing.Imaging.ImageLockMode.ReadOnly, bitmap.PixelFormat);
+                try {
+                    var pixels = new int[size.Width * size.Height];
+                    Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
+                    return pixels;
+                } finally { bitmap.UnlockBits(data); }
+            }
+        } finally { ReleaseDC(editor, source); }
+    }
+    static void VerifyPaintedFrame(IntPtr editor, string transition) {
+        // Let naturally queued WM_PAINTs complete before inspecting the frame.
+        // GetUpdateRect does not invalidate, validate or render the window.
+        Until("Shortcut painting should settle after " + transition, () => {
+            bool dirty = GetUpdateRect(editor, IntPtr.Zero, false);
+            EnumChildWindows(editor, delegate(IntPtr hwnd, IntPtr unused) {
+                dirty |= IsWindowVisible(hwnd) && GetUpdateRect(hwnd, IntPtr.Zero, false);
+                return !dirty;
+            }, IntPtr.Zero);
+            return !dirty;
+        });
+        SendTrayMessage(editor, 0 /* WM_NULL */, IntPtr.Zero, IntPtr.Zero);
+        var before = PaintedPixels(editor);
+        Require(RedrawWindow(editor, IntPtr.Zero, IntPtr.Zero, 0x185 /* INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW */),
+            "Could not fully repaint the shortcut editor");
+        SendTrayMessage(editor, 0, IntPtr.Zero, IntPtr.Zero);
+        var after = PaintedPixels(editor);
+        int changed = 0, content = 0;
+        for (int i = 0; i < after.Length; ++i) {
+            if (((before[i] ^ after[i]) & 0xffffff) != 0) changed++;
+            if (((after[i] ^ after[0]) & 0xffffff) != 0) content++;
+        }
+        Require(content > 500, "The client snapshot did not include the shortcut controls after " + transition);
+        Require(changed == 0, "A full repaint changed " + changed + " stale pixels after " + transition);
+    }
+    static void VerifyShortcutRepaint(IntPtr editor, string file) {
+        var original = Bounds(editor);
+        var toggle = EditorControl(editor, 1029);
+        var add = EditorControl(editor, 1329);
+        int dpi = (int)GetDpiForWindow(editor);
+        foreach (bool shift in new[] { false, true }) {
+            var before = File.ReadAllText(file);
+            MouseClick(add);
+            var keys = shift ? new[] { Keys.ControlKey, Keys.LWin, Keys.ShiftKey, Keys.Y } : new[] { Keys.ControlKey, Keys.LWin, Keys.Y };
+            EnterChord(toggle, keys);
+            string chord = shift ? "Ctrl+Win+Shift+Y" : "Ctrl+Win+Y";
+            Until("The mosaic toggle should retain its new alternative", () =>
+                File.ReadAllText(file) != before && IsWindowEnabled(add) && ShortcutLabel(editor, 29).EndsWith(chord));
+            VerifyPaintedFrame(editor, "adding " + chord);
+        }
+        foreach (int width in new[] { 940, 460 }) {
+            Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, width * dpi / 96, 650 * dpi / 96, 0x16), "Could not reflow the shortcut editor");
+            VerifyPaintedFrame(editor, "narrowing to " + width);
+        }
+        MouseClick(EditorControl(editor, 513));
+        VerifyPaintedFrame(editor, "next page");
+        MouseClick(EditorControl(editor, 512));
+        VerifyPaintedFrame(editor, "previous page");
+        // Drag past both column breakpoints and back without repainting on the
+        // fixture's behalf between consecutive Windows resize notifications.
+        foreach (int width in new[] { 530, 640, 745, 780, 825, 940, 1030, 1120, 1190, 1280, 1190, 1120, 1010, 900 }) {
+            Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, width * dpi / 96, 650 * dpi / 96, 0x16),
+                "Could not drag the shortcut editor across a column breakpoint");
+        }
+        VerifyPaintedFrame(editor, "rapid resizes across both column breakpoints");
+        Require(SetWindowPos(editor, IntPtr.Zero, original.X, original.Y, original.Width, original.Height, 0x14), "Cannot restore editor width");
+        VerifyPaintedFrame(editor, "restoring three columns");
+        MouseClick(EditorControl(editor, 1129));
+        Until("The mosaic shortcuts should be reset", () => ShortcutLabel(editor, 29).EndsWith(", Win+Y"));
+        VerifyPaintedFrame(editor, "removing both alternate bindings");
+    }
     static void VerifyEditorLayout(IntPtr editor) {
         var original = Bounds(editor);
         int dpi = (int)GetDpiForWindow(editor);
@@ -1119,6 +1210,7 @@ internal static class DesktopSmoke {
         var focusLeft = EditorControl(editor, 1000);
         var file = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
         var beforeCapture = File.ReadAllText(file);
+        VerifyShortcutRepaint(editor, file);
         VerifyAlternativeEdits(editor, left, initial[4], file);
         var previousDesktop = EditorControl(editor, 1030);
         BeginRecording(previousDesktop);

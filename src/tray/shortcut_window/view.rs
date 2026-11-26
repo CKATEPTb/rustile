@@ -322,23 +322,14 @@ impl ShortcutWindow {
             let height = bounds.bottom.max(self.p(18));
             place(status, margin, top + p(4), content, height);
             top += height + p(12);
-        }
-        unsafe {
-            ShowWindow(
-                status,
-                if count > 0 {
-                    SW_SHOWNOACTIVATE
-                } else {
-                    SW_HIDE
-                },
-            );
+        } else {
+            hide(status);
         }
         top += p(1);
         let height = (client.bottom - top).max(1);
         let view = child(hwnd, VIEW);
         place(view, 0, top, width, height);
         self.layout_rows(view, width, height, None);
-        unsafe { InvalidateRect(hwnd, null(), 1) };
     }
 
     fn action_lines(&self, view: HWND, dc: HDC, action: Shortcut, col: i32) -> ActionLines {
@@ -417,7 +408,8 @@ impl ShortcutWindow {
     }
 
     fn layout_rows(&self, view: HWND, width: i32, height: i32, reveal: Option<HWND>) {
-        if view.is_null() {
+        let editor = self.hwnd.get();
+        if editor.is_null() || view.is_null() {
             return;
         }
         let p = |n| self.p(n);
@@ -514,24 +506,14 @@ impl ShortcutWindow {
                 || (focus == next && page + 1 == page_count));
         unsafe {
             for item in items.iter() {
-                SetWindowPos(
-                    item.hwnd,
-                    null_mut(),
-                    item.x,
-                    item.y,
-                    item.width,
-                    item.height,
-                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-                );
+                place(item.hwnd, item.x, item.y, item.width, item.height);
             }
             EnableWindow(prev, i32::from(page > 0));
             EnableWindow(next, i32::from(page + 1 < page_count));
             let mut hwnd = GetWindow(view, GW_CHILD);
             while !hwnd.is_null() {
-                if !visible.contains(&hwnd)
-                    && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0
-                {
-                    ShowWindow(hwnd, SW_HIDE);
+                if !visible.contains(&hwnd) {
+                    hide(hwnd);
                 }
                 hwnd = GetWindow(hwnd, GW_HWNDNEXT);
             }
@@ -550,6 +532,14 @@ impl ShortcutWindow {
             {
                 SetFocus(target);
             }
+            // Both containers clip their children. Repaint the final layout as a
+            // tree, including the background exposed by moved or hidden controls.
+            RedrawWindow(
+                editor,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
         }
     }
 
@@ -593,7 +583,12 @@ impl ShortcutWindow {
     }
 }
 
-pub(super) fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+// The final RedrawWindow also covers the header. Do not copy pixels from the
+// previous layout or paint intermediate positions during a column change.
+const LAYOUT_FLAGS: SET_WINDOW_POS_FLAGS =
+    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS;
+
+fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe {
         SetWindowPos(
             hwnd,
@@ -602,9 +597,25 @@ pub(super) fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
             y,
             width.max(1),
             height.max(1),
-            SWP_NOACTIVATE | SWP_NOZORDER,
+            LAYOUT_FLAGS | SWP_SHOWWINDOW,
         )
     };
+}
+
+fn hide(hwnd: HWND) {
+    unsafe {
+        if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                LAYOUT_FLAGS | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW,
+            );
+        }
+    }
 }
 
 unsafe extern "system" fn view_proc(
@@ -619,9 +630,18 @@ unsafe extern "system" fn view_proc(
         let ui = &*(data as *const ShortcutWindow);
         let parent = GetParent(hwnd);
         match msg {
-            WM_ERASEBKGND => {
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                paint::background(dc, &paint.rcPaint, ui.colors.get());
+                EndPaint(hwnd, &paint);
+                0
+            }
+            // The opaque WM_PAINT above covers the entire update region.
+            WM_ERASEBKGND => 1,
+            WM_PRINTCLIENT => {
                 ui.background(hwnd, wp as HDC);
-                1
+                0
             }
             WM_DRAWITEM | WM_COMMAND | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_MOUSEWHEEL => {
                 SendMessageW(parent, msg, wp, lp)
