@@ -5,7 +5,9 @@ use std::ptr::{null, null_mut};
 use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, IServiceProvider};
 use windows::Win32::UI::Shell::Common::IObjectArray;
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, RPC_E_CHANGED_MODE};
+use windows_sys::Win32::Foundation::{
+    E_UNEXPECTED, ERROR_SUCCESS, HWND, RPC_E_CHANGED_MODE, TYPE_E_ELEMENTNOTFOUND,
+};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
@@ -80,7 +82,7 @@ pub(in crate::native) struct ViewVtable {
 
 impl ApplicationView {
     pub(in crate::native) fn lookup(hwnd: HWND) -> Option<Self> {
-        ApplicationViews::connect()?.for_window(hwnd)
+        ApplicationViews::connect()?.for_window(hwnd).ok()
     }
 
     pub(in crate::native) fn request_focus(&self) -> bool {
@@ -96,16 +98,21 @@ impl ApplicationViews {
         unsafe { shell_provider()?.QueryService(&Self::IID).ok() }
     }
 
-    fn for_window(&self, hwnd: HWND) -> Option<ApplicationView> {
+    fn for_window(&self, hwnd: HWND) -> Result<ApplicationView, HRESULT> {
         let mut view = None;
-        if unsafe { (self.vtable().for_window)(self.as_raw(), hwnd, &mut view) }.0 != 0 {
-            return None;
+        let hr = unsafe { (self.vtable().for_window)(self.as_raw(), hwnd, &mut view) };
+        if hr.0 != 0 {
+            return Err(hr);
         }
-        view
+        view.ok_or(HRESULT(E_UNEXPECTED))
+    }
+
+    pub(super) fn confirms_no_view(&self, hwnd: HWND) -> bool {
+        matches!(self.for_window(hwnd), Err(hr) if hr.0 == TYPE_E_ELEMENTNOTFOUND)
     }
 
     pub(super) fn is_hidden_unassigned_view(&self, hwnd: HWND) -> bool {
-        let Some(view) = self.for_window(hwnd) else {
+        let Ok(view) = self.for_window(hwnd) else {
             return false;
         };
         let mut visible = 1;

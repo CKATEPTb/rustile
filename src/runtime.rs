@@ -931,6 +931,11 @@ fn pump(
             } else {
                 None
             };
+            // Resolving Next may create or reorder the spare even if the
+            // subsequent window transfer or desktop switch does not finish.
+            if workspaces.supported {
+                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
+            }
             let (from, to, followed) = match &window {
                 None => {
                     let Some((from, to)) = workspaces.navigate(destination) else {
@@ -963,7 +968,6 @@ fn pump(
                     if window.matches() {
                         manager.transferred_window(window.id(), moved.to);
                     }
-                    inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                     (moved.from, moved.to, moved.followed)
                 }
             };

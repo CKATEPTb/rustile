@@ -76,17 +76,19 @@ enum Decision {
 #[derive(Default)]
 struct Policy {
     spare: Option<DesktopId>,
-    last_current: Option<(DesktopId, bool)>,
-    awaiting_departure: Option<DesktopId>,
     pending: Option<(Inventory, Change)>,
-    issued: Option<(Inventory, Change)>,
-    failures: u8,
-    retry_at: Option<Instant>,
+    issued: Option<IssuedChange>,
+    attempts: u8,
+}
+
+struct IssuedChange {
+    proposal: (Inventory, Change),
+    retry_at: Instant,
 }
 
 impl Policy {
     fn apply(&mut self, shell: &DesktopShell, change: Change) -> bool {
-        let applied = match change {
+        match change {
             Change::Create => {
                 self.spare = shell.create();
                 self.spare.is_some()
@@ -96,47 +98,33 @@ impl Policy {
                 shell.move_to_end(spare)
             }
             Change::Remove { desktop, fallback } => shell.remove(desktop, fallback),
-        };
-        if !applied {
-            self.failed();
         }
-        applied
     }
 
-    fn failed(&mut self) {
-        self.failures = self.failures.saturating_add(1);
-        let seconds = match self.failures {
+    fn issue(&mut self, proposal: (Inventory, Change)) {
+        // An HRESULT alone cannot tell us whether the order in Explorer has
+        // actually changed. Back off until a fresh inventory confirms it.
+        self.attempts = self.attempts.saturating_add(1);
+        let seconds = match self.attempts {
             1 => 1,
             2 => 3,
             _ => 15,
         };
-        self.retry_at = Some(Instant::now() + Duration::from_secs(seconds));
+        self.issued = Some(IssuedChange {
+            proposal,
+            retry_at: Instant::now() + Duration::from_secs(seconds),
+        });
+        self.pending = None;
     }
 
     fn observe(&mut self, inventory: Inventory) -> Decision {
         let empty = |id: &DesktopId| !inventory.occupied.contains(id);
         let current = inventory.current;
-        let occupied = !empty(&current);
         let empty_tail = inventory.current_is_empty_tail();
-        if occupied || self.awaiting_departure != Some(current) {
-            self.awaiting_departure = None;
-        }
-        if !occupied && self.last_current == Some((current, true)) {
-            self.awaiting_departure = Some(current);
-        }
-        self.last_current = Some((current, occupied));
-        self.spare = if empty_tail || (!occupied && self.awaiting_departure.is_none()) {
+        self.spare = if empty(&current) {
+            // Keep the selected desktop's identity even if its last window
+            // just closed. It can move past occupied successors without a switch.
             Some(current)
-        } else if self.awaiting_departure == Some(current) && self.spare == Some(current) {
-            // A window may open farther right while tail removal is pending.
-            // Keep the vacated current slot in place if another spare exists.
-            inventory
-                .order
-                .iter()
-                .rev()
-                .copied()
-                .find(|&id| id != current && empty(&id))
-                .or(Some(current))
         } else {
             inventory.empty_spare(self.spare)
         };
@@ -166,39 +154,30 @@ impl Policy {
         let Some(change) = change else {
             self.pending = None;
             self.issued = None;
-            self.failures = 0;
-            self.retry_at = None;
+            self.attempts = 0;
             return Decision::Idle;
         };
         let proposal = (inventory, change);
-        if self.issued.as_ref() == Some(&proposal) {
-            let Some(deadline) = self.retry_at else {
-                return Decision::Idle;
-            };
-            let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Some(issued) = &self.issued
+            && issued.proposal == proposal
+        {
+            let remaining = issued.retry_at.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
-                // After repeated failures, only a new external event wakes the loop.
-                return if self.failures < 3 {
-                    Decision::RetryAfter(remaining.as_millis().max(1) as u32)
-                } else {
-                    Decision::Idle
-                };
+                return Decision::RetryAfter(remaining.as_millis().max(1) as u32);
             }
             self.issued = None;
-            self.retry_at = None;
             self.pending = Some(proposal);
             return Decision::Verify;
         }
         if self.issued.is_some() || self.pending.as_ref().is_some_and(|old| old != &proposal) {
-            self.failures = 0;
-            self.retry_at = None;
+            self.attempts = 0;
         }
         self.issued = None;
         if self.pending.as_ref() != Some(&proposal) {
             self.pending = Some(proposal);
             return Decision::Verify;
         }
-        self.issued = self.pending.take();
+        self.issue(proposal);
         Decision::Apply(change)
     }
 }
@@ -343,6 +322,12 @@ impl Workspaces {
         self.supported && (self.available() || Instant::now() >= self.reconnect_at)
     }
 
+    fn retry_incomplete(&mut self) -> u32 {
+        self.policy.pending = None;
+        self.incomplete = self.incomplete.saturating_add(1);
+        (RETRY_MS * u32::from(self.incomplete)).min(5000)
+    }
+
     // Returns a delay only while Explorer is settling or a change needs confirmation.
     pub(super) fn reconcile(&mut self) -> Option<u32> {
         if !self.supported {
@@ -358,14 +343,14 @@ impl Workspaces {
             return Some(5000);
         };
         let Some(inventory) = Inventory::read(shell) else {
-            self.policy.pending = None;
-            if shell.current().is_none() {
+            let disconnected = shell.current().is_none();
+            let delay = self.retry_incomplete();
+            if disconnected {
                 self.shell = None;
                 self.reconnect_at = Instant::now() + Duration::from_secs(5);
                 return Some(5000);
             }
-            self.incomplete = self.incomplete.saturating_add(1);
-            return (self.incomplete <= 3).then(|| RETRY_MS * u32::from(self.incomplete));
+            return Some(delay);
         };
         self.incomplete = 0;
         match self.policy.observe(inventory) {
@@ -419,13 +404,16 @@ impl Workspaces {
         let change =
             Change::position_spare(&inventory.order, inventory.empty_spare(self.policy.spare))?;
         let proposal = (inventory, change);
-        if self.policy.issued.as_ref() == Some(&proposal) {
+        if self
+            .policy
+            .issued
+            .as_ref()
+            .is_some_and(|issued| issued.proposal == proposal)
+        {
             return None;
         }
-        self.policy.issued = Some(proposal);
-        self.policy.pending = None;
-        self.policy.retry_at = None;
-        self.policy.failures = 0;
+        self.policy.attempts = 0;
+        self.policy.issue(proposal);
         if self.policy.apply(shell, change) {
             let to = self.policy.spare?;
             let order = shell.list()?;
@@ -494,7 +482,7 @@ mod tests {
             policy.observe(full.clone()),
             Decision::Apply(Change::Create)
         );
-        assert_eq!(policy.observe(full), Decision::Idle);
+        assert!(matches!(policy.observe(full), Decision::RetryAfter(_)));
         assert_eq!(policy.observe(inventory(&[1, 2], 1, &[1])), Decision::Idle);
         let full = inventory(&[1, 2], 2, &[1, 2]);
         assert_eq!(policy.observe(full.clone()), Decision::Verify);
@@ -546,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successor_gaining_a_window_cancels_tail_cleanup_and_preserves_the_current_slot() {
+    fn a_successor_gaining_a_window_cancels_tail_cleanup_and_preserves_the_current_desktop() {
         let mut policy = Policy::default();
         let order = [1, 2, 3, 4, 5, 6];
         let used = inventory(&order, 4, &[1, 2, 3, 4, 5]);
@@ -554,8 +542,11 @@ mod tests {
         let tail = inventory(&order, 4, &[1, 2, 3]);
         assert_eq!(policy.observe(tail), Decision::Verify);
         let fifth_reopened = inventory(&order, 4, &[1, 2, 3, 5]);
-        assert_eq!(policy.observe(fifth_reopened), Decision::Idle);
-        assert_eq!(policy.spare, Some(DesktopId(6)));
+        assert_eq!(policy.observe(fifth_reopened.clone()), Decision::Verify);
+        assert_eq!(
+            policy.observe(fifth_reopened),
+            Decision::Apply(Change::MoveToEnd(DesktopId(4)))
+        );
     }
 
     #[test]
@@ -611,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn the_spare_stays_last_while_the_vacated_current_waits_for_departure() {
+    fn the_vacated_current_moves_past_occupied_successors_then_retires_the_other_spare() {
         let mut policy = Policy::default();
         assert_eq!(
             policy.observe(inventory(&[1, 2, 3, 4], 2, &[1, 2, 3])),
@@ -624,20 +615,20 @@ mod tests {
         );
         assert_eq!(
             policy.observe(closed_and_reordered),
-            Decision::Apply(Change::MoveToEnd(DesktopId(4)))
+            Decision::Apply(Change::MoveToEnd(DesktopId(2)))
         );
+        let moved = inventory(&[4, 1, 3, 2], 2, &[1, 3]);
+        assert_eq!(policy.observe(moved.clone()), Decision::Verify);
         assert_eq!(
-            policy.observe(inventory(&[1, 2, 3, 4], 2, &[1, 3])),
-            Decision::Idle
-        );
-        let left = inventory(&[1, 2, 3, 4], 3, &[1, 3]);
-        assert_eq!(policy.observe(left.clone()), Decision::Verify);
-        assert_eq!(
-            policy.observe(left),
+            policy.observe(moved),
             Decision::Apply(Change::Remove {
-                desktop: DesktopId(2),
-                fallback: DesktopId(4)
+                desktop: DesktopId(4),
+                fallback: DesktopId(2)
             })
+        );
+        assert_eq!(
+            policy.observe(inventory(&[1, 3, 2], 2, &[1, 3])),
+            Decision::Idle
         );
     }
 
@@ -655,6 +646,54 @@ mod tests {
             })
         );
         assert_eq!(policy.observe(inventory(&[2], 2, &[])), Decision::Idle);
+    }
+
+    #[test]
+    fn every_four_desktop_occupancy_keeps_one_empty_tail_and_the_order_of_working_desktops() {
+        let order = [41, 8, 74, 3].map(DesktopId);
+        for mask in 0u8..16 {
+            let working: Vec<_> = order
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, &desktop)| desktop)
+                .collect();
+            for current in order {
+                let mut state = Inventory {
+                    order: order.to_vec(),
+                    current,
+                    occupied: working.iter().copied().collect(),
+                };
+                let mut policy = Policy::default();
+                for _ in 0..=order.len() {
+                    if policy.observe(state.clone()) == Decision::Idle {
+                        break;
+                    }
+                    let Decision::Apply(change) = policy.observe(state.clone()) else {
+                        panic!("unchanged inventory should confirm the proposed change");
+                    };
+                    match change {
+                        Change::Create => state.order.push(DesktopId(100)),
+                        Change::MoveToEnd(id) => {
+                            assert!(!state.occupied.contains(&id));
+                            state.order.retain(|&desktop| desktop != id);
+                            state.order.push(id);
+                        }
+                        Change::Remove { desktop, fallback } => {
+                            assert_ne!(desktop, current);
+                            assert!(!state.occupied.contains(&desktop));
+                            assert!(state.order.contains(&fallback));
+                            state.order.retain(|&id| id != desktop);
+                        }
+                    }
+                }
+                let (spare, settled) = state.order.split_last().unwrap();
+                assert!(!state.occupied.contains(spare));
+                assert_eq!(settled, working);
+                assert!(state.order.contains(&current));
+                assert_eq!(policy.observe(state), Decision::Idle);
+            }
+        }
     }
 
     #[test]
@@ -891,22 +930,50 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_shell_failures_retry_only_after_checking_the_result() {
-        let full = inventory(&[1], 1, &[1]);
+    fn an_unobserved_shell_change_retries_until_the_inventory_confirms_it() {
+        let complete = inventory(&[1, 2], 1, &[1]);
+        for (stale, change) in [
+            (inventory(&[1], 1, &[1]), Change::Create),
+            (inventory(&[2, 1], 1, &[1]), Change::MoveToEnd(DesktopId(2))),
+        ] {
+            let mut policy = Policy::default();
+            for seconds in [1, 3, 15, 15] {
+                assert_eq!(policy.observe(stale.clone()), Decision::Verify);
+                let before = Instant::now();
+                assert_eq!(policy.observe(stale.clone()), Decision::Apply(change));
+                assert!(matches!(
+                    policy.observe(stale.clone()),
+                    Decision::RetryAfter(_)
+                ));
+                let issued = policy.issued.as_mut().unwrap();
+                assert!(issued.retry_at >= before + Duration::from_secs(seconds));
+                issued.retry_at = Instant::now();
+            }
+            assert_eq!(policy.observe(stale), Decision::Verify);
+            assert_eq!(policy.observe(complete.clone()), Decision::Idle);
+        }
+    }
+
+    #[test]
+    fn incomplete_inventories_retry_at_a_bounded_rate_and_break_confirmation() {
+        let state = inventory(&[2, 1], 1, &[1]);
         let mut policy = Policy::default();
-        assert_eq!(policy.observe(full.clone()), Decision::Verify);
+        assert_eq!(policy.observe(state.clone()), Decision::Verify);
+        let mut workspaces = Workspaces {
+            supported: true,
+            shell: None,
+            reconnect_at: Instant::now(),
+            policy,
+            incomplete: 0,
+        };
+        for n in 1..=32 {
+            assert_eq!(workspaces.retry_incomplete(), (RETRY_MS * n).min(5000));
+        }
+        assert_eq!(workspaces.policy.observe(state.clone()), Decision::Verify);
         assert_eq!(
-            policy.observe(full.clone()),
-            Decision::Apply(Change::Create)
+            workspaces.policy.observe(state),
+            Decision::Apply(Change::MoveToEnd(DesktopId(2)))
         );
-        policy.failed();
-        assert!(matches!(
-            policy.observe(full.clone()),
-            Decision::RetryAfter(_)
-        ));
-        policy.retry_at = Some(Instant::now());
-        assert_eq!(policy.observe(full.clone()), Decision::Verify);
-        assert_eq!(policy.observe(inventory(&[1, 2], 1, &[1])), Decision::Idle);
     }
 
     #[test]

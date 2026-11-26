@@ -2,7 +2,7 @@ use std::cell::OnceCell;
 use std::collections::HashSet;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, TYPE_E_ELEMENTNOTFOUND};
-use windows_sys::Win32::Graphics::Dwm::{DWM_CLOAKED_SHELL, DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows_sys::Win32::Graphics::Dwm::DWM_CLOAKED_SHELL;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -16,7 +16,7 @@ use windows_sys::core::HRESULT;
 use super::shell::ApplicationViews;
 use super::{DesktopId, Service, shell_window};
 use crate::layout::Id;
-use crate::native::{Cloak, append_window, cloak_state, pid};
+use crate::native::{Cloak, append_window, cloak_flags, cloak_state, pid};
 
 // GetWindowDesktopId returns these two Shell IDs for pins. A pin is present
 // everywhere and cannot occupy a particular workspace.
@@ -30,7 +30,26 @@ pub(crate) fn is_pinned(id: DesktopId) -> bool {
 /// Snapshot all monitors and virtual desktops independently of tiling eligibility.
 /// The caller owns the COM apartment. None means that emptiness is unproven.
 pub(crate) fn occupied(desktops: &[DesktopId]) -> Option<HashSet<DesktopId>> {
-    scan(desktops, |windows| windows.collect::<Result<_, _>>().ok())
+    scan(desktops, |windows| occupied_set(windows, desktops))
+}
+
+fn occupied_set(
+    windows: impl Iterator<Item = Result<DesktopId, ()>>,
+    desktops: &[DesktopId],
+) -> Option<HashSet<DesktopId>> {
+    let mut occupied = HashSet::new();
+    let mut complete = true;
+    for window in windows {
+        match window {
+            Ok(id) => {
+                occupied.insert(id);
+            }
+            Err(()) => complete = false,
+        }
+    }
+    // An unknown window cannot make an occupied desktop empty. It can,
+    // however, belong to any apparently empty one, which must be protected.
+    (complete || desktops.iter().all(|id| occupied.contains(id))).then_some(occupied)
 }
 
 /// A known window suffices for navigation; proving emptiness requires every observation.
@@ -95,14 +114,32 @@ fn window_desktop(
                 Ok(_) => desktop,
                 Err(_) => None,
             };
-        } else if owner == hwnd
-            && unassigned_overlay(
+        } else if owner == hwnd {
+            let minimized = unsafe { IsIconic(hwnd) } != 0;
+            if unassigned_overlay(
                 view_desktop,
                 unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32,
-                unsafe { IsIconic(hwnd) } != 0,
-            )
-        {
-            return Ok(None);
+                minimized,
+            ) {
+                return Ok(None);
+            }
+            // Explorer can retain its own cloaked frame after unregistering
+            // its application view. Check both Shell APIs for explicit absence.
+            if view_desktop == Err(TYPE_E_ELEMENTNOTFOUND)
+                && orphan_frame_candidate(
+                    class_name(hwnd).as_deref(),
+                    pid(hwnd as Id),
+                    pid(service.shell as Id),
+                    minimized,
+                    cloak_flags(hwnd as Id),
+                )
+                && views
+                    .get_or_init(ApplicationViews::connect)
+                    .as_ref()
+                    .is_some_and(|views| views.confirms_no_view(hwnd))
+            {
+                return Ok(None);
+            }
         }
     }
     if unsafe { IsWindow(hwnd) } == 0 {
@@ -127,6 +164,20 @@ fn unassigned_overlay(desktop: Result<DesktopId, HRESULT>, extended: u32, minimi
         && extended & (OVERLAY | WS_EX_APPWINDOW) == OVERLAY
 }
 
+fn orphan_frame_candidate(
+    class: Option<&str>,
+    process: u32,
+    shell_process: u32,
+    minimized: bool,
+    cloak: Option<u32>,
+) -> bool {
+    class == Some("ApplicationFrameWindow")
+        && process != 0
+        && process == shell_process
+        && !minimized
+        && cloak == Some(DWM_CLOAKED_SHELL)
+}
+
 fn class_name(hwnd: HWND) -> Option<String> {
     let mut name = [0u16; 256];
     let length = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) };
@@ -140,16 +191,8 @@ fn shell_cloaked_packaged_window(hwnd: HWND) -> bool {
     let Some(class) = class_name(hwnd) else {
         return false;
     };
-    let mut cloak = 0u32;
-    let hr = unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED as u32,
-            (&raw mut cloak).cast(),
-            size_of_val(&cloak) as u32,
-        )
-    };
-    hr == 0 && parked_frame_candidate(&class, unsafe { IsIconic(hwnd) } != 0, cloak)
+    cloak_flags(hwnd as Id)
+        .is_some_and(|cloak| parked_frame_candidate(&class, unsafe { IsIconic(hwnd) } != 0, cloak))
 }
 
 fn parked_frame_candidate(class: &str, minimized: bool, cloak: u32) -> bool {
@@ -259,6 +302,43 @@ fn core_window_shell_host(process_id: u32) -> bool {
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::{WS_POPUP, WS_VISIBLE};
+
+    #[test]
+    fn unresolved_views_only_block_a_claim_of_emptiness() {
+        let (one, two) = (DesktopId(1), DesktopId(2));
+        let order = [one, two];
+        assert_eq!(
+            occupied_set([Err(()), Ok(one), Ok(two)].into_iter(), &order),
+            Some(HashSet::from(order))
+        );
+        assert_eq!(
+            occupied_set([Ok(one), Ok(one), Err(())].into_iter(), &order),
+            None
+        );
+        assert_eq!(
+            occupied_set([Ok(two)].into_iter(), &order),
+            Some(HashSet::from([two]))
+        );
+    }
+
+    #[test]
+    fn only_shell_owned_cloaked_unminimized_frames_can_be_orphaned() {
+        let frame = Some("ApplicationFrameWindow");
+        let hidden = Some(DWM_CLOAKED_SHELL);
+        assert!(orphan_frame_candidate(frame, 9, 9, false, hidden));
+        assert!(!orphan_frame_candidate(frame, 8, 9, false, hidden));
+        assert!(!orphan_frame_candidate(frame, 0, 0, false, hidden));
+        assert!(!orphan_frame_candidate(frame, 9, 9, true, hidden));
+        assert!(!orphan_frame_candidate(frame, 9, 9, false, Some(0)));
+        assert!(!orphan_frame_candidate(frame, 9, 9, false, None));
+        assert!(!orphan_frame_candidate(
+            Some("CabinetWClass"),
+            9,
+            9,
+            false,
+            hidden
+        ));
+    }
 
     #[test]
     fn only_unassigned_click_through_overlays_can_be_ignored() {
