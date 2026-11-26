@@ -1253,6 +1253,7 @@ fn move_windows() {
     run(share_upper_tile_in_six_windows);
     run(virtual_desktops::round_trip);
     run(virtual_desktops::transfer_and_follow);
+    run(virtual_desktops::fullscreen_transfer);
     run(panel_reservations);
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));

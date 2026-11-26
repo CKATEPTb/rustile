@@ -449,6 +449,81 @@ fn focus_owned_dialog(manager: &mut Manager, owner: Id) {
     assert!(!accepted_foreign);
 }
 
+pub(super) fn fullscreen_transfer(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
+    use crate::native::{TileState, TransferIdentity, tile_state};
+    use std::cell::Cell;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GWL_STYLE, GetWindowLongW};
+
+    let [game, left, right, ..] = windows;
+    // SetFixtureMode uses 1 for a monitor-sized WS_POPUP, 0 for the original frame.
+    let set_mode = |mode| assert_eq!(fixture_message(game, WM_APP + 5, mode), 1);
+    set_mode(1);
+    until("fixture entered fullscreen", || {
+        tile_state(game) == TileState::Fullscreen
+    });
+    let appearance = || unsafe {
+        (
+            frame(game),
+            GetWindowLongW(game as _, GWL_STYLE),
+            GetWindowLongW(game as _, GWL_EXSTYLE),
+            geometry_changes(game),
+        )
+    };
+    let fullscreen = appearance();
+    let homes = |home| [(game, home), (left, A), (right, B)];
+    for (source, destination, enabled) in [(A, B, true), (B, A, false)] {
+        let mut settings = manager.settings;
+        settings.enabled = enabled;
+        manager.apply_settings(settings).unwrap();
+        select_desktop(manager, &homes(source), source, None);
+        manager.reconcile_desktop();
+        if enabled {
+            settle(manager, 1);
+            assert!(manager.workspace.layout.contains(left));
+        }
+        assert!(manager.transferable_on(game, source));
+        let identity =
+            TransferIdentity::capture(game).expect("capture fullscreen app for transfer");
+        let peers = [left, right].map(frame);
+        select_desktop(manager, &homes(destination), source, None);
+        manager.transferred_window(game, destination);
+        assert!(!manager.transferable_on(game, source));
+        select_desktop(manager, &homes(destination), destination, None);
+        manager.reconcile_desktop();
+        if enabled {
+            settle(manager, 1);
+            assert!(manager.workspace.layout.contains(right));
+        } else {
+            assert_eq!([left, right].map(frame), peers);
+        }
+        let foreground = Cell::new(0);
+        assert!(identity.matches());
+        assert!(manager.restore_transferred_focus_with(
+            identity.id(),
+            destination,
+            || foreground.get(),
+            |_| {
+                foreground.set(game);
+                true
+            },
+        ));
+        assert_eq!(foreground.get(), game);
+        assert!(
+            !manager.windows.contains_key(&game),
+            "fullscreen game became a tile"
+        );
+        assert_eq!(
+            appearance(),
+            fullscreen,
+            "the game was moved, resized or restyled"
+        );
+    }
+    set_mode(0);
+    manager
+        .desktops
+        .set_memberships(windows.map(|id| (id, DesktopMembership::Current(A))));
+}
+
 pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     let mut a = [windows[0], windows[1]];
     let b = [windows[2], windows[3]];

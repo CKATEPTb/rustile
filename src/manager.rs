@@ -285,13 +285,7 @@ impl Manager {
     }
 
     fn transferable_on(&self, id: Id, desktop: DesktopId) -> bool {
-        id != 0
-            && native::window_enabled(id)
-            && self.windows.get(&id).is_none_or(|w| w.original.matches(id))
-            && matches!(
-                native::tile_state(id),
-                TileState::Eligible | TileState::Maximized
-            )
+        native::can_transfer(id)
             && self.desktops.membership(id) == DesktopMembership::Current(desktop)
     }
 
@@ -375,6 +369,9 @@ impl Manager {
         match state {
             TileState::Maximized | TileState::Fullscreen => {
                 self.expanded.insert(id);
+                // The first reliable frame can arrive after the desktop move.
+                // An expanded window has no destination tile to split.
+                self.transfer_anchor.take_if(|(window, _, _)| *window == id);
             }
             TileState::Eligible => {
                 self.expanded.remove(&id);

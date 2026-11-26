@@ -5,6 +5,22 @@ use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::core::w;
 
 #[test]
+fn transfer_without_an_active_window_selects_the_neighbor_in_each_direction() {
+    let desktop = unsafe { GetDesktopWindow() } as isize;
+    assert_ne!(desktop, 0);
+    for (command, expected_next) in [(MOVE_DESKTOP_PREVIOUS, false), (MOVE_DESKTOP_NEXT, true)] {
+        for target in [0, desktop] {
+            assert!(matches!(
+                DesktopDestination::from_shortcut(command, target, None, || desktop),
+                Some(DesktopDestination::Relative { next }) if next == expected_next
+            ));
+        }
+        // A foreground change after the keypress must not move the new app.
+        assert!(DesktopDestination::from_shortcut(command, desktop, None, || 0).is_none());
+    }
+}
+
+#[test]
 fn desktop_focus_waits_for_the_requested_desktop_and_ignores_reorders() {
     let (a, b) = (DesktopId(1), DesktopId(2));
     let mut focus = DesktopFocus::default();
@@ -203,7 +219,17 @@ fn isolated_shortcut_ownership() {
 
     assert_eq!(key(VK_F17, true), 1);
     assert_eq!(key(VK_F17, false), 1);
-    assert_eq!(next_command(), None, "transfer needs a foreground window");
+    let expect_navigation_without_window = || {
+        let (command, ticket, target) = next_command().expect("windowless desktop shortcut");
+        assert_eq!((command, target), (MOVE_DESKTOP_NEXT, 0));
+        assert_ne!(ticket, 0);
+        assert!(matches!(
+            DesktopDestination::from_shortcut(command, target, None, native::foreground),
+            Some(DesktopDestination::Relative { next: true })
+        ));
+        assert_eq!(next_command(), None);
+    };
+    expect_navigation_without_window();
 
     shortcuts::watch_transfer_focus();
     key(VK_LSHIFT, true);
@@ -225,11 +251,7 @@ fn isolated_shortcut_ownership() {
     assert_eq!(key(VK_F15, false), 0);
     assert_eq!(key(VK_F17, true), 1);
     assert_eq!(key(VK_F17, false), 1);
-    assert_eq!(
-        next_command(),
-        None,
-        "ordinary input ends the follow gesture"
-    );
+    expect_navigation_without_window();
 
     let wheel = |message, delta, mods| shortcuts::test_wheel_event(message, delta, mods, owner);
     assert!(!wheel(WM_MOUSEWHEEL, 120, 0));

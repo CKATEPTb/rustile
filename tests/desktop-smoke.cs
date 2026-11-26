@@ -1435,6 +1435,7 @@ internal static class DesktopSmoke {
             Console.WriteLine("PASS  Five real windows: three plus two slots, level DWM heights after resize and horizontal moves");
             Console.WriteLine("PASS  Quick resize and its inverse preserve the off-grid divider with no modal hint; shell focus commits the current resize");
             Console.WriteLine("PASS  Virtual desktop switch events preserve both layouts, resized splits and pending moves on the first return");
+            Console.WriteLine("PASS  A borderless fullscreen window can transfer and receive focus on the destination, keeping its style and bounds with tiling on and off");
             Console.WriteLine("PASS  A hidden, app-cloaked tray window releases the bottom tile and rejoins when shown");
             Console.WriteLine(windows.Any(w => GetProp(w, "Rustile.Smoke.StaggeredPassed") != IntPtr.Zero)
                 ? "PASS  Staggered Down shares the lower tile with backfill, then takes it; Up shares the L before completing the return"

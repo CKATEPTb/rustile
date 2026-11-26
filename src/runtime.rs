@@ -87,21 +87,25 @@ impl DesktopDestination {
         command: i32,
         target: isize,
         following: Option<&Rc<TransferIdentity>>,
+        foreground: impl FnOnce() -> isize,
     ) -> Option<Self> {
         if matches!(command, MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT) {
+            let next = command == MOVE_DESKTOP_NEXT;
             // Explorer may temporarily focus a different tile while switching.
             // Repeated presses during that handoff still belong to the same HWND.
-            let window = match following {
-                Some(window) => Rc::clone(window),
-                None if target != 0 && native::foreground() == target => {
-                    Rc::new(TransferIdentity::capture(target)?)
+            let window = if let Some(window) = following.filter(|window| window.matches()) {
+                Rc::clone(window)
+            } else {
+                if target != 0 && foreground() != target {
+                    return None;
                 }
-                None => return None,
+                // Explorer can report no HWND, the wallpaper, or an idle taskbar.
+                if native::desktop_foreground(target) == native::DesktopForeground::Vacant {
+                    return Some(Self::Relative { next });
+                }
+                Rc::new(TransferIdentity::capture(target)?)
             };
-            return Some(Self::Transfer {
-                window,
-                next: command == MOVE_DESKTOP_NEXT,
-            });
+            return Some(Self::Transfer { window, next });
         }
         if target == 0 {
             Self::from_command(command)
@@ -642,6 +646,7 @@ fn pump(
                 (message.wParam & 0xff) as i32,
                 message.lParam,
                 following.as_ref(),
+                native::foreground,
             )
         } else {
             None

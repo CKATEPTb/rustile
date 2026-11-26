@@ -120,12 +120,12 @@ pub(crate) enum DesktopForeground {
     Preserve,
 }
 
-// Called only during a confirmed desktop change. A floating app, dialog or
-// taskbar control can own legitimate input even though it is not a tile.
+// A floating app, dialog or taskbar control can own legitimate input even
+// though it is not a tile. The Win32 desktop root itself never belongs to an app.
 pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
     use DesktopForeground::*;
     let hwnd = id as HWND;
-    if hwnd.is_null() {
+    if hwnd.is_null() || hwnd == unsafe { GetDesktopWindow() } {
         return Vacant;
     }
     let Some(class) = window_class(hwnd) else {
@@ -138,9 +138,7 @@ pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
             class.as_str(),
             "MultitaskingViewFrame" | "TaskSwitcherWnd" | "XamlExplorerHostIslandWindow"
         );
-    let wallpaper = hwnd == shell
-        || hwnd == unsafe { GetDesktopWindow() }
-        || (shell_process && is_desktop_view(hwnd, shell, &class));
+    let wallpaper = hwnd == shell || (shell_process && is_desktop_view(hwnd, shell, &class));
     let taskbar =
         shell_process && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
     if !wallpaper && !taskbar && !hidden_or_minimized(id) && cloak_flags(id).is_none_or(|f| f == 0)
@@ -539,10 +537,15 @@ pub(crate) fn focus_app_owner(id: Id) -> Option<Id> {
 enum WindowUse {
     Tiling,
     NativeControl,
+    DesktopTransfer,
 }
 
 pub(crate) fn tile_state(id: Id) -> TileState {
     classify_window(id, WindowUse::Tiling)
+}
+
+pub(crate) fn can_transfer(id: Id) -> bool {
+    window_enabled(id) && classify_window(id, WindowUse::DesktopTransfer) != TileState::Excluded
 }
 
 fn classify_window(id: Id, usage: WindowUse) -> TileState {
@@ -587,7 +590,13 @@ fn classify_window(id: Id, usage: WindowUse) -> TileState {
         // can cover the monitor. Its native maximize button still toggles it back.
         let fullscreen_only =
             borderless && fullscreen && (work != screen || style & WS_MAXIMIZEBOX == 0);
-        let normal_frame = resizable || (usage == WindowUse::NativeControl && !borderless);
+        let normal_frame = match usage {
+            WindowUse::Tiling => resizable,
+            WindowUse::NativeControl => resizable || !borderless,
+            // Explorer moves the app view without changing its frame. A game
+            // can use a fixed-size borderless window even in windowed mode.
+            WindowUse::DesktopTransfer => true,
+        };
         let state = if normal_frame && IsZoomed(hwnd) != 0 && !floating_panel && !fullscreen_only {
             TileState::Maximized
         } else if fullscreen {
@@ -683,9 +692,7 @@ pub(crate) struct TransferIdentity(WindowMarker);
 impl TransferIdentity {
     pub(crate) fn capture(id: Id) -> Option<Self> {
         static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-        if !window_enabled(id)
-            || !matches!(tile_state(id), TileState::Eligible | TileState::Maximized)
-        {
+        if !can_transfer(id) {
             return None;
         }
         WindowMarker::attach(id, process_marker_name(&NAME, "TransferIdentity")).map(Self)

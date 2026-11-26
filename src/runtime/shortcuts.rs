@@ -107,11 +107,9 @@ impl KeyRoutes {
         let target = if id == TOGGLE_MOSAIC || DesktopDestination::from_command(id).is_some() {
             Some(0) // Global commands need no foreground window.
         } else {
-            // When Explorer clears the foreground, a focus command can select
-            // a tile on the current desktop, and a transfer can continue its handoff.
-            let has_target = active != 0
-                || is_focus_command(id)
-                || (is_desktop_move(id) && transfer_focus_uninterrupted());
+            // A null foreground lets focus select a tile or a desktop move
+            // switch desktops without a window. The pump resolves any pending handoff.
+            let has_target = active != 0 || is_focus_command(id) || is_desktop_move(id);
             // Own a configured normal chord even when its action is unavailable
             // in resize mode. Close/maximize still apply to the live foreground;
             // a saved binding specific to resize already took priority above.
@@ -752,10 +750,7 @@ mod tests {
                         .map(|b| (b.id, b.target))
                 };
                 for active in [100, 999, 0] {
-                    assert_eq!(
-                        binding(mods, active),
-                        Some((transfer, (active != 0).then_some(active)))
-                    );
+                    assert_eq!(binding(mods, active), Some((transfer, Some(active))));
                     assert_eq!(
                         binding(MOD_WIN | MOD_CONTROL, active),
                         Some((navigate, Some(0)))
@@ -769,6 +764,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn desktop_move_from_an_empty_desktop_dispatches_once_and_samples_each_new_press() {
+        let mut keyboard = Keyboard::new();
+        keyboard.settings.enabled = false;
+        keyboard.state.target = None;
+        keyboard.assign(Shortcut::MoveNextDesktop, MOD_ALT, VK_F8);
+        assert_eq!(
+            keyboard.key(VK_F8, true, MOD_ALT),
+            Action::Command(MOVE_DESKTOP_NEXT)
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_F8, true, MOD_ALT, 200),
+            Action::Consume
+        );
+        assert_eq!(keyboard.key(VK_F8, false, 0), Action::Consume);
+        assert_eq!(
+            keyboard.key_with_foreground(VK_F8, true, MOD_ALT, 200),
+            Action::Command(MOVE_DESKTOP_NEXT)
+        );
     }
 
     #[test]
