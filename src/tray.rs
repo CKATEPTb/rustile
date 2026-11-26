@@ -1,3 +1,4 @@
+mod exclusion_window;
 mod menu;
 mod paint;
 mod shortcut_window;
@@ -25,8 +26,9 @@ use windows_sys::Win32::{
 };
 use windows_sys::core::w;
 
-use crate::settings::{Command, Settings};
+use crate::settings::{Command, Settings, exclusions::ExclusionRule};
 use crate::startup::Startup;
+use exclusion_window::ExclusionWindow;
 use menu::{Action, Row};
 use paint::Painter;
 pub(crate) use paint::{Colors, Fonts};
@@ -71,6 +73,7 @@ struct State {
     registered: Cell<bool>,
     attempts: Cell<u8>,
     shortcuts: ShortcutWindow,
+    exclusions: ExclusionWindow,
     anchor: Cell<POINT>,
     icon_bounds: Cell<Option<RECT>>,
     icon_pressed: Cell<bool>,
@@ -129,6 +132,7 @@ impl Tray {
                 registered: Cell::new(false),
                 attempts: Cell::new(0),
                 shortcuts: ShortcutWindow::default(),
+                exclusions: ExclusionWindow::default(),
                 anchor: Cell::default(),
                 icon_bounds: Cell::default(),
                 icon_pressed: Cell::new(false),
@@ -242,7 +246,15 @@ impl Tray {
     }
 
     pub fn pre_translate(&self, message: &MSG) -> bool {
-        self.state.shortcuts.pre_translate(message)
+        self.state.exclusions.pre_translate(message) || self.state.shortcuts.pre_translate(message)
+    }
+
+    pub fn take_exclusions(&self) -> Option<Vec<ExclusionRule>> {
+        self.state.exclusions.take_rules()
+    }
+
+    pub fn exclusions_result(&self, result: Result<(), String>) {
+        self.state.exclusions.finish_save(result);
     }
 
     pub fn take_work_area_change(&self) -> bool {
@@ -657,10 +669,15 @@ impl State {
             .map(|r| r.action);
         match action {
             Some(Action::Adjust(_)) => self.start_edit(hwnd, index),
-            Some(Action::EditShortcuts) => {
+            Some(action @ (Action::EditShortcuts | Action::EditExclusions)) => {
                 self.hide(hwnd, false);
                 let settings = self.settings.borrow().clone();
-                if let Err(detail) = self.shortcuts.show(hwnd, self.anchor.get(), settings) {
+                let opened = if matches!(action, Action::EditExclusions) {
+                    self.exclusions.open(hwnd, &settings.exclusions)
+                } else {
+                    self.shortcuts.show(hwnd, self.anchor.get(), settings)
+                };
+                if let Err(detail) = opened {
                     let text: Vec<_> = detail.encode_utf16().chain([0]).collect();
                     unsafe {
                         MessageBoxW(hwnd, text.as_ptr(), w!("Rustile"), MB_OK | MB_ICONWARNING)
@@ -694,11 +711,9 @@ impl State {
         match key {
             VK_ESCAPE | VK_LEFT | VK_BACK => self.hide(hwnd, true),
             VK_RIGHT => {
-                let opens = self
-                    .entries
-                    .borrow()
-                    .get(index)
-                    .is_some_and(|r| matches!(r.action, Action::EditShortcuts));
+                let opens = self.entries.borrow().get(index).is_some_and(|r| {
+                    matches!(r.action, Action::EditShortcuts | Action::EditExclusions)
+                });
                 if opens {
                     self.activate(hwnd, index);
                 }

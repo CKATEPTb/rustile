@@ -1,10 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND,
+    EVENT_SYSTEM_MOVESIZESTART,
 };
 
 use crate::hud::{FocusOutline, ResizeHud};
@@ -12,6 +13,7 @@ use crate::layout::{Direction, Id, Layout, Rect, ResizeStep, ResizeStops};
 use crate::native::desktops::{DesktopId, DesktopMembership, Desktops};
 use crate::native::{self, Cloak, Original, TileState, WindowControl};
 use crate::settings::Settings;
+use crate::settings::exclusions::ExclusionMatcher;
 
 mod mouse;
 use mouse::MouseDrag;
@@ -123,6 +125,8 @@ impl WorkArea {
 
 pub struct Manager {
     settings: Settings,
+    exclusions: ExclusionMatcher,
+    exclusion_cache: RefCell<HashMap<Id, bool>>,
     desktops: Desktops,
     current: Option<DesktopId>,
     workspace: Workspace,
@@ -150,9 +154,17 @@ impl Manager {
         Self::with_settings(Settings::default())
     }
 
+    #[cfg(test)]
     pub fn with_settings(settings: Settings) -> Self {
+        Self::from_saved(settings).0
+    }
+
+    pub(crate) fn from_saved(settings: Settings) -> (Self, Option<String>) {
         let work_area = WorkArea::read();
-        Self {
+        let (exclusions, warning) = ExclusionMatcher::from_saved(&settings.exclusions);
+        let manager = Self {
+            exclusions,
+            exclusion_cache: RefCell::default(),
             desktops: Desktops::new(),
             current: None,
             workspace: Workspace::new(native::spacing_px(settings.gap)),
@@ -171,7 +183,26 @@ impl Manager {
             session: None,
             hud: ResizeHud::default(),
             outline: FocusOutline::default(),
+        };
+        (manager, warning)
+    }
+
+    pub(crate) fn watches_titles(&self) -> bool {
+        self.settings.enabled && self.exclusions.needs_title()
+    }
+
+    // Geometry events are frequent. Only read a candidate's properties once
+    // until its title, visibility, identity or the user's rules change.
+    fn excluded(&self, id: Id) -> bool {
+        if self.exclusions.is_empty() {
+            return false;
         }
+        if let Some(&matched) = self.exclusion_cache.borrow().get(&id) {
+            return matched;
+        }
+        let matched = native::excluded_by(id, &self.exclusions);
+        self.exclusion_cache.borrow_mut().insert(id, matched);
+        matched
     }
 
     // Only a window that Windows positively identifies on the current desktop
@@ -242,6 +273,7 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        self.exclusion_cache.get_mut().remove(&id);
         self.openings.forget(id);
         if self
             .transfer_anchor
@@ -258,6 +290,14 @@ impl Manager {
             self.detach(id, window.desktop);
             self.remove_empty_desktop(window.desktop);
         }
+    }
+
+    fn release_excluded(&mut self, id: Id) {
+        self.openings.cancel(id);
+        if let Some(window) = self.windows.get(&id) {
+            native::release_tiled(id, &window.original, window.requested);
+        }
+        self.forget(id);
     }
 
     // Move the original capture with the HWND. Recapturing here would make a
@@ -321,7 +361,12 @@ impl Manager {
         };
         self.transfer_anchor = workspace
             .and_then(|w| w.focus_history.last().copied())
-            .filter(|&anchor| anchor != id && self.settings.enabled && !self.expanded.contains(&id))
+            .filter(|&anchor| {
+                anchor != id
+                    && self.settings.enabled
+                    && !self.expanded.contains(&id)
+                    && !self.excluded(id)
+            })
             .map(|anchor| (id, destination, anchor));
         if self.migrate(id, destination) && self.settings.enabled {
             self.apply();
@@ -377,6 +422,11 @@ impl Manager {
 
     fn observe(&mut self, id: Id) -> TileState {
         let state = native::tile_state(id);
+        if state != TileState::Excluded && self.excluded(id) {
+            self.expanded.remove(&id);
+            self.pending_app_cloaks.remove(&id);
+            return TileState::Excluded;
+        }
         match state {
             TileState::Maximized | TileState::Fullscreen => {
                 self.expanded.insert(id);
@@ -402,7 +452,7 @@ impl Manager {
             return;
         }
         let Some(work) = work else { return };
-        self.update_work_area(work);
+        self.exclusion_cache.get_mut().clear();
         let foreground = native::foreground();
         // A paused or inactive workspace can miss DESTROY, or an HWND can be
         // reused. Identity markers survive cloaking and distinguish the cases.
@@ -410,6 +460,8 @@ impl Manager {
         for id in tracked {
             if !self.windows[&id].original.matches(id) {
                 self.forget(id);
+            } else if self.excluded(id) {
+                self.release_excluded(id);
             } else {
                 match self.desktops.membership(id) {
                     DesktopMembership::Other(key) | DesktopMembership::Current(key) => {
@@ -423,6 +475,7 @@ impl Manager {
                 }
             }
         }
+        self.update_work_area(work);
         let inventory = native::enumerate();
         self.expanded.retain(|id| inventory.contains(id));
         let visible: Vec<_> = inventory
@@ -563,6 +616,10 @@ impl Manager {
         let previous = &self.settings;
         let resuming = updated.enabled && !previous.enabled;
         let geometry = updated.gap != previous.gap || updated.padding != previous.padding;
+        let exclusions = (updated.exclusions != previous.exclusions)
+            .then(|| ExclusionMatcher::compile_update(&previous.exclusions, &updated.exclusions))
+            .transpose()?;
+        let rules_changed = exclusions.is_some();
         let proposed = if geometry {
             let work = WorkArea::read()
                 .ok_or_else(|| "Windows не сообщила размер рабочей области.".to_owned())?;
@@ -587,7 +644,7 @@ impl Manager {
             None
         };
         persist()?;
-        if geometry || !updated.enabled {
+        if geometry || rules_changed || !updated.enabled {
             self.openings.clear();
         }
         let system_changed = proposed
@@ -604,6 +661,23 @@ impl Manager {
             }
         }
         self.settings = updated;
+        if let Some(exclusions) = exclusions {
+            self.exclusions = exclusions;
+            self.exclusion_cache.get_mut().clear();
+            // A paused mosaic will not reconcile until it resumes, but should
+            // still relinquish any tile for which the user just added a rule.
+            if !self.settings.enabled {
+                let released: Vec<_> = self
+                    .windows
+                    .keys()
+                    .copied()
+                    .filter(|&id| self.excluded(id))
+                    .collect();
+                for id in released {
+                    self.release_excluded(id);
+                }
+            }
+        }
         if geometry || !self.settings.enabled {
             self.finish_mode();
         }
@@ -612,7 +686,7 @@ impl Manager {
             self.transfer_anchor = None;
             self.unconfirmed_focus.set(None);
             self.outline.hide();
-        } else if resuming || system_changed {
+        } else if resuming || system_changed || rules_changed {
             self.sync();
         } else if geometry {
             self.apply();
@@ -685,6 +759,9 @@ impl Manager {
 
     fn admit(&mut self, id: Id, anchor: Option<Id>) -> bool {
         let Some(area) = self.area else { return false };
+        if self.excluded(id) {
+            return false;
+        }
         let DesktopMembership::Current(desktop) = self.desktops.membership(id) else {
             return false;
         };
@@ -737,7 +814,7 @@ impl Manager {
     }
 
     pub fn event(&mut self, event: u32, id: Id) {
-        if !self.settings.enabled {
+        if !self.settings.enabled || (event == EVENT_OBJECT_NAMECHANGE && !self.watches_titles()) {
             return;
         }
         // Start and other shell surfaces can have no virtual desktop ID. A
@@ -755,6 +832,25 @@ impl Manager {
                 self.apply();
             }
             if event == EVENT_OBJECT_DESTROY {
+                return;
+            }
+        }
+        if !self.exclusions.is_empty()
+            && matches!(
+                event,
+                EVENT_OBJECT_CREATE
+                    | EVENT_OBJECT_NAMECHANGE
+                    | EVENT_OBJECT_SHOW
+                    | EVENT_OBJECT_UNCLOAKED
+            )
+        {
+            self.exclusion_cache.get_mut().remove(&id);
+            if (self.tracks_window(id) || self.openings.is_prepared(id)) && self.excluded(id) {
+                let was_tiled = self.workspace.layout.contains(id);
+                self.release_excluded(id);
+                if was_tiled {
+                    self.apply();
+                }
                 return;
             }
         }
@@ -959,6 +1055,9 @@ impl Manager {
             placements.swap(0, index);
         }
         for (id, rect) in placements {
+            if self.excluded(id) {
+                continue;
+            }
             let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
@@ -996,6 +1095,7 @@ impl Manager {
                 .get(&target)
                 .is_some_and(|w| w.original.matches(target))
             && native::eligible(target)
+            && !self.excluded(target)
     }
 
     pub(crate) fn cli_tile_available(&mut self, target: Id) -> bool {
@@ -1026,6 +1126,7 @@ impl Manager {
         // desktop with no normal tiles. Check its actual Shell membership.
         (native::maximized(id)
             && native::tile_state(id) == TileState::Maximized
+            && !self.excluded(id)
             && matches!(self.desktops.membership(id), DesktopMembership::Current(_))
             && self.windows.get(&id).is_none_or(|w| w.original.matches(id)))
         .then_some(ShortcutTarget::Expanded(id))

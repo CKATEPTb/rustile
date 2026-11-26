@@ -7,7 +7,7 @@ mod shortcuts;
 #[cfg(test)]
 mod tests;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
@@ -29,7 +29,7 @@ use crate::layout::Direction;
 use crate::manager::Mode;
 use crate::native::desktops::DesktopId;
 use crate::native::{self, TransferIdentity, WindowControl};
-use crate::settings::{Command, Modifier, Settings};
+use crate::settings::{Command, Modifier, Settings, exclusions::ExclusionRule};
 use crate::startup;
 use crate::tray::Tray;
 use crate::{Manager, cli};
@@ -189,6 +189,7 @@ impl DesktopStep {
 // that may themselves deliver more events.
 thread_local! {
     static PENDING: RefCell<Vec<(u32, isize)>> = const { RefCell::new(Vec::new()) };
+    static WATCH_TITLES: Cell<bool> = const { Cell::new(false) };
 }
 
 const ARROWS: [Direction; 4] = [
@@ -213,6 +214,7 @@ unsafe extern "system" fn on_window_event(
 ) {
     if (hwnd.is_null() && !matches!(event, EVENT_SYSTEM_DESKTOPSWITCH | EVENT_SYSTEM_FOREGROUND))
         || (event >= EVENT_OBJECT_CREATE && (object != OBJID_WINDOW || child != 0))
+        || (event == EVENT_OBJECT_NAMECHANGE && !WATCH_TITLES.get())
     {
         return;
     }
@@ -220,7 +222,7 @@ unsafe extern "system" fn on_window_event(
     // the parent of a destroyed HWND; the manager still needs its removal.
     if matches!(
         event,
-        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_STATECHANGE
+        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_STATECHANGE | EVENT_OBJECT_NAMECHANGE
     ) && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
     {
         return;
@@ -253,6 +255,7 @@ impl EventHooks {
             (EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
             (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
+            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         ] {
@@ -411,13 +414,38 @@ impl Preferences<'_> {
         // The command-line resize shortcut applies only to this launch unless
         // the user explicitly chooses a new resize binding in the tray.
         let saved = self.saved.changed_for_save(command, &self.live)?;
+        self.commit(manager, tray, next, saved)?;
+        hook.set_settings(&self.live);
+        Ok(())
+    }
+
+    fn replace_exclusions(
+        &mut self,
+        manager: &mut Manager,
+        tray: &Tray,
+        rules: Vec<ExclusionRule>,
+    ) -> Result<(), String> {
+        let mut next = self.live.clone();
+        let mut saved = self.saved.clone();
+        next.exclusions.clone_from(&rules);
+        saved.exclusions = rules;
+        self.commit(manager, tray, next, saved)
+    }
+
+    fn commit(
+        &mut self,
+        manager: &mut Manager,
+        tray: &Tray,
+        next: Settings,
+        saved: Settings,
+    ) -> Result<(), String> {
         let write = (saved != self.saved)
             .then(|| saved.prepare(self.path))
             .transpose()?;
         manager.apply_settings_with(next.clone(), || {
             write.map_or(Ok(()), |pending| pending.commit())
         })?;
-        hook.set_settings(&next);
+        WATCH_TITLES.set(manager.watches_titles());
         tray.set_settings(next.clone());
         self.live = next;
         self.saved = saved;
@@ -1061,6 +1089,11 @@ fn pump(
                 tray.shortcut_result(result.as_ref().err().map(String::as_str));
             }
         }
+        if let Some(rules) = tray.take_exclusions() {
+            let result = preferences.replace_exclusions(manager, tray, rules);
+            tray.exclusions_result(result);
+            refresh(manager, 0);
+        }
         if !manager.tracking_drag_cursor() {
             drag_timer.cancel();
         } else if drag_timer.id == 0 {
@@ -1187,11 +1220,15 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
     let server = ipc::Server::start()?;
     let keyboard = shortcuts::Hook::install(&live)?;
     let hooks = EventHooks::install()?;
-    let mut manager = Manager::with_settings(live);
+    let (mut manager, exclusion_warning) = Manager::from_saved(live);
+    WATCH_TITLES.set(manager.watches_titles());
     manager.sync();
     refresh(&mut manager, 0);
     if let Some(warning) = load_warning {
         show_error(&format!("Применены настройки по умолчанию.\n\n{warning}"));
+    }
+    if let Some(warning) = exclusion_warning {
+        show_error(&warning);
     }
     let result = pump(
         &mut manager,

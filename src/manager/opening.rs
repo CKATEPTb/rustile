@@ -40,6 +40,10 @@ pub(super) fn insert_tile(
 }
 
 impl Openings {
+    pub(super) fn is_prepared(&self, id: Id) -> bool {
+        self.prepared.contains_key(&id)
+    }
+
     pub(super) fn forget(&mut self, id: Id) {
         self.prepared.remove(&id);
         self.retry.remove(&id);
@@ -107,6 +111,11 @@ impl Manager {
         let Some(original) = native::capture_opening(id, stage) else {
             return;
         };
+        // An app can assign its title immediately before SHOW. A rule whose
+        // other fields already match must get that chance before moving it.
+        if native::opening_excluded_by(id, &self.exclusions) {
+            return;
+        }
         let Some(desktop) = self.desktops.opening_desktop(id) else {
             return;
         };

@@ -59,6 +59,126 @@ fn geometry_changes(id: Id) -> usize {
     fixture_message(id, WM_APP + 3, 0)
 }
 
+pub(super) fn mosaic_exclusions(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
+    use crate::settings::exclusions::{ExclusionRule, MatchMode};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE, GetWindowTextW, WM_SETTEXT,
+    };
+
+    let [peer, target, remote, ..] = windows;
+    let homes = [(peer, A), (target, A), (remote, B)];
+    let originals = [target, remote].map(frame);
+    let title = |id: Id| {
+        let mut text = [0u16; 256];
+        let len = unsafe { GetWindowTextW(id as _, text.as_mut_ptr(), text.len() as _) };
+        assert!(len > 0);
+        String::from_utf16_lossy(&text[..len as usize])
+    };
+    let rename = |id: Id, value: &str| {
+        let text = value.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut result = 0;
+        assert_ne!(
+            unsafe {
+                SendMessageTimeoutW(
+                    id as _,
+                    WM_SETTEXT,
+                    0,
+                    text.as_ptr() as _,
+                    SMTO_ABORTIFHUNG,
+                    1000,
+                    &mut result,
+                )
+            },
+            0
+        );
+        assert_ne!(result, 0);
+    };
+    let target_title = title(target);
+    let by_title = |value: String| ExclusionRule {
+        title: value,
+        mode: MatchMode::Equals,
+        ..Default::default()
+    };
+    select_desktop(manager, &homes, B, None);
+    manager.reconcile_desktop();
+    settle(manager, 1);
+    select_desktop(manager, &homes, A, None);
+    manager.reconcile_desktop();
+    settle(manager, 2);
+
+    let previous = manager.settings.clone();
+    let mut updated = previous.clone();
+    updated.exclusions = vec![by_title(target_title.clone()), by_title(title(remote))];
+    assert!(
+        manager
+            .apply_settings_with(updated.clone(), || Err("disk full".into()))
+            .is_err()
+    );
+    assert!(manager.can_act_on(target));
+    assert!(manager.tracks_window(remote));
+    assert!(manager.begin_resize(target));
+    manager.apply_settings(updated).unwrap();
+    settle(manager, 1);
+    assert_eq!(manager.mode(), super::Mode::Normal);
+    assert!(super::resize_hint().is_none());
+    until("release current and parked matches", || {
+        [target, remote].map(frame) == originals
+    });
+    assert_eq!(frame(peer), manager.area.unwrap());
+    assert!(!manager.tracks_window(remote));
+    assert!(!manager.begin_resize(target));
+    assert!(!manager.move_window(target, Direction::Right));
+    assert!(manager.transferable_on(target, A));
+    assert!(manager.current_control_targets().contains(&target));
+    let maximize = crate::native::WindowControl::ToggleMaximize;
+    assert!(manager.request_window_control(target, maximize, || true));
+    until("maximize excluded window", || {
+        crate::native::maximized(target)
+    });
+    manager.event(EVENT_OBJECT_LOCATIONCHANGE, target);
+    assert!(manager.shortcut_target(target).is_none());
+    assert!(manager.request_window_control(target, maximize, || true));
+    until("restore excluded window", || {
+        !crate::native::maximized(target) && frame(target) == originals[0]
+    });
+
+    let transferred = [(peer, A), (target, B), (remote, B)];
+    select_desktop(manager, &transferred, B, None);
+    manager.transferred_window(target, B);
+    manager.event(EVENT_OBJECT_SHOW, target);
+    assert!(manager.transferable_on(target, B));
+    assert!(!manager.tracks_window(target));
+    select_desktop(manager, &homes, A, None);
+    manager.transferred_window(target, A);
+
+    // A previously excluded title can become eligible and vice versa without a SHOW.
+    rename(target, "Rustile regular document");
+    manager.event(EVENT_OBJECT_NAMECHANGE, target);
+    settle(manager, 2);
+    rename(target, &target_title);
+    manager.event(EVENT_OBJECT_NAMECHANGE, target);
+    settle(manager, 1);
+    until("renamed document returns to floating coordinates", || {
+        frame(target) == originals[0]
+    });
+    // Even with an early current-desktop hint, hidden CREATE must not pre-place it.
+    super::set_visible(target, false);
+    manager.desktops.opening_hint_fixture = Some((target, A));
+    manager.event(EVENT_OBJECT_CREATE, target);
+    assert!(!manager.openings.is_prepared(target));
+    rename(target, "");
+    manager.event(EVENT_OBJECT_CREATE, target);
+    assert!(!manager.openings.is_prepared(target));
+    rename(target, &target_title);
+    manager.event(EVENT_OBJECT_NAMECHANGE, target);
+    super::set_visible(target, true);
+    manager.event(EVENT_OBJECT_SHOW, target);
+    assert!(!manager.tracks_window(target));
+    manager.apply_settings(previous).unwrap();
+    settle(manager, 2);
+    assert!(manager.can_act_on(target));
+}
+
 // Only the fixture can cloak its own window. This leaves WS_VISIBLE set, as
 // during a shell desktop switch. Membership still comes from the test adapter.
 fn cloak(id: Id, cloaked: bool) {

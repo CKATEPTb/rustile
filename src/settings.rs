@@ -1,4 +1,5 @@
 mod bindings;
+pub(crate) mod exclusions;
 mod scheme;
 
 use crate::profile_io;
@@ -6,6 +7,7 @@ use crate::profile_io;
 pub(crate) use bindings::BindingOwners;
 pub(crate) use bindings::{Assignment, BindingConflicts, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
 use bindings::{Overrides, StoredOverrides};
+use exclusions::ExclusionRule;
 use scheme::{Scheme, SchemeKey};
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
@@ -90,6 +92,8 @@ pub(crate) struct Settings {
     scheme: Scheme,
     #[serde(skip_serializing_if = "Overrides::is_empty")]
     shortcuts: Overrides,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exclusions: Vec<ExclusionRule>,
 }
 
 impl Default for Settings {
@@ -102,6 +106,7 @@ impl Default for Settings {
             padding: 8,
             scheme: Scheme::default(),
             shortcuts: Overrides::default(),
+            exclusions: Vec::new(),
         }
     }
 }
@@ -122,6 +127,8 @@ struct StoredSettings {
     scheme: Option<Scheme>,
     #[serde(default)]
     shortcuts: StoredOverrides,
+    #[serde(default)]
+    exclusions: Vec<ExclusionRule>,
 }
 
 impl From<StoredSettings> for Settings {
@@ -135,6 +142,7 @@ impl From<StoredSettings> for Settings {
             padding: file.padding.unwrap_or(defaults.padding),
             scheme: file.scheme.unwrap_or_default(),
             shortcuts: Overrides::default(),
+            exclusions: file.exclusions,
         };
         settings.import_bindings(
             file.shortcuts,

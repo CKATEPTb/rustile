@@ -44,6 +44,7 @@ impl Measure {
 #[derive(Clone, Copy)]
 pub(super) enum Action {
     EditShortcuts,
+    EditExclusions,
     Adjust(Measure),
     Apply(Command),
     None,
@@ -158,7 +159,12 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
                 .group(),
         );
     }
-    rows.push(Row::new("Выйти из Rustile", "\u{e7e8}", Action::Apply(Command::Exit)).group());
+    rows.push(Row::new("Исключения", "\u{e71c}", Action::EditExclusions).group());
+    rows.push(Row::new(
+        "Выйти из Rustile",
+        "\u{e7e8}",
+        Action::Apply(Command::Exit),
+    ));
     rows
 }
 

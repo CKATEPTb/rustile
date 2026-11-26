@@ -711,7 +711,7 @@ internal static class DesktopSmoke {
             result = hwnd;
             return false;
         }, IntPtr.Zero);
-        Require(result != IntPtr.Zero, "Missing shortcut editor control " + id);
+        Require(result != IntPtr.Zero, "Missing editor control " + id);
         return result;
     }
     static string ControlText(IntPtr hwnd) {
@@ -734,6 +734,55 @@ internal static class DesktopSmoke {
     }
     static void ClickControl(IntPtr window, int id) {
         SendTrayMessage(EditorControl(window, id), 0x00f5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
+    }
+    static void SetText(IntPtr window, string value) {
+        UIntPtr result;
+        Require(SendMessageTimeout(window, 0x000c /* WM_SETTEXT */, UIntPtr.Zero,
+            new StringBuilder(value), 2, 1000, out result) != IntPtr.Zero && result != UIntPtr.Zero,
+            "Could not set fixture text");
+    }
+    static void VerifyExclusions(Child manager, IntPtr tray, Rectangle area, IntPtr[] pair, Rectangle[] original) {
+        TrayOpen(tray, TrayKeyboard, area);
+        TrayClick(tray, "Исключения");
+        var editor = TrayWindow(manager, "Rustile.Exclusions");
+        Until("Exclusions should replace the flyout", () => IsWindowVisible(editor) && !IsWindowVisible(tray));
+        var title = ControlText(pair[0]);
+        var nameField = EditorControl(editor, 605);
+        var mode = EditorControl(editor, 607);
+        var path = Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "Rustile", "settings.toml");
+        var previousProfile = File.Exists(path) ? File.ReadAllText(path) : null;
+        SendTrayMessage(mode, 0x014e /* CB_SETCURSEL */, (IntPtr)2, IntPtr.Zero);
+        SetText(nameField, "[");
+        ClickControl(editor, 608);
+        Until("Invalid regex should be explained inline", () => ControlText(EditorControl(editor, 609)).Length > 0);
+        Require((File.Exists(path) ? File.ReadAllText(path) : null) == previousProfile && Tiled(area, pair),
+            "An invalid exclusion changed the profile or mosaic");
+        SendTrayMessage(mode, 0x014e /* CB_SETCURSEL */, IntPtr.Zero, IntPtr.Zero);
+        SetText(nameField, title);
+        ClickControl(editor, 608);
+        Until("Saving a title rule should restore that window and expand its peer", () =>
+            Bounds(pair[0]) == original[0] && VisibleFrame(pair[1]).Width > area.Width * 9 / 10
+            && File.Exists(path) && File.ReadAllText(path).Contains(title));
+        SetText(pair[0], title + " renamed");
+        Until("A title change should return the window to the mosaic", () => Tiled(area, pair));
+        SetText(pair[0], title);
+        Until("Changing a title back must release the window again", () => Bounds(pair[0]) == original[0]);
+        SendTrayMessage(editor, WmClose, IntPtr.Zero, IntPtr.Zero);
+        Until("Closing the exclusions editor should dismiss it", () => !IsWindowVisible(editor));
+        TrayOpen(tray, TrayContext, area);
+        TrayClick(tray, "Исключения");
+        editor = TrayWindow(manager, "Rustile.Exclusions");
+        var list = EditorControl(editor, 601);
+        UIntPtr count;
+        Require(SendMessageTimeout(list, 0x018b /* LB_GETCOUNT */, IntPtr.Zero, IntPtr.Zero, 2, 1000, out count)
+            != IntPtr.Zero && count.ToUInt64() == 1, "Reopening the editor should load the saved rule");
+        SendTrayMessage(list, 0x0186 /* LB_SETCURSEL */, IntPtr.Zero, IntPtr.Zero);
+        SendTrayMessage(editor, 0x0111 /* WM_COMMAND */, (IntPtr)((1 << 16) | 601), list);
+        ClickControl(editor, 603);
+        Until("Deleting the rule should restore both tiles and persist the change", () =>
+            Tiled(area, pair) && !File.ReadAllText(path).Contains(title));
+        SendTrayMessage(editor, WmClose, IntPtr.Zero, IntPtr.Zero);
+        Console.WriteLine("PASS  Exclusion editor saves and removes a rule; real title changes release and readmit the window");
     }
     static void MouseClick(IntPtr control, bool twice = false) {
         var bounds = Bounds(control);
@@ -1362,8 +1411,11 @@ internal static class DesktopSmoke {
                 var compact = Bounds(tray);
                 TrayButton(tray, startup + ", Выключено");
                 TrayKey(tray, startup, Keys.Down);
+                TrayFocus(tray, "Исключения");
+                TrayKey(tray, "Исключения", Keys.Down);
                 TrayFocus(tray, "Выйти из Rustile");
                 TrayKey(tray, "Выйти из Rustile", Keys.Up);
+                TrayKey(tray, "Исключения", Keys.Up);
                 TrayFocus(tray, startup);
                 TrayKey(tray, startup, Keys.Space);
                 TrayButton(tray, startup + ", Включено");
@@ -1398,7 +1450,7 @@ internal static class DesktopSmoke {
                 TrayClick(tray, startup);
                 TrayButton(tray, startup + ", Выключено");
                 TrayKey(tray, startup, Keys.Down);
-                TrayFocus(tray, "Выйти из Rustile");
+                TrayFocus(tray, "Исключения");
                 TrayClick(tray, "Выйти из Rustile");
                 Require(manager.Exited(5000) && manager.ExitCode == 0, "Isolated startup fixture did not exit cleanly");
             } finally {
@@ -1417,6 +1469,7 @@ internal static class DesktopSmoke {
     static void TraySettings(Child manager, string rustile, string desktop, List<Child> children,
         IntPtr[] pair, Rectangle[] originals, Rectangle area) {
         var tray = TrayWindow(manager);
+        VerifyExclusions(manager, tray, area, pair, originals);
         TrayOpen(tray, TrayKeyboard, area);
         TrayFocus(tray, "Мозаика");
         TrayKey(tray, "Мозаика", Keys.Down);
@@ -1585,8 +1638,13 @@ internal static class DesktopSmoke {
             ControlText(right) == initial[5] && !IsWindowVisible(trashRight) && File.ReadAllText(file) == beforeCapture);
         BeginRecording(right);
         EnterChord(right, Keys.ControlKey, Keys.Delete);
-        Until("Delete should be bindable during recording", () => ControlText(right).EndsWith("Ctrl+Delete"));
-        MouseClick(EditorControl(editor, 1105));
+        var resetRight = EditorControl(editor, 1105);
+        // The live recording preview can display the full chord before its
+        // asynchronous save finishes and the reset control becomes available.
+        Until("Delete should be saved before resetting its binding", () =>
+            ControlText(right).EndsWith("Ctrl+Delete") && !IsWindowVisible(trashRight)
+            && IsWindowEnabled(resetRight) && File.ReadAllText(file) != beforeCapture);
+        MouseClick(resetRight);
         Until("Reset should restore Move right after binding Delete", () => File.ReadAllText(file) == beforeCapture);
         BeginRecording(left);
         EnterChord(left, Keys.LWin, Keys.Left); // Conflicts with Focus left.

@@ -2,11 +2,14 @@ pub(crate) mod access;
 pub(crate) mod desktops;
 
 use crate::layout::{Id, Rect};
+use crate::settings::exclusions::ExclusionMatcher;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, HWND, LPARAM, POINT, RECT,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DWM_CLOAKED_APP, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUNDSMALL, DwmGetWindowAttribute,
@@ -273,10 +276,8 @@ fn ordinary_process(owner: u32) -> bool {
         if process.is_null() {
             return false;
         }
-        let mut path = [0u16; 1024];
-        let mut len = path.len() as u32;
-        let has_image = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len) != 0;
-        let allowed = has_image
+        let image = process_basename(process);
+        let allowed = image.is_some()
             && access::ProcessAccess::current().is_some_and(|manager| {
                 access::ProcessAccess::query(process)
                     .is_some_and(|target| manager.can_tile(&target))
@@ -285,8 +286,7 @@ fn ordinary_process(owner: u32) -> bool {
         if !allowed {
             return false;
         }
-        let image = String::from_utf16_lossy(&path[..len as usize]);
-        let executable = image.rsplit('\\').next().unwrap_or_default();
+        let executable = image.as_deref().unwrap_or_default();
         ![
             "ShellExperienceHost.exe",
             "ShellHost.exe",
@@ -303,6 +303,81 @@ fn ordinary_process(owner: u32) -> bool {
         .iter()
         .any(|shell| executable.eq_ignore_ascii_case(shell))
     }
+}
+
+fn process_basename(process: HANDLE) -> Option<String> {
+    let query = |path: &mut [u16]| {
+        let mut length = path.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } == 0 {
+            return None;
+        }
+        let name = path[..length as usize]
+            .rsplit(|&c| c == b'\\' as u16)
+            .next()?;
+        Some(String::from_utf16_lossy(name))
+    };
+    let name = query(&mut [0u16; 1024]);
+    if name.is_none() && unsafe { GetLastError() } == ERROR_INSUFFICIENT_BUFFER {
+        return query(&mut vec![0u16; 32_768]);
+    }
+    name
+}
+
+fn window_executable(id: Id) -> Option<String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid(id)) };
+    if handle.is_null() {
+        return None;
+    }
+    let name = process_basename(handle);
+    unsafe { CloseHandle(handle) };
+    name
+}
+
+pub(crate) fn excluded_by(id: Id, rules: &ExclusionMatcher) -> bool {
+    match_exclusions(id, rules, false)
+}
+
+pub(crate) fn opening_excluded_by(id: Id, rules: &ExclusionMatcher) -> bool {
+    match_exclusions(id, rules, true)
+}
+
+fn match_exclusions(id: Id, rules: &ExclusionMatcher, opening: bool) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+    let process = rules
+        .needs_process()
+        .then(|| window_executable(id))
+        .flatten();
+    let title = rules.needs_title().then(|| window_title(id));
+    let class = rules
+        .needs_class()
+        .then(|| window_class(id as HWND))
+        .flatten();
+    let process = process.as_deref().unwrap_or_default();
+    let title = title.as_deref().unwrap_or_default();
+    let class = class.as_deref().unwrap_or_default();
+    rules.matches(process, title, class)
+        || (opening
+            && title.is_empty()
+            && rules.needs_title()
+            && rules.may_match_pending_title(process, class))
+}
+
+pub(crate) fn exclusion_candidates() -> Vec<(String, String, String)> {
+    // enumerate() returns bottom first. Offer the frontmost windows first.
+    enumerate()
+        .into_iter()
+        .rev()
+        .filter(|&id| can_close_or_transfer(id))
+        .filter_map(|id| {
+            Some((
+                window_executable(id)?,
+                window_title(id),
+                window_class(id as HWND).unwrap_or_default(),
+            ))
+        })
+        .collect()
 }
 
 fn window_class(hwnd: HWND) -> Option<String> {
@@ -1093,6 +1168,17 @@ pub(crate) fn place_unsnapped(hwnd: HWND, bounds: Rect) -> bool {
 pub fn restore(id: Id, original: &Original) {
     if eligible(id) && original.matches(id) {
         position(id as HWND, original.outer, 0);
+    }
+}
+
+/// Give back only the last rectangle Rustile owned. A manual move during
+/// pause, native maximize, or fullscreen keeps the application's own frame.
+/// The rollback also works on a parked desktop without changing activation.
+pub(crate) fn release_tiled(id: Id, original: &Original, requested: Option<Rect>) {
+    if let Some(tile) = requested
+        && original.matches(id)
+    {
+        original.restore_opening(original.insets.outer_for(tile));
     }
 }
 

@@ -1354,6 +1354,7 @@ fn move_windows() {
         six_windows(manager, fixtures, area);
     });
     run(immediately_shown_arrival);
+    run(virtual_desktops::mosaic_exclusions);
     run(focused_arrivals);
     run(move_left_past_tall_window);
     run(move_down_beside_tall_window);
