@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use super::DesktopDestination;
 use crate::layout::Id;
 use crate::native::desktops::{DesktopId, occupancy, shell::DesktopShell};
 
@@ -347,20 +348,37 @@ impl Workspaces {
         }
     }
 
-    fn relative_target(&mut self, current: DesktopId, next: bool) -> Option<DesktopId> {
+    fn resolve(
+        &mut self,
+        current: DesktopId,
+        destination: DesktopDestination,
+    ) -> Option<(DesktopId, Vec<DesktopId>)> {
         let shell = self.shell.as_ref()?;
         let order = shell.list()?;
-        if !next {
-            return neighbor(&order, current, false);
-        }
-        let tail = from_current(&order, current)?;
-        if tail.len() > 1 {
-            let target = forward_neighbor(tail, |ids| occupancy::any_occupied(&order, ids))?;
-            if shell.current()? != current || shell.list()? != order {
-                return None;
+        let target = match destination {
+            DesktopDestination::Number(number) => {
+                numbered_target(&order, current, number, |tail| {
+                    occupancy::any_occupied(&order, tail)
+                })?
             }
-            return Some(target);
-        }
+            DesktopDestination::Relative { next: false } => neighbor(&order, current, false)?,
+            DesktopDestination::Relative { next: true } => {
+                let tail = from_current(&order, current)?;
+                if tail.len() == 1 {
+                    return self.prepare_next(current, order);
+                }
+                forward_neighbor(tail, |ids| occupancy::any_occupied(&order, ids))?
+            }
+        };
+        Some((target, order))
+    }
+
+    fn prepare_next(
+        &mut self,
+        current: DesktopId,
+        order: Vec<DesktopId>,
+    ) -> Option<(DesktopId, Vec<DesktopId>)> {
+        let shell = self.shell.as_ref()?;
         let inventory = Inventory::for_order(shell, current, order)?;
         if !inventory.occupied.contains(&current) {
             return None;
@@ -376,22 +394,28 @@ impl Workspaces {
         self.policy.retry_at = None;
         self.policy.failures = 0;
         if self.policy.apply(shell, change) {
-            return self.policy.spare;
+            let to = self.policy.spare?;
+            let order = shell.list()?;
+            return (neighbor(&order, current, true) == Some(to)).then_some((to, order));
         }
         None
     }
 
-    pub(super) fn navigate(&mut self, next: bool) -> Option<(DesktopId, DesktopId)> {
+    pub(super) fn navigate(
+        &mut self,
+        destination: DesktopDestination,
+    ) -> Option<(DesktopId, DesktopId)> {
         let current = self.current_desktop()?;
-        let target = self.relative_target(current, next)?;
+        let (target, order) = self.resolve(current, destination)?;
         let shell = self.shell.as_ref()?;
-        (shell.current()? == current && shell.switch(target)).then_some((current, target))
+        (shell.current()? == current && shell.list()? == order && shell.switch(target))
+            .then_some((current, target))
     }
 
     pub(super) fn transfer(
         &mut self,
         window: Id,
-        next: bool,
+        destination: DesktopDestination,
         valid: impl Fn(DesktopId) -> bool,
         uninterrupted: impl Fn() -> bool,
     ) -> Option<WindowTransfer> {
@@ -399,32 +423,19 @@ impl Workspaces {
         if !uninterrupted() || !valid(from) {
             return None;
         }
-        let to = self.relative_target(from, next)?;
+        let (to, order) = self.resolve(from, destination)?;
         let shell = self.shell.as_ref()?;
-        if neighbor(&shell.list()?, from, next) != Some(to) {
-            return None;
-        }
         WindowTransfer::perform(
             from,
             to,
-            || shell.move_window(window, from, to, || valid(from) && uninterrupted()),
+            || {
+                shell.list().as_ref() == Some(&order)
+                    && shell.move_window(window, from, to, || valid(from) && uninterrupted())
+            },
             || shell.current(),
             &uninterrupted,
             |target| shell.switch(target),
         )
-    }
-
-    pub(super) fn navigate_to(&self, number: usize) -> Option<(DesktopId, DesktopId)> {
-        let shell = self.shell.as_ref()?;
-        let current = shell.current()?;
-        let order = shell.list()?;
-        let target = numbered_target(&order, current, number, |tail| {
-            occupancy::any_occupied(&order, tail)
-        })?;
-        if shell.current()? != current || shell.list()? != order {
-            return None;
-        }
-        shell.switch(target).then_some((current, target))
     }
 }
 
@@ -724,6 +735,48 @@ mod tests {
         assert_eq!(
             numbered_target(&many, many[0], 10, |_| Some(true)),
             Some(many[9])
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only numbered transfer preflight; requires a movable foreground and two desktops"]
+    fn numbered_foreground_transfer_preflight() {
+        use crate::native::{
+            desktops::{DesktopMembership, Desktops},
+            foreground,
+        };
+
+        let mut workspaces = Workspaces::new();
+        let current = workspaces.current_desktop().expect("interactive Explorer");
+        let order = workspaces.shell.as_ref().unwrap().list().unwrap();
+        assert!(order.len() > 1, "a second desktop is required");
+        let number = if order[4.min(order.len() - 1)] == current {
+            1
+        } else {
+            5
+        };
+        let destination = DesktopDestination::Number(number);
+        let (target, snapshot) = workspaces.resolve(current, destination).unwrap();
+        assert_eq!(snapshot, order);
+        assert_eq!(target, order[(number - 1).min(order.len() - 1)]);
+        let hwnd = foreground();
+        let desktops = Desktops::new();
+        assert_eq!(
+            desktops.membership(hwnd),
+            DesktopMembership::Current(current)
+        );
+
+        let shell = workspaces.shell.as_ref().unwrap();
+        let mut reached = false;
+        assert!(!shell.move_window(hwnd, current, target, || {
+            reached = true;
+            false
+        }));
+        assert!(reached, "foreground must reach the final veto");
+        assert_eq!(workspaces.current_desktop(), Some(current));
+        assert_eq!(
+            desktops.membership(hwnd),
+            DesktopMembership::Current(current)
         );
     }
 

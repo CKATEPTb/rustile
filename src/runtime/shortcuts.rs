@@ -15,8 +15,9 @@ mod wheel;
 
 use super::{
     CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_FIRST, DESKTOP_NEXT, DESKTOP_PREVIOUS, DESKTOP_TENTH,
-    DesktopDestination, EXPAND, FOCUS, KEY_COMMAND, MOVE, MOVE_DESKTOP_NEXT, MOVE_DESKTOP_PREVIOUS,
-    QUICK_RESIZE, QUICK_REVERSE, SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
+    DesktopDestination, EXPAND, FOCUS, KEY_COMMAND, MOVE, MOVE_DESKTOP_FIRST, MOVE_DESKTOP_NEXT,
+    MOVE_DESKTOP_PREVIOUS, MOVE_DESKTOP_TENTH, QUICK_RESIZE, QUICK_REVERSE, SHRINK, START_RESIZE,
+    TOGGLE_MAXIMIZE, TOGGLE_MOSAIC, is_desktop_move,
 };
 use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
@@ -46,10 +47,6 @@ pub(crate) fn transfer_focus_uninterrupted() -> bool {
 
 pub(super) fn end_transfer_focus_watch() {
     TRANSFER_FOCUS_WATCH.store(false, Ordering::Relaxed);
-}
-
-fn is_desktop_move(id: i32) -> bool {
-    matches!(id, MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT)
 }
 
 pub(super) fn is_focus_command(id: i32) -> bool {
@@ -201,6 +198,16 @@ fn command_id(action: Shortcut) -> u8 {
         Desktop10 => DESKTOP_TENTH,
         MovePreviousDesktop | MovePreviousDesktopAlt => MOVE_DESKTOP_PREVIOUS,
         MoveNextDesktop | MoveNextDesktopAlt => MOVE_DESKTOP_NEXT,
+        MoveDesktop1 => MOVE_DESKTOP_FIRST,
+        MoveDesktop2 => MOVE_DESKTOP_FIRST + 1,
+        MoveDesktop3 => MOVE_DESKTOP_FIRST + 2,
+        MoveDesktop4 => MOVE_DESKTOP_FIRST + 3,
+        MoveDesktop5 => MOVE_DESKTOP_FIRST + 4,
+        MoveDesktop6 => MOVE_DESKTOP_FIRST + 5,
+        MoveDesktop7 => MOVE_DESKTOP_FIRST + 6,
+        MoveDesktop8 => MOVE_DESKTOP_FIRST + 7,
+        MoveDesktop9 => MOVE_DESKTOP_FIRST + 8,
+        MoveDesktop10 => MOVE_DESKTOP_TENTH,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -351,13 +358,8 @@ impl Pending {
     fn transition(self, command: i32, focus_epoch: usize) -> Option<Self> {
         let mode = match command {
             START_RESIZE => Mode::Resize,
-            CONFIRM
-            | CANCEL
-            | CLOSE_WINDOW
-            | TOGGLE_MAXIMIZE
-            | TOGGLE_MOSAIC
-            | MOVE_DESKTOP_PREVIOUS
-            | MOVE_DESKTOP_NEXT => Mode::Normal,
+            CONFIRM | CANCEL | CLOSE_WINDOW | TOGGLE_MAXIMIZE | TOGGLE_MOSAIC => Mode::Normal,
+            id if is_desktop_move(id) => Mode::Normal,
             _ => return None,
         };
         // Low eight bits of WPARAM carry the command. Ticket zero denotes a
@@ -498,13 +500,16 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             } else {
                 None
             };
-            if down
+            // A consumed digit can repeat after Shift is released. It still
+            // belongs to the original move, including its pending focus handoff.
+            let fresh_input = down && previous != Press::Consumed;
+            if fresh_input
                 && transfer_focus_uninterrupted()
                 && !binding.is_some_and(|b| is_desktop_move(b.id))
             {
                 end_transfer_focus_watch();
             }
-            if down
+            if fresh_input
                 && desktop_focus_uninterrupted()
                 && !binding.is_some_and(|b| uses_desktop_focus(b.id))
             {
@@ -745,6 +750,7 @@ mod tests {
             (VK_H, MOD_ALT | MOD_WIN, QUICK_RESIZE),
             (VK_H, MOD_ALT | MOD_WIN | MOD_CONTROL, QUICK_REVERSE),
             (VK_1, MOD_ALT, DESKTOP_FIRST),
+            (VK_1, MOD_ALT | MOD_CONTROL, MOVE_DESKTOP_FIRST),
             (crate::settings::WHEEL_DOWN, MOD_ALT, DESKTOP_NEXT),
             (VK_F9, MOD_CONTROL, MOVE + 1),
         ] {
@@ -891,6 +897,66 @@ mod tests {
                 assert_eq!(keyboard.key(key, false, 0), Action::Pass);
             }
         }
+    }
+
+    #[test]
+    fn shifted_desktop_digits_move_the_live_foreground_and_plain_digits_only_navigate() {
+        let mut keyboard = Keyboard::new();
+        for (enabled, mode, tile, foreground) in [
+            (true, Mode::Normal, Some(ShortcutTarget::Tile(100)), 100),
+            (true, Mode::Resize, Some(ShortcutTarget::Tile(100)), 100),
+            (true, Mode::Normal, Some(ShortcutTarget::Tile(100)), 999),
+            (false, Mode::Normal, None, 741),
+            (false, Mode::Normal, None, 0),
+        ] {
+            keyboard.settings.enabled = enabled;
+            keyboard.state.mode = mode;
+            keyboard.state.target = tile;
+            let routes = Routes::new(&keyboard.settings);
+            for number in 1..=10 {
+                let key = VK_0 + number % 10;
+                let offset = i32::from(number) - 1;
+                let binding = |mods| {
+                    routes.0[usize::from(key)]?
+                        .binding(keyboard.state, Pending::NEW, mods, || foreground)
+                        .map(|b| (b.id, b.target))
+                };
+                assert_eq!(
+                    binding(WIN_SHIFT),
+                    Some((MOVE_DESKTOP_FIRST + offset, Some(foreground)))
+                );
+                assert_eq!(binding(MOD_WIN), Some((DESKTOP_FIRST + offset, Some(0))));
+                assert_eq!(binding(MOD_SHIFT), None);
+                assert_eq!(binding(MOD_CONTROL | WIN_SHIFT), None);
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_transfers_end_resize_and_consume_the_digit_until_release() {
+        let mut keyboard = Keyboard::new();
+        keyboard.state.mode = Mode::Resize;
+        assert_eq!(
+            keyboard.key(VK_5, true, WIN_SHIFT),
+            Action::Command(MOVE_DESKTOP_FIRST + 4)
+        );
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_5, true, MOD_WIN), Action::Consume);
+        assert_eq!(keyboard.key(VK_5, false, MOD_WIN), Action::Consume);
+        assert_eq!(
+            keyboard.key(VK_5, true, MOD_WIN),
+            Action::Command(DESKTOP_FIRST + 4)
+        );
+        assert_eq!(keyboard.key(VK_5, false, 0), Action::Consume);
+
+        keyboard.assign(Shortcut::MoveDesktop5, MOD_ALT, VK_F8);
+        assert_eq!(keyboard.key(VK_5, true, WIN_SHIFT), Action::Pass);
+        assert_eq!(keyboard.key(VK_5, false, 0), Action::Pass);
+        assert_eq!(
+            keyboard.key(VK_F8, true, MOD_ALT),
+            Action::Command(MOVE_DESKTOP_FIRST + 4)
+        );
     }
 
     #[test]

@@ -482,15 +482,16 @@ internal static class DesktopSmoke {
     // Keep the stable IDs of the commands. The two modal exits and six
     // former desktop alternative slots no longer have editable rows.
     static readonly int[] RetiredRows = { 17, 18, 32, 33, 34, 35, 48, 49 };
-    static readonly int[] EditableRows = Enumerable.Range(0, 50).Except(RetiredRows).ToArray();
+    const int ActionCount = 60;
+    static readonly int[] EditableRows = Enumerable.Range(0, ActionCount).Except(RetiredRows).ToArray();
     // Stable action IDs in the order in which a user reads each family.
     static readonly int[][] ShortcutFamilies = {
         new[] { 29, 27, 28, 0, 1, 2, 3, 4, 5, 6, 7 },
-        new[] { 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 },
+        new[] { 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59 },
         new[] { 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 26 }
     };
     static string[] ShortcutLabels(IntPtr editor) {
-        var labels = new string[50];
+        var labels = new string[ActionCount];
         foreach (int id in EditableRows) labels[id] = ControlText(EditorControl(editor, 1000 + id));
         return labels;
     }
@@ -588,7 +589,7 @@ internal static class DesktopSmoke {
         var control = GetNextDlgTabItem(view, IntPtr.Zero, false);
         while (control != IntPtr.Zero && visited.Add(control)) {
             int id = GetDlgCtrlID(control) - 1200;
-            if (id >= 0 && id < 50) pencils.Add(id);
+            if (id >= 0 && id < ActionCount) pencils.Add(id);
             control = GetNextDlgTabItem(view, control, false);
         }
         Require(pencils.SequenceEqual(ShortcutFamilies.SelectMany(family => family)),
@@ -623,23 +624,24 @@ internal static class DesktopSmoke {
                 && undo.Top <= rowMiddle && rowMiddle < undo.Bottom, "Edit and reset should sit beside their row: " + label);
         }
         VerifyEditorTabOrder(view);
-        if (area.Width * 96 >= 1260 * dpi && area.Height * 96 >= 910 * dpi) {
-            VerifyReadingOrder(view, 3);
-            Require(rows.Select(h => Bounds(h).Left).Distinct().Count() == 3
-                && controls.All(h => Bounds(view).Contains(Bounds(h))),
-                "All shortcut actions should fit in three columns at the default wide size");
-        }
-        foreach (int width in new[] { 940, Math.Min(460, area.Width * 96 / dpi) }) {
-            if (area.Width < width * dpi / 96) continue;
-            Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, width * dpi / 96, Math.Min(area.Height, 650 * dpi / 96),
-                0x16 /* SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE */), "Could not resize the test editor");
+        var layouts = new List<int>();
+        if (area.Width * 96 >= 1260 * dpi && area.Height * 96 >= 910 * dpi)
+            layouts.Add(3);
+        if (area.Width * 96 >= 940 * dpi) layouts.Add(2);
+        layouts.Add(1);
+        foreach (int columns in layouts) {
+            int width = columns == 3 ? original.Width * 96 / dpi :
+                columns == 2 ? 940 : Math.Min(460, area.Width * 96 / dpi);
+            if (columns != 3)
+                Require(SetWindowPos(editor, IntPtr.Zero, 0, 0, width * dpi / 96, Math.Min(area.Height, 650 * dpi / 96),
+                    0x16 /* SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE */), "Could not resize the test editor");
             SendTrayMessage(view, 0x0115 /* WM_VSCROLL */, (IntPtr)6 /* SB_TOP */, IntPtr.Zero);
             var viewport = Bounds(view);
             var fixedPreview = Bounds(preview);
             var fixedReset = Bounds(reset);
             Require(fixedPreview.Bottom <= viewport.Top && fixedReset.Bottom <= viewport.Top
                 && IsWindowVisible(reset), "The selected action and reset should sit above the list");
-            VerifyReadingOrder(view, width == 940 ? 2 : 1);
+            VerifyReadingOrder(view, columns);
             var reached = new HashSet<int>();
             for (int step = 0; step < 100; ++step) {
                 for (int i = 0; i < rows.Length; ++i)
@@ -1029,9 +1031,12 @@ internal static class DesktopSmoke {
             Require(new[] { "Ctrl+Win+Shift+" + direction, "Ctrl+Win+Shift+" + vertical }
                 .All(initial[46 + i].Contains), "Both choices should share a move-to-desktop action");
         }
-        for (int number = 1; number <= 10; number++)
-            Require(initial[35 + number].EndsWith("Win+" + (number % 10)),
-                "Wrong desktop number key for slot " + number);
+        for (int number = 1; number <= 10; number++) {
+            int digit = number % 10;
+            Require(initial[35 + number].EndsWith(", Win+" + digit)
+                && initial[49 + number].EndsWith(", Win+Shift+" + digit),
+                "Wrong switch or move shortcut for desktop " + number);
+        }
         var arrows = new[] { "Left", "Right", "Up", "Down" };
         for (int i = 0; i < arrows.Length; ++i) {
             Require(initial[i].EndsWith(", Win+" + arrows[i]) && initial[4 + i].EndsWith(", Win+Shift+" + arrows[i]),

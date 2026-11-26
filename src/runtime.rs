@@ -50,6 +50,8 @@ pub(crate) const QUICK_RESIZE: i32 = 60;
 pub(crate) const QUICK_REVERSE: i32 = 70;
 const DESKTOP_FIRST: i32 = 80;
 const DESKTOP_TENTH: i32 = DESKTOP_FIRST + 9;
+const MOVE_DESKTOP_FIRST: i32 = 90;
+const MOVE_DESKTOP_TENTH: i32 = MOVE_DESKTOP_FIRST + 9;
 const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
@@ -59,15 +61,10 @@ const DESKTOP_SETTLE_MS: u32 = 160;
 const FOCUS_SETTLE_MS: u32 = 40;
 const FOCUS_CONFIRM_MS: u32 = 450;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopDestination {
-    Relative {
-        next: bool,
-    },
+    Relative { next: bool },
     Number(usize),
-    Transfer {
-        window: Rc<TransferIdentity>,
-        next: bool,
-    },
 }
 
 impl DesktopDestination {
@@ -83,39 +80,70 @@ impl DesktopDestination {
         }
     }
 
+    fn from_move_command(command: i32) -> Option<Self> {
+        match command {
+            MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT => Some(Self::Relative {
+                next: command == MOVE_DESKTOP_NEXT,
+            }),
+            MOVE_DESKTOP_FIRST..=MOVE_DESKTOP_TENTH => {
+                Some(Self::Number((command - MOVE_DESKTOP_FIRST + 1) as usize))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn is_desktop_move(command: i32) -> bool {
+    DesktopDestination::from_move_command(command).is_some()
+}
+
+struct DesktopStep {
+    destination: DesktopDestination,
+    window: Option<Rc<TransferIdentity>>,
+}
+
+impl DesktopStep {
     fn from_shortcut(
         command: i32,
         target: isize,
         following: Option<&Rc<TransferIdentity>>,
         foreground: impl FnOnce() -> isize,
     ) -> Option<Self> {
-        if matches!(command, MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT) {
-            let next = command == MOVE_DESKTOP_NEXT;
+        if let Some(destination) = DesktopDestination::from_move_command(command) {
             // Explorer may temporarily focus a different tile while switching.
             // Repeated presses during that handoff still belong to the same HWND.
             let window = if let Some(window) = following.filter(|window| window.matches()) {
-                Rc::clone(window)
+                Some(Rc::clone(window))
             } else {
                 if target != 0 && foreground() != target {
                     return None;
                 }
                 // Explorer can report no HWND, the wallpaper, or an idle taskbar.
                 if native::desktop_foreground(target) == native::DesktopForeground::Vacant {
-                    return Some(Self::Relative { next });
+                    None
+                } else {
+                    Some(Rc::new(TransferIdentity::capture(target)?))
                 }
-                Rc::new(TransferIdentity::capture(target)?)
             };
-            return Some(Self::Transfer { window, next });
+            return Some(Self {
+                destination,
+                window,
+            });
         }
         if target == 0 {
-            Self::from_command(command)
+            Some(Self {
+                destination: DesktopDestination::from_command(command)?,
+                window: None,
+            })
         } else {
             None
         }
     }
 
     fn continues_transfer(&self, following: &Rc<TransferIdentity>) -> bool {
-        matches!(self, Self::Transfer { window, .. } if Rc::ptr_eq(window, following))
+        self.window
+            .as_ref()
+            .is_some_and(|window| Rc::ptr_eq(window, following))
     }
 }
 
@@ -630,7 +658,7 @@ fn pump(
         if !shortcuts::transfer_focus_uninterrupted()
             && let Some(window) = following.take()
         {
-            navigation.retain(|step: &DesktopDestination| !step.continues_transfer(&window));
+            navigation.retain(|step: &DesktopStep| !step.continues_transfer(&window));
         }
         if !preferences.live.enabled || !shortcuts::desktop_focus_uninterrupted() {
             desktop_focus.stop_watching();
@@ -644,7 +672,7 @@ fn pump(
             focus_timer.schedule_within(FOCUS_SETTLE_MS);
         }
         let mut destination = if message.message == KEY_COMMAND {
-            DesktopDestination::from_shortcut(
+            DesktopStep::from_shortcut(
                 (message.wParam & 0xff) as i32,
                 message.lParam,
                 following.as_ref(),
@@ -670,7 +698,10 @@ fn pump(
                 // Task View or another program selected a different desktop.
                 shortcuts::watch_desktop_focus();
                 navigation.clear();
-                if matches!(destination, Some(DesktopDestination::Transfer { .. })) {
+                if destination
+                    .as_ref()
+                    .is_some_and(|step| step.window.is_some())
+                {
                     destination = None;
                 }
                 following = None;
@@ -732,8 +763,12 @@ fn pump(
             if command == TOGGLE_MOSAIC && target == 0 {
                 shortcut_command = Some((Command::Toggle, ticket));
             } else if let Some(destination) = destination {
-                if matches!(destination, DesktopDestination::Number(_)) {
-                    navigation.clear();
+                if matches!(destination.destination, DesktopDestination::Number(_)) {
+                    // A direct jump supersedes queued navigation. Preserve any
+                    // window moves and the steps on which their destinations depend.
+                    while navigation.back().is_some_and(|step| step.window.is_none()) {
+                        navigation.pop_back();
+                    }
                 }
                 navigation.push_back(destination);
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
@@ -779,26 +814,23 @@ fn pump(
                     .front()
                     .is_some_and(|step| step.continues_transfer(window))
             })
-            && let Some(destination) = navigation.pop_front()
+            && let Some(DesktopStep {
+                destination,
+                window,
+            }) = navigation.pop_front()
         {
-            let (from, to, followed, window) = match destination {
-                DesktopDestination::Relative { next } => {
-                    let Some((from, to)) = workspaces.navigate(next) else {
+            let (from, to, followed) = match &window {
+                None => {
+                    let Some((from, to)) = workspaces.navigate(destination) else {
                         continue;
                     };
-                    (from, to, true, None)
+                    (from, to, true)
                 }
-                DesktopDestination::Number(number) => {
-                    let Some((from, to)) = workspaces.navigate_to(number) else {
-                        continue;
-                    };
-                    (from, to, true, None)
-                }
-                DesktopDestination::Transfer { window, next } => {
+                Some(window) => {
                     shortcuts::watch_transfer_focus();
                     let moved = workspaces.transfer(
                         window.id(),
-                        next,
+                        destination,
                         |from| {
                             window.matches() && manager.transfer_target_is_valid(window.id(), from)
                         },
@@ -812,7 +844,7 @@ fn pump(
                         manager.transferred_window(window.id(), moved.to);
                     }
                     inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
-                    (moved.from, moved.to, moved.followed, Some(window))
+                    (moved.from, moved.to, moved.followed)
                 }
             };
             following = window.filter(|_| followed);

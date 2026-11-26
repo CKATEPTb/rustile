@@ -69,7 +69,20 @@ pub(super) const GROUPS: [Group; 8] = [
         topic: Desktops,
         title: "Перенос окна между столами",
         icon: "\u{e8ab}",
-        actions: &[MovePreviousDesktop, MoveNextDesktop],
+        actions: &[
+            MovePreviousDesktop,
+            MoveNextDesktop,
+            MoveDesktop1,
+            MoveDesktop2,
+            MoveDesktop3,
+            MoveDesktop4,
+            MoveDesktop5,
+            MoveDesktop6,
+            MoveDesktop7,
+            MoveDesktop8,
+            MoveDesktop9,
+            MoveDesktop10,
+        ],
     },
     Group {
         topic: Resize,
@@ -330,7 +343,10 @@ impl ShortcutWindow {
             |viewport| (viewport - 2 * margin - (columns as i32 - 1) * gap) / columns as i32;
         let header_h = p(34);
         let row_gap = |action| {
-            if matches!(action, GrowLeft | ShrinkLeft | QuickReverseLeft) {
+            if matches!(
+                action,
+                GrowLeft | ShrinkLeft | QuickReverseLeft | MoveDesktop1
+            ) {
                 p(5)
             } else {
                 0

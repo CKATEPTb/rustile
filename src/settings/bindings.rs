@@ -24,6 +24,7 @@ enum Group {
     Window,
     Desktop,
     DesktopMove,
+    DesktopMoveNumber,
 }
 
 macro_rules! shortcuts {
@@ -33,7 +34,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 50] = [$( Self::$name, )+];
+            pub const ALL: [Self; 60] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -93,6 +94,16 @@ shortcuts! {
     MoveNextDesktop,       "На следующий стол",              DesktopMove, VK_RIGHT;
     MovePreviousDesktopAlt,"На предыдущий стол (вариант 2)", DesktopMove, VK_UP;
     MoveNextDesktopAlt,    "На следующий стол (вариант 2)",  DesktopMove, VK_DOWN;
+    MoveDesktop1,          "На рабочий стол 1",              DesktopMoveNumber, VK_1;
+    MoveDesktop2,          "На рабочий стол 2",              DesktopMoveNumber, VK_2;
+    MoveDesktop3,          "На рабочий стол 3",              DesktopMoveNumber, VK_3;
+    MoveDesktop4,          "На рабочий стол 4",              DesktopMoveNumber, VK_4;
+    MoveDesktop5,          "На рабочий стол 5",              DesktopMoveNumber, VK_5;
+    MoveDesktop6,          "На рабочий стол 6",              DesktopMoveNumber, VK_6;
+    MoveDesktop7,          "На рабочий стол 7",              DesktopMoveNumber, VK_7;
+    MoveDesktop8,          "На рабочий стол 8",              DesktopMoveNumber, VK_8;
+    MoveDesktop9,          "На рабочий стол 9",              DesktopMoveNumber, VK_9;
+    MoveDesktop10,         "На рабочий стол 10",             DesktopMoveNumber, VK_0;
 }
 
 impl Shortcut {
@@ -148,7 +159,11 @@ impl Shortcut {
     // These commands reserve their chord in both modes. Window close and
     // maximize also work in resize when no resize binding owns the chord.
     pub fn reserves_both_modes(self) -> bool {
-        self == Self::ToggleMosaic || matches!(self.spec().1, Group::Desktop | Group::DesktopMove)
+        self == Self::ToggleMosaic
+            || matches!(
+                self.spec().1,
+                Group::Desktop | Group::DesktopMove | Group::DesktopMoveNumber
+            )
     }
 
     pub fn default_chord(self) -> Chord {
@@ -176,7 +191,7 @@ impl Shortcut {
         };
         let mods = match group {
             Group::Focus | Group::StartResize | Group::Window => base,
-            Group::Move => base | grab,
+            Group::Move | Group::DesktopMoveNumber => base | grab,
             Group::Grow | Group::Finish => 0,
             Group::Shrink => grab,
             Group::Quick => base | quick,
@@ -541,7 +556,16 @@ impl Settings {
         resize: Option<Modifier>,
     ) {
         let explicit = &stored.entries;
+        let missing_transfer = |action: Shortcut| {
+            matches!(action.spec().1, Group::DesktopMoveNumber) && !explicit.contains_key(&action)
+        };
         for action in Shortcut::ALL.into_iter().filter(|a| a.is_editable()) {
+            // Install new defaults only after loading both modes and all old
+            // scheme roles. Until then a digit might still belong to either.
+            if missing_transfer(action) {
+                self.set_bindings(action, Vec::new());
+                continue;
+            }
             let mut chords = Vec::new();
             if let Some(StoredBinding::List(all)) = explicit.get(&action) {
                 chords.extend_from_slice(all);
@@ -589,6 +613,12 @@ impl Settings {
             }
             self.set_bindings(action, chords);
         }
+        for action in Shortcut::ALL.into_iter().filter(|&a| missing_transfer(a)) {
+            let chord = action.inherited(self);
+            if self.conflict(action, chord).is_none() {
+                self.set_bindings(action, vec![chord]);
+            }
+        }
     }
 
     pub fn bindings(&self, action: Shortcut) -> Vec<Chord> {
@@ -601,7 +631,19 @@ impl Settings {
     }
 
     pub(super) fn set_bindings(&mut self, action: Shortcut, chords: Vec<Chord>) {
-        let override_needed = chords != action.inherited_bindings(self);
+        // If an old profile uses this digit as a direction, the same key can
+        // also be a held-opener resize alias. Keep its explicit transfer even
+        // when it happens to match the new default.
+        let override_needed = chords != action.inherited_bindings(self)
+            || (matches!(action.spec().1, Group::DesktopMoveNumber)
+                && [
+                    SchemeKey::Left,
+                    SchemeKey::Right,
+                    SchemeKey::Up,
+                    SchemeKey::Down,
+                ]
+                .iter()
+                .any(|&role| self.scheme.key(role) == action.spec().2));
         self.shortcuts
             .set(action, override_needed.then_some(chords));
     }

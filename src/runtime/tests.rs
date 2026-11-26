@@ -5,18 +5,22 @@ use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::core::w;
 
 #[test]
-fn transfer_without_an_active_window_selects_the_neighbor_in_each_direction() {
+fn transfer_without_an_active_window_uses_the_same_destination_as_navigation() {
     let desktop = unsafe { GetDesktopWindow() } as isize;
     assert_ne!(desktop, 0);
-    for (command, expected_next) in [(MOVE_DESKTOP_PREVIOUS, false), (MOVE_DESKTOP_NEXT, true)] {
+    let numbered = (0..10).map(|i| (MOVE_DESKTOP_FIRST + i, DESKTOP_FIRST + i));
+    for (command, navigation) in numbered.chain([
+        (MOVE_DESKTOP_PREVIOUS, DESKTOP_PREVIOUS),
+        (MOVE_DESKTOP_NEXT, DESKTOP_NEXT),
+    ]) {
+        let expected = DesktopDestination::from_command(navigation).unwrap();
         for target in [0, desktop] {
-            assert!(matches!(
-                DesktopDestination::from_shortcut(command, target, None, || desktop),
-                Some(DesktopDestination::Relative { next }) if next == expected_next
-            ));
+            let step = DesktopStep::from_shortcut(command, target, None, || desktop).unwrap();
+            assert_eq!(step.destination, expected);
+            assert!(step.window.is_none());
         }
         // A foreground change after the keypress must not move the new app.
-        assert!(DesktopDestination::from_shortcut(command, desktop, None, || 0).is_none());
+        assert!(DesktopStep::from_shortcut(command, desktop, None, || 0).is_none());
     }
 }
 
@@ -155,7 +159,7 @@ fn smoke_desktop() -> String {
 fn isolated_shortcut_ownership() {
     use crate::settings::{Assignment, Chord, Shortcut};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_LSHIFT,
+        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18, VK_LSHIFT,
     };
 
     smoke_desktop();
@@ -166,6 +170,7 @@ fn isolated_shortcut_ownership() {
         (Shortcut::ToggleMosaic, VK_F14),
         (Shortcut::Desktop10, VK_F16),
         (Shortcut::MoveNextDesktop, VK_F17),
+        (Shortcut::MoveDesktop5, VK_F18),
     ] {
         settings = settings
             .changed(Command::Assign(Assignment::Add(
@@ -227,12 +232,27 @@ fn isolated_shortcut_ownership() {
         assert_eq!((command, target), (MOVE_DESKTOP_NEXT, 0));
         assert_ne!(ticket, 0);
         assert!(matches!(
-            DesktopDestination::from_shortcut(command, target, None, native::foreground),
-            Some(DesktopDestination::Relative { next: true })
+            DesktopStep::from_shortcut(command, target, None, native::foreground),
+            Some(DesktopStep {
+                destination: DesktopDestination::Relative { next: true },
+                window: None
+            })
         ));
         assert_eq!(next_command(), None);
     };
     expect_navigation_without_window();
+
+    shortcuts::watch_transfer_focus();
+    assert_eq!(key(VK_F18, true), 1);
+    let (command, ticket, target) = next_command().unwrap();
+    assert_eq!((command, target), (MOVE_DESKTOP_FIRST + 4, 0));
+    assert_ne!(ticket, 0);
+    hook.set_settings(&Settings::default());
+    assert_eq!(key(VK_F18, true), 1, "owned transfer repeats stay consumed");
+    assert!(shortcuts::transfer_focus_uninterrupted());
+    assert_eq!(key(VK_F18, false), 1);
+    assert_eq!(next_command(), None);
+    hook.set_settings(&settings);
 
     shortcuts::watch_transfer_focus();
     key(VK_LSHIFT, true);

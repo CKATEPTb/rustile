@@ -559,6 +559,78 @@ mod tests {
     }
 
     #[test]
+    fn numbered_transfers_preserve_existing_owners_in_both_modes_and_can_be_reset() {
+        use Shortcut::{FocusLeft, MoveDesktop5, MoveDesktop6, ShrinkUp};
+
+        let chord = MoveDesktop5.default_chord();
+        assert_eq!(chord.label(), "Win+Shift+5");
+        for scheme in ["", "[scheme]\n"] {
+            let text = format!(
+                "{scheme}[shortcuts]\nfocus_left = [{{mods=8,key=37}},{{mods=12,key=53}}]\nshrink_up = {{mods=12,key=53}}"
+            );
+            let imported = toml::from_str::<Settings>(&text)
+                .unwrap()
+                .validated()
+                .unwrap();
+            assert!(imported.bindings(MoveDesktop5).is_empty());
+            assert_eq!(
+                imported.binding(MoveDesktop6),
+                Some(MoveDesktop6.default_chord())
+            );
+            assert_eq!(
+                imported.conflict(MoveDesktop5, chord),
+                Some(BindingOwners::Both(FocusLeft, ShrinkUp))
+            );
+            let reset = Assignment::Reset(MoveDesktop5);
+            assert!(imported.changed(Command::Assign(reset)).is_err());
+            let moved = imported
+                .changed(Command::Transfer(reset, imported.conflicts(reset).unwrap()))
+                .unwrap();
+            assert_eq!(moved.bindings(FocusLeft), [FocusLeft.default_chord()]);
+            assert!(moved.bindings(ShrinkUp).is_empty());
+            assert_eq!(moved.bindings(MoveDesktop5), [chord]);
+            let reloaded: Settings = toml::from_str(&toml::to_string(&moved).unwrap()).unwrap();
+            assert_eq!(reloaded.validated().unwrap(), moved);
+        }
+    }
+
+    #[test]
+    fn numbered_transfers_use_saved_base_and_grab_and_preserve_digit_direction_aliases() {
+        use Shortcut::{MoveDesktop5, MoveDesktop10, ShrinkLeft};
+
+        let saved = "scheme.base = 18\nscheme.resize = 91\nscheme.left = 53\nshortcuts.desktop5 = 'disabled'\nshortcuts.move_left = 'disabled'";
+        let imported = toml::from_str::<Settings>(saved)
+            .unwrap()
+            .validated()
+            .unwrap();
+        assert_eq!(
+            imported.binding(MoveDesktop10).unwrap().label(),
+            "Alt+Shift+0"
+        );
+        let chord = Chord {
+            mods: MOD_ALT | MOD_SHIFT,
+            key: b'5' as u16,
+        };
+        assert_eq!(
+            imported.conflict(MoveDesktop5, chord),
+            Some(ShrinkLeft.into())
+        );
+        assert!(imported.bindings(MoveDesktop5).is_empty());
+        let changed = imported
+            .transfer_primary(MoveDesktop5, chord, ShrinkLeft.into())
+            .unwrap();
+        let reloaded: Settings =
+            toml::from_str(&toml::to_string_pretty(&changed).unwrap()).unwrap();
+        assert_eq!(reloaded.validated().unwrap(), changed);
+        assert_eq!(reloaded.bindings(MoveDesktop5), [chord]);
+        assert_eq!(reloaded.bindings(ShrinkLeft), imported.bindings(ShrinkLeft));
+        assert_eq!(
+            changed.changed(Command::ResetShortcuts).unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
     fn assigning_a_global_chord_confirms_the_normal_binding_and_modal_alias() {
         use Shortcut::{FocusLeft, GrowLeft, ToggleMosaic};
 
