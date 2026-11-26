@@ -612,6 +612,29 @@ internal static class DesktopSmoke {
         Require(bindings.SequenceEqual(ShortcutFamilies.SelectMany(family => family)),
             "Tab should reach each action's binding in reading order");
     }
+    static void VerifyFittedOpening(IntPtr editor, Rectangle area, bool factory = false) {
+        int dpi = (int)GetDpiForWindow(editor);
+        var view = EditorControl(editor, 510);
+        var viewport = Bounds(view);
+        Require(area.Contains(Bounds(editor)), "The initial editor bounds must respect the monitor work area");
+        bool paged = IsWindowVisible(EditorControl(editor, 513));
+        bool largeWorkArea = area.Width * 96 >= 1424 * dpi && area.Height * 96 >= 891 * dpi;
+        if (largeWorkArea)
+            Require(!paged, "All shortcuts in the fixture should fit its large work area on opening");
+        if (paged) return;
+        var controls = EditableRows.SelectMany(id => Bindings(editor, id).Concat(new[] {
+            GetDlgItem(view, 1500 + id), GetDlgItem(view, 1300 + id), GetDlgItem(view, 1100 + id) }))
+            .Concat(Enumerable.Range(520, 8).Select(id => GetDlgItem(view, id))).ToArray();
+        Require(controls.All(h => IsWindowVisible(h) && viewport.Contains(Bounds(h))),
+            "The fitted single-page editor should show every action, alternative and button in full");
+        int free = viewport.Bottom - controls.Select(Bounds).Max(r => r.Bottom);
+        int rowHeight = Bounds(GetDlgItem(view, 1029)).Height;
+        Require(free <= rowHeight, "Opening left " + free + " unused pixels below the final row");
+        if (factory && largeWorkArea)
+            Require(EditableRows.Where(id => Bindings(editor, id).Count == 1).All(id =>
+                Bounds(GetDlgItem(view, 1000 + id)).Top == Bounds(GetDlgItem(view, 1500 + id)).Top),
+                "An action with a single factory shortcut should fit on one line");
+    }
     static int[][] VisualColumns(IntPtr view, IEnumerable<int> actions) {
         return actions.Select(id => new { id, rect = Bounds(GetDlgItem(view, 1500 + id)) })
             .GroupBy(action => action.rect.Left).OrderBy(column => column.Key)
@@ -1188,6 +1211,7 @@ internal static class DesktopSmoke {
         var beforeEditor = pair.Select(VisibleFrame).ToArray();
         var editor = OpenShortcutEditor(manager, tray, area);
         Require(GetWindow(editor, 4 /* GW_OWNER */) == IntPtr.Zero, "Shortcut editor should be an independent window");
+        VerifyFittedOpening(editor, area, true);
         var initial = ShortcutLabels(editor);
         VerifyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
@@ -1342,10 +1366,21 @@ internal static class DesktopSmoke {
         expected[6] = punctuation;
         Require(ShortcutLabels(editor).SequenceEqual(expected), "A row reset changed a neighboring shortcut");
         Require(pair.Select(VisibleFrame).SequenceEqual(beforeEditor), "Shortcut editor changed the tiled layout");
+        // Bringing the existing editor forward should respect its user's size.
+        var bounds = Bounds(editor);
+        var manual = new Rectangle(area.X, area.Y, Math.Min(bounds.Width, area.Width * 3 / 4), Math.Min(bounds.Height, area.Height * 2 / 3));
+        Require(SetWindowPos(editor, IntPtr.Zero, manual.X, manual.Y, manual.Width, manual.Height, 0x14),
+            "Could not apply manual editor bounds");
+        var resized = Bounds(editor);
+        TrayOpen(tray, TraySelect, area);
+        TrayClick(tray, "Горячие клавиши");
+        Until("The tray should dismiss when returning to the already open editor", () => !IsWindowVisible(tray));
+        Require(Bounds(editor) == resized && IsWindowVisible(editor), "Returning to an open editor discarded the manual size");
         Message(editor, WmClose);
         Until("Closing the editor should leave Rustile running", () => !IsWindowVisible(editor) && !manager.Exited(0));
         TrayOpen(tray, TraySelect, area);
         editor = OpenShortcutEditor(manager, tray, area);
+        VerifyFittedOpening(editor, area);
         Require(ShortcutLabels(editor).SequenceEqual(expected), "Reopening lost the alternative, the donor's remaining chord or the OEM key");
         VerifyIdleHeader(editor);
         Message(editor, WmClose);

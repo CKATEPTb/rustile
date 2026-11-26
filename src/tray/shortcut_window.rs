@@ -189,24 +189,18 @@ impl ShortcutWindow {
                 let (mut dpi, mut y_dpi) = (96, 96);
                 GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut y_dpi);
                 self.dpi.set(dpi.max(96));
-                let mut size = RECT {
-                    right: self.p(1408),
-                    bottom: self.p(852),
-                    ..Default::default()
-                };
-                AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());
                 let area = info.rcWork;
-                let width = (size.right - size.left).min(area.right - area.left);
-                let height = (size.bottom - size.top).min(area.bottom - area.top);
+                // Create hidden on the destination monitor so text measurements
+                // use its actual fonts and DPI before the first visible frame.
                 hwnd = CreateWindowExW(
                     WS_EX_CONTROLPARENT,
                     CLASS,
                     TITLE,
                     STYLE,
-                    area.left + (area.right - area.left - width) / 2,
-                    area.top + (area.bottom - area.top - height) / 2,
-                    width,
-                    height,
+                    area.left,
+                    area.top,
+                    self.p(340).min(area.right - area.left),
+                    self.p(320).min(area.bottom - area.top),
                     null_mut(),
                     null_mut(),
                     instance,
@@ -225,7 +219,7 @@ impl ShortcutWindow {
                 self.update_fonts(hwnd);
                 self.apply_theme(hwnd);
                 self.update_rows();
-                self.layout(hwnd);
+                self.fit_on_open(hwnd, area);
             }
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);

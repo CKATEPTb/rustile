@@ -13,6 +13,10 @@ pub(super) use canvas::ResizeCanvas;
 pub(super) use pagination::Placement;
 use pagination::{ActionLines, CellPlacement, Grid, Section};
 
+const THREE_COLUMNS: i32 = 1140;
+const MAX_CONTENT_WIDTH: i32 = 1460;
+const SIDE_MARGIN: i32 = 24;
+
 #[derive(Clone, Copy)]
 enum Topic {
     Windows,
@@ -269,8 +273,93 @@ impl ShortcutWindow {
     }
 
     fn margin(&self, width: i32) -> i32 {
-        let edge = if width < self.p(620) { 14 } else { 24 };
-        self.p(edge).max((width - self.p(1460)) / 2)
+        let edge = if width < self.p(620) { 14 } else { SIDE_MARGIN };
+        self.p(edge).max((width - self.p(MAX_CONTENT_WIDTH)) / 2)
+    }
+
+    fn header_height(&self, width: i32) -> i32 {
+        self.p(if width < self.p(620) { 58 } else { 60 })
+    }
+
+    pub(super) fn fit_on_open(&self, hwnd: HWND, work: RECT) {
+        let (mut outer, mut client) = (RECT::default(), RECT::default());
+        unsafe {
+            GetWindowRect(hwnd, &mut outer);
+            GetClientRect(hwnd, &mut client);
+        }
+        let frame_w = outer.right - outer.left - client.right;
+        let frame_h = outer.bottom - outer.top - client.bottom;
+        let work_w = work.right - work.left;
+        let work_h = work.bottom - work.top;
+        let max_w = (work_w - frame_w).max(1);
+        let max_h = (work_h - frame_h).max(1);
+        let view = child(hwnd, VIEW);
+        let mut width = max_w.min(self.p(THREE_COLUMNS));
+        let limit = max_w.min(self.p(MAX_CONTENT_WIDTH) + 2 * self.p(SIDE_MARGIN));
+        let measure = |width| {
+            let top = self.header_height(width) + self.p(1);
+            let Some(pages) = self.row_pages(view, width, (max_h - top).max(1)) else {
+                return (usize::MAX, max_h);
+            };
+            let height = if let [page] = pages.as_slice() {
+                let bottom = page.iter().map(|p| p.y + p.height).max().unwrap_or(0);
+                (top + bottom + self.p(8)).min(max_h)
+            } else {
+                max_h
+            };
+            (pages.len(), height)
+        };
+        let mut layout = measure(width);
+        let widest = if width == limit {
+            layout
+        } else {
+            measure(limit)
+        };
+        let mut size = (width, layout.1);
+        let mut best = (layout.0, i64::from(width) * i64::from(layout.1));
+        // Only widening enough to remove a page or a wrapped line can improve
+        // the fit. Find those widths using the same layout as the visible editor.
+        while layout > widest {
+            let (mut lo, mut hi) = (width + 1, limit);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if measure(mid) < layout {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            width = lo;
+            layout = if width == limit {
+                widest
+            } else {
+                measure(width)
+            };
+            let rank = (layout.0, i64::from(width) * i64::from(layout.1));
+            if rank < best {
+                best = rank;
+                size = (width, layout.1);
+            }
+        }
+        let (w, h) = (
+            (size.0 + frame_w).min(work_w),
+            (size.1 + frame_h).min(work_h),
+        );
+        let placed = unsafe {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                work.left + (work_w - w) / 2,
+                work.top + (work_h - h) / 2,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        };
+        // A size change lays out the controls synchronously via WM_SIZE.
+        if placed == 0 || (client.right, client.bottom) == size {
+            self.layout(hwnd);
+        }
     }
 
     pub(super) fn set_status(&self, message: &str) {
@@ -320,7 +409,7 @@ impl ShortcutWindow {
         let compact = width < p(620);
         let content = width - 2 * margin;
         let reset_width = p(if compact { 34 } else { 133 });
-        let header_height = p(if compact { 58 } else { 60 });
+        let header_height = self.header_height(width);
         let button_height = p(32);
         let reset_y = (header_height - button_height) / 2;
         let preview_width = content - reset_width - p(if compact { 10 } else { 20 });
@@ -465,20 +554,9 @@ impl ShortcutWindow {
         ActionLines { header, lines }
     }
 
-    fn layout_rows(
-        &self,
-        view: HWND,
-        width: i32,
-        height: i32,
-        reveal: Option<HWND>,
-        resizing: bool,
-    ) {
-        let editor = self.hwnd.get();
-        if editor.is_null() || view.is_null() {
-            return;
-        }
+    fn row_pages(&self, view: HWND, width: i32, height: i32) -> Option<Vec<Vec<Placement>>> {
         let p = |n| self.p(n);
-        let columns = if width >= p(1140) {
+        let columns = if width >= p(THREE_COLUMNS) {
             3
         } else if width >= p(780) {
             2
@@ -490,7 +568,7 @@ impl ShortcutWindow {
         let col = ((width - 2 * margin - (columns - 1) as i32 * gap) / columns as i32).max(1);
         let sections: [_; GROUPS.len()] = {
             let fonts = self.fonts.borrow();
-            let Some(fonts) = fonts.as_ref() else { return };
+            let fonts = fonts.as_ref()?;
             let dc = unsafe { GetDC(view) };
             let sections = std::array::from_fn(|i| {
                 let group = &GROUPS[i];
@@ -519,10 +597,28 @@ impl ShortcutWindow {
         };
         let [upper @ .., transfers] = &sections;
         let mut pages = grid.pages(upper, transfers, height - p(5));
-        let pager_height = p(34);
         if pages.len() > 1 {
-            pages = grid.pages(upper, transfers, height - pager_height - p(4));
+            pages = grid.pages(upper, transfers, height - p(34) - p(4));
         }
+        Some(pages)
+    }
+
+    fn layout_rows(
+        &self,
+        view: HWND,
+        width: i32,
+        height: i32,
+        reveal: Option<HWND>,
+        resizing: bool,
+    ) {
+        let editor = self.hwnd.get();
+        if editor.is_null() || view.is_null() {
+            return;
+        }
+        let Some(mut pages) = self.row_pages(view, width, height) else {
+            return;
+        };
+        let p = |n| self.p(n);
         let recording = self.capture.borrow().is_some().then(|| self.selected_row());
         let page = recording
             .or(reveal)
@@ -549,7 +645,7 @@ impl ShortcutWindow {
                 appearance::text_width(dc, fonts.small, &page_text) + p(20)
             });
             unsafe { ReleaseDC(view, dc) };
-            let y = height - pager_height;
+            let y = height - p(34);
             let left = mid - number_w / 2;
             for (hwnd, x, width) in [
                 (prev, left - w, w),
