@@ -66,6 +66,12 @@ fn hint_scales_with_dpi_and_fits_remapped_keys_in_the_work_area() {
     for (small, large) in [(at_96.width, at_144.width), (at_96.height, at_144.height)] {
         assert!((small * 13 / 10..=small * 17 / 10).contains(&large));
     }
+    // At high DPI a single row of English direction caps no longer fits.
+    // A narrow panel should reflow all three rows and still show the footer.
+    let narrow_work = Rect { w: 260, ..WORK };
+    let wrapped = Panel::render(&guide, 144, narrow_work, colors, true).unwrap();
+    assert_eq!(wrapped.width, narrow_work.w);
+    assert!(wrapped.height > at_144.height && wrapped.height < narrow_work.h);
     let custom = toml::from_str("shortcuts.grow_left = { mods = 0, key = 117 }\nshortcuts.shrink_up = { mods = 6, key = 35 }").unwrap();
     let work = Rect { w: 340, ..WORK };
     let narrow = Panel::render(&Guide::new(&custom), 144, work, colors, true).unwrap();

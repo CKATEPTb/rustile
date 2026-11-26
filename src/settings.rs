@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(changed.binding(NextDesktopWheel), None);
         assert_eq!(
             changed.binding(PreviousDesktopWheel).unwrap().label(),
-            "Win+Колесо ↑"
+            "Win+Wheel Up"
         );
         let restored: Settings = toml::from_str(&toml::to_string(&changed).unwrap()).unwrap();
         assert_eq!(restored.validated().unwrap(), changed);
@@ -875,6 +875,44 @@ mod tests {
             .unwrap();
         assert!(other.changed_for_save(command, live).is_err());
         assert!(live.changed_for_save(command, other).is_err());
+    }
+
+    #[test]
+    fn shortcut_keycaps_use_stable_english_legends() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        for key in (VK_A..=VK_Z).chain(VK_0..=VK_9) {
+            assert_eq!(Chord::key_label(key), char::from(key as u8).to_string());
+        }
+        for key in VK_F1..=VK_F24 {
+            assert_eq!(Chord::key_label(key), format!("F{}", key - VK_F1 + 1));
+        }
+        for (key, expected) in [
+            (VK_LEFT, "Left"),
+            (VK_DOWN, "Down"),
+            (VK_UP, "Up"),
+            (VK_RIGHT, "Right"),
+            (VK_SPACE, "Space"),
+            (VK_OEM_1, ";"),
+            (VK_OEM_102, "ISO \\"),
+            (VK_ADD, "Num +"),
+            (VK_MEDIA_PLAY_PAUSE, "Play/Pause"),
+            (WHEEL_UP, "Wheel Up"),
+            (WHEEL_DOWN, "Wheel Down"),
+        ] {
+            assert_eq!(Chord::key_labels(0, Some(key)), [expected]);
+        }
+        for key in (0..=WHEEL_DOWN).filter(|key| Chord::supports_key(*key)) {
+            let label = Chord::key_label(key);
+            assert!(!label.is_empty() && label.is_ascii(), "{key:#x}: {label}");
+            assert!(!label.starts_with("VK "), "missing legend for {key:#x}");
+        }
+        assert_eq!(Chord::key_labels(MOD_WIN, Some(VK_OEM_PLUS)), ["Win", "+"]);
+        let mods = MOD_CONTROL | MOD_WIN | MOD_ALT | MOD_SHIFT;
+        assert_eq!(
+            Chord::key_labels(mods, None),
+            ["Ctrl", "Win", "Alt", "Shift"]
+        );
+        assert!(Chord::key_labels(0, None).is_empty());
     }
 
     #[test]

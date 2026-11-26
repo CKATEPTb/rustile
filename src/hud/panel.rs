@@ -110,8 +110,8 @@ impl PanelLayout {
         p: impl Fn(i32) -> i32,
     ) -> Self {
         let pad = p(17).min(work.w / 10);
-        let gap = p(6);
-        let cap_pad = p(8);
+        let gap = p(4);
+        let cap_pad = p(7);
         let icon = p(20);
         let mut title = Label::new(Guide::TITLE, fonts.heading, colors.text);
         let mut width = p(328).max(2 * pad + icon + p(9) + title.measure(dc.0, work.w).cx);
@@ -128,13 +128,13 @@ impl PanelLayout {
                 },
             );
             let mut caps = Vec::new();
-            for (index, key) in row.keys.iter().enumerate() {
-                if index > 0 {
-                    let or = Label::new("или", fonts.small, colors.secondary);
-                    let measured = or.measure(dc.0, work.w).cx;
-                    caps.push((or, measured, 0));
+            for (connector, key) in row.keycaps() {
+                if !connector.is_empty() {
+                    let mark = Label::new(connector, fonts.small, colors.secondary);
+                    let measured = mark.measure(dc.0, work.w).cx;
+                    caps.push((mark, measured, 0));
                 }
-                let cap = Label::new(key, fonts.small, colors.text);
+                let cap = Label::new(&key, fonts.small, colors.text);
                 let measured = cap.measure(dc.0, work.w).cx + 2 * cap_pad;
                 caps.push((cap, measured, cap_pad));
             }
@@ -181,9 +181,16 @@ impl PanelLayout {
             };
             let mut key_y = if stacked { y + label_height + p(3) } else { y };
             let mut band_height = 0;
-            for (mut cap, natural_w, inset) in caps {
+            let mut caps = caps.into_iter().peekable();
+            while let Some((mut cap, natural_w, inset)) = caps.next() {
                 let w = natural_w.min(inner);
-                if stacked && key_x > pad && key_x + w > width - pad {
+                // Keep a connector with the key it introduces when the row wraps.
+                let group_w = if inset == 0 {
+                    caps.peek().map_or(w, |(_, next, _)| w + gap + next)
+                } else {
+                    w
+                };
+                if stacked && key_x > pad && key_x + group_w > width - pad {
                     key_y += band_height + p(3);
                     key_x = pad;
                     band_height = 0;

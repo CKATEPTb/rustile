@@ -151,6 +151,32 @@ impl ShortcutWindow {
         }
     }
 
+    pub(super) fn action_row_height(&self, dc: HDC, action: Shortcut, row_width: i32) -> i32 {
+        let fonts = self.fonts.borrow();
+        let Some(fonts) = fonts.as_ref() else {
+            return self.p(32);
+        };
+        let binding = self.settings.get().binding(action);
+        let width = if let Some(chord) = binding {
+            keycaps::Keycaps::new(
+                self,
+                dc,
+                fonts,
+                (chord.mods, Some(chord.key)),
+                keycaps::Size::Row,
+            )
+            .width()
+        } else {
+            text_width(dc, fonts.small, "Не назначено")
+        };
+        let label = text_width(dc, fonts.regular, action.label());
+        if label + self.p(11) + self.p(8) + width + self.p(5) > row_width {
+            self.p(48)
+        } else {
+            self.p(32)
+        }
+    }
+
     fn draw_action(
         &self,
         item: &DRAWITEMSTRUCT,
@@ -163,79 +189,32 @@ impl ShortcutWindow {
         let mut label = item.rcItem;
         label.left += self.p(11);
         label.right -= self.p(5);
-        let bounds = label;
-        let stacked = bounds.bottom - bounds.top >= self.p(44);
-        let tight = bounds.right - bounds.left < self.p(325);
-        let chord = self.settings.get().binding(action).filter(|_| !recording);
-        let legend = chord.map_or_else(|| self.binding_text(action), |c| Chord::key_label(c.key));
-        let mods = chord
-            .map(|c| {
-                Chord::modifier_labels(c.mods)
-                    .collect::<Vec<_>>()
-                    .join(if tight { "+" } else { " + " })
-            })
-            .unwrap_or_default();
-        let gap = if mods.is_empty() {
-            0
+        let mut value = label;
+        let caps = keycaps::Keycaps::new(
+            self,
+            dc,
+            fonts,
+            self.editor_chord(action),
+            keycaps::Size::Row,
+        );
+        let placeholder = if recording {
+            "Нажмите клавиши"
         } else {
-            self.p(if tight { 4 } else { 6 })
+            "Не назначено"
         };
-        let legend_width = text_width(dc, fonts.small, &legend);
-        let cap_width = if chord.is_some() {
-            let padding = self.p(if tight { 10 } else { 12 });
-            (legend_width + padding).max(self.p(if tight { 21 } else { 23 }))
+        let width = caps.width();
+        let visible_width = if width == 0 {
+            text_width(dc, fonts.small, placeholder)
         } else {
-            legend_width
+            width
         };
-        let mods_width = text_width(dc, fonts.small, &mods);
-        let value_width = mods_width + gap + cap_width;
-        let ink = if recording {
-            colors.accent
+        if label.bottom - label.top >= self.p(44) {
+            label.bottom = label.top + self.p(22);
+            value.top = label.bottom;
+            value.bottom -= self.p(2);
         } else {
-            colors.secondary
-        };
-        let gutter = self.p(if tight { 6 } else { 8 });
-        let label_width = text_width(dc, fonts.regular, action.label());
-
-        // A custom media key with all four modifiers can fill most of a column.
-        // Give it a second baseline without moving the neighbouring shortcuts.
-        if !stacked && label_width + gutter + value_width > bounds.right - bounds.left {
-            let mid = (bounds.top + bounds.bottom) / 2;
-            // Segoe UI's line box includes leading above and below the glyphs.
-            // Let the two lines share that leading at fractional scale factors.
-            let leading = self.p(2);
-            label.bottom = mid + leading;
-            paint::text(
-                dc,
-                label,
-                action.label(),
-                fonts.small,
-                colors.text,
-                DT_LEFT | DT_END_ELLIPSIS,
-            );
-            let binding = self.binding_text(action);
-            paint::text(
-                dc,
-                RECT {
-                    top: mid - leading,
-                    ..bounds
-                },
-                &binding,
-                fonts.small,
-                ink,
-                DT_RIGHT | DT_END_ELLIPSIS,
-            );
-            return;
-        }
-
-        let mut value = bounds;
-        if stacked {
-            value.top = (bounds.top + bounds.bottom) / 2 - self.p(1);
-            label.bottom = value.top;
-            value.right = (value.left + value_width).min(value.right);
-        } else {
-            value.left = value.right - value_width;
-            label.right = value.left - gutter;
+            value.left = (value.right - visible_width).max(value.left);
+            label.right = (value.left - self.p(8)).max(label.left);
         }
         paint::text(
             dc,
@@ -245,51 +224,21 @@ impl ShortcutWindow {
             colors.text,
             DT_LEFT | DT_END_ELLIPSIS,
         );
-        if chord.is_none() {
+        if width == 0 {
             paint::text(
                 dc,
                 value,
-                &legend,
+                placeholder,
                 fonts.small,
-                ink,
+                if recording {
+                    colors.accent
+                } else {
+                    colors.secondary
+                },
                 DT_LEFT | DT_END_ELLIPSIS,
             );
-            return;
-        }
-        let mid = (value.top + value.bottom) / 2;
-        let cap = RECT {
-            left: (value.right - cap_width).max(value.left),
-            right: value.right,
-            top: mid - self.p(10),
-            bottom: mid + self.p(10),
-        };
-        let palette = self.colors.get();
-        fill_outlined(
-            dc,
-            cap,
-            palette.control,
-            palette.border,
-            self.p(4),
-            self.p(1),
-        );
-        paint::text(
-            dc,
-            inset(cap, self.p(1)),
-            &legend,
-            fonts.small,
-            palette.text,
-            DT_CENTER | DT_END_ELLIPSIS,
-        );
-        if !mods.is_empty() {
-            value.right = cap.left - gap;
-            paint::text(
-                dc,
-                value,
-                &mods,
-                fonts.small,
-                ink,
-                DT_RIGHT | DT_END_ELLIPSIS,
-            );
+        } else {
+            caps.draw(dc, value, self.colors.get());
         }
     }
 }

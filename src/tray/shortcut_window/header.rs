@@ -20,19 +20,9 @@ impl ShortcutWindow {
         let Some(fonts) = fonts.as_ref() else { return };
         let colors = self.colors.get();
         let action = self.selected.get();
-        let capture = self.capture.borrow().as_ref().map(|c| c.keys.preview());
-        let (mods, key) = capture
-            .or_else(|| {
-                self.settings
-                    .get()
-                    .binding(action)
-                    .map(|c| (c.mods, Some(c.key)))
-            })
-            .unwrap_or_default();
-        let key = key.map(Chord::key_label);
-        let mut labels: Vec<&str> = Chord::modifier_labels(mods).collect();
-        labels.extend(key.as_deref());
-        let category = if capture.is_some() {
+        let recording = self.recording(action);
+        let chord = self.editor_chord(action);
+        let category = if recording {
             "Запись сочетания"
         } else {
             view::GROUPS
@@ -40,7 +30,7 @@ impl ShortcutWindow {
                 .find_map(|&(title, actions)| actions.contains(&action).then_some(title))
                 .unwrap_or("")
         };
-        let placeholder = if capture.is_some() {
+        let placeholder = if recording {
             "Нажмите клавиши"
         } else {
             "Не назначено"
@@ -49,29 +39,11 @@ impl ShortcutWindow {
         buffered(item, |dc, r| {
             paint::fill(dc, &r, self.header_color(), 0);
             let available = r.right - r.left;
-            let width_of = |label: &str, font, compact| {
-                let label_width = if label == "Win" {
-                    p(15)
-                } else {
-                    text_width(dc, font, label)
-                };
-                if compact {
-                    (label_width + p(12)).max(p(30))
-                } else {
-                    (label_width + p(26)).max(p(48))
-                }
-            };
-            let needed = |widths: &[i32], gap| {
-                widths.iter().sum::<i32>() + widths.len().saturating_sub(1) as i32 * gap
-            };
-            let mut widths: Vec<_> = labels
-                .iter()
-                .map(|label| width_of(label, fonts.heading, false))
-                .collect();
-            let legend_width = if widths.is_empty() {
+            let caps = keycaps::Keycaps::new(self, dc, fonts, chord, keycaps::Size::Preview);
+            let legend_width = if caps.width() == 0 {
                 text_width(dc, fonts.regular, placeholder)
             } else {
-                needed(&widths, p(6))
+                caps.width()
             };
             let title_width = text_width(dc, fonts.display, action.label()).max(text_width(
                 dc,
@@ -92,7 +64,7 @@ impl ShortcutWindow {
                 right: title_right,
                 bottom: group_top + p(19),
             };
-            let category_ink = if capture.is_some() && !colors.high_contrast {
+            let category_ink = if recording && !colors.high_contrast {
                 colors.accent
             } else {
                 colors.secondary
@@ -140,7 +112,7 @@ impl ShortcutWindow {
                 right: r.right,
                 bottom: top + height,
             };
-            if labels.is_empty() {
+            if caps.width() == 0 {
                 paint::text(
                     dc,
                     legend_rect,
@@ -149,69 +121,11 @@ impl ShortcutWindow {
                     category_ink,
                     DT_END_ELLIPSIS,
                 );
-                return;
-            }
-            let (key_font, gap) = if stacked {
-                for (label, width) in labels.iter().zip(&mut widths) {
-                    *width = width_of(label, fonts.regular, true);
-                }
-                (fonts.regular, p(4))
+            } else if stacked {
+                let compact = keycaps::Keycaps::new(self, dc, fonts, chord, keycaps::Size::Compact);
+                compact.draw(dc, legend_rect, colors);
             } else {
-                (fonts.heading, p(6))
-            };
-            // A five-key chord with a localized media key can exceed a narrow window.
-            // Keep every modifier visible and give the terminal key the remaining space.
-            let overflow = (needed(&widths, gap) - available).max(0);
-            if let Some(last) = widths.last_mut() {
-                *last = (*last - overflow).max(p(14));
-            }
-            let mut x = left;
-            for (i, (&label, width)) in labels.iter().zip(widths).enumerate() {
-                let outer = RECT {
-                    left: x,
-                    right: (x + width).min(r.right),
-                    ..legend_rect
-                };
-                if outer.right <= outer.left {
-                    break;
-                }
-                let terminal = key.is_some() && i + 1 == labels.len();
-                let (face, ink) = if terminal {
-                    (colors.accent, colors.on_accent)
-                } else {
-                    (colors.control, colors.text)
-                };
-                let edge = if colors.high_contrast {
-                    colors.border
-                } else {
-                    blend(face, colors.text, if terminal { 14 } else { 23 })
-                };
-                let foot = if colors.high_contrast {
-                    edge
-                } else {
-                    blend(face, 0, if colors.dark { 45 } else { 22 })
-                };
-                let radius = if stacked { p(4) } else { p(6) };
-                paint::fill(dc, &outer, foot, radius);
-                let surface = RECT {
-                    bottom: outer.bottom - if stacked { p(2) } else { p(3) },
-                    ..outer
-                };
-                fill_outlined(dc, surface, face, edge, radius, p(1));
-                if label == "Win" {
-                    let side = if stacked { p(12) } else { p(15) };
-                    windows_mark(dc, surface, side, p(1), ink);
-                } else {
-                    paint::text(
-                        dc,
-                        inset(surface, p(1)),
-                        label,
-                        key_font,
-                        ink,
-                        DT_CENTER | DT_END_ELLIPSIS,
-                    );
-                }
-                x += width + gap;
+                caps.draw(dc, legend_rect, colors);
             }
         });
     }
@@ -283,28 +197,6 @@ impl ShortcutWindow {
                 paint::text(dc, r, "\u{e777}", fonts.symbol, ink, DT_CENTER);
             }
         });
-    }
-}
-
-fn windows_mark(dc: HDC, bounds: RECT, side: i32, gutter: i32, ink: COLORREF) {
-    let pane = ((side - gutter) / 2).max(1);
-    let span = 2 * pane + gutter;
-    let x = (bounds.left + bounds.right - span) / 2;
-    let y = (bounds.top + bounds.bottom - span) / 2;
-    for left in [x, x + pane + gutter] {
-        for top in [y, y + pane + gutter] {
-            paint::fill(
-                dc,
-                &RECT {
-                    left,
-                    top,
-                    right: left + pane,
-                    bottom: top + pane,
-                },
-                ink,
-                0,
-            );
-        }
     }
 }
 

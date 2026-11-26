@@ -6,11 +6,11 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
-        "Навигация по окнам",
+        "Переключение фокуса",
         &[FocusLeft, FocusRight, FocusUp, FocusDown],
     ),
     (
-        "Изменение размера",
+        "Режим изменения размера",
         &[
             StartResize,
             GrowLeft,
@@ -26,7 +26,7 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
         ],
     ),
     (
-        "Быстрое изменение размера",
+        "Изменение размера без входа в режим",
         &[
             QuickLeft,
             QuickRight,
@@ -43,7 +43,7 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
         &[Shortcut::CloseWindow, ToggleMaximize, ToggleMosaic],
     ),
     (
-        "Перенос окна между столами",
+        "Перенос между рабочими столами",
         &[
             MovePreviousDesktop,
             MovePreviousDesktopAlt,
@@ -52,7 +52,7 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
         ],
     ),
     (
-        "Переключение столов",
+        "Смена рабочего стола",
         &[
             PreviousDesktop,
             PreviousDesktopAlt,
@@ -63,7 +63,7 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
         ],
     ),
     (
-        "Стол по номеру",
+        "Выбор стола по номеру",
         &[
             Desktop1, Desktop2, Desktop3, Desktop4, Desktop5, Desktop6, Desktop7, Desktop8,
             Desktop9, Desktop10,
@@ -338,7 +338,10 @@ impl ShortcutWindow {
         } else {
             1
         };
-        let row_h = p(if width < p(430) { 50 } else { 32 });
+        let margin = self.margin(width);
+        let gap = p(24);
+        let button_w = p(28);
+        let column_width = |viewport| (viewport - 2 * margin - (columns - 1) * gap) / columns;
         let header_h = p(34);
         let row_gap = |action| {
             if matches!(action, GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft) {
@@ -347,20 +350,38 @@ impl ShortcutWindow {
                 0
             }
         };
-        let mut starts = [(0, 0); GROUPS.len()];
-        let mut ends = [p(12); 3];
-        for (order, &i) in READING_ORDER.iter().enumerate() {
-            let column = match columns {
-                3 if order >= 6 => 2,
-                3 if order >= 4 => 1,
-                2 if order >= 5 => 1,
-                _ => 0,
-            };
-            starts[i] = (column, ends[column]);
-            ends[column] +=
-                header_h + GROUPS[i].1.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(15);
+        let dc = unsafe { GetDC(view) };
+        let measure = |viewport| {
+            let col = column_width(viewport);
+            let heights = Shortcut::ALL.map(|a| self.action_row_height(dc, a, col - 2 * button_w));
+            let mut starts = [(0, 0); GROUPS.len()];
+            let mut ends = [p(12); 3];
+            for (order, &i) in READING_ORDER.iter().enumerate() {
+                let column = match columns {
+                    3 if order >= 6 => 2,
+                    3 if order >= 4 => 1,
+                    2 if order >= 5 => 1,
+                    _ => 0,
+                };
+                starts[i] = (column, ends[column]);
+                let rows: i32 = GROUPS[i]
+                    .1
+                    .iter()
+                    .map(|&a| heights[a.index()] + row_gap(a))
+                    .sum();
+                ends[column] += header_h + rows + p(15);
+            }
+            (heights, starts, *ends.iter().max().unwrap())
+        };
+        // Measure without the scrollbar first so rows can return to one line
+        // when the user widens the window or assigns a shorter chord.
+        let mut measured = measure(width);
+        if measured.2 > height {
+            let scrollbar = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi.get()) };
+            measured = measure(width - scrollbar);
         }
-        let total = *ends.iter().max().unwrap();
+        unsafe { ReleaseDC(view, dc) };
+        let (heights, starts, total) = measured;
         self.scroll
             .set(self.scroll.get().clamp(0, (total - height).max(0)));
         let scroll = SCROLLINFO {
@@ -377,10 +398,7 @@ impl ShortcutWindow {
             SetScrollInfo(view, SB_VERT, &scroll, 1);
             GetClientRect(view, &mut client)
         };
-        let margin = self.margin(width);
-        let gap = p(24);
-        let col = (client.right - 2 * margin - (columns - 1) * gap) / columns;
-        let button_w = p(28);
+        let col = column_width(client.right);
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
             let (column, start) = starts[i];
             let x = margin + column as i32 * (col + gap);
@@ -389,6 +407,7 @@ impl ShortcutWindow {
             y += header_h;
             for &action in actions {
                 y += row_gap(action);
+                let row_h = heights[action.index()];
                 let label_width = col - 2 * button_w;
                 place(self.row(action), x, y, label_width, row_h);
                 place(

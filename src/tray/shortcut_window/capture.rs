@@ -270,7 +270,7 @@ mod tests {
         keys.key(VK_RWIN, true);
         for _ in 0..2 {
             assert_eq!(keys.key(WHEEL_DOWN, true), Event::Changed);
-            assert_eq!(keys.label(), "Win+Колесо ↓");
+            assert_eq!(keys.label(), "Win+Wheel Down");
         }
         assert_eq!(
             keys.key(VK_RWIN, false),

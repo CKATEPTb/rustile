@@ -178,20 +178,14 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SetBkMode(dc, TRANSPARENT as i32);
                 if item.CtlID == CHORD as u32 {
                     if let Some(Command::ReassignShortcut(_, chord, _)) = ui.transfer.get() {
-                        let label = chord.label();
-                        let font = if appearance::text_width(dc, fonts.display, &label)
-                            > r.right - r.left
-                        {
-                            fonts.heading
-                        } else {
-                            fonts.display
-                        };
-                        let ink = if colors.high_contrast {
-                            colors.text
-                        } else {
-                            colors.accent
-                        };
-                        paint::text(dc, r, &label, font, ink, DT_LEFT | DT_END_ELLIPSIS);
+                        let caps = keycaps::Keycaps::new(
+                            ui,
+                            dc,
+                            fonts,
+                            (chord.mods, Some(chord.key)),
+                            keycaps::Size::Compact,
+                        );
+                        caps.draw(dc, r, colors);
                     }
                     return 1;
                 }

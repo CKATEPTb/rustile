@@ -574,7 +574,7 @@ internal static class DesktopSmoke {
             return true;
         }, IntPtr.Zero);
         string message = copy.ToString();
-        Require(new[] { "Фокус влево", "Переместить влево", "Win+←" }
+        Require(new[] { "Выбрать окно слева", "Переместить влево", "Win+Left" }
             .All(label => message.IndexOf(label, StringComparison.OrdinalIgnoreCase) >= 0),
             "Conflict prompt must identify the chord and both actions: " + message);
         var cancel = EditorControl(dialog, 2 /* IDCANCEL */);
@@ -907,16 +907,29 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         VerifyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1050) == IntPtr.Zero
-            && initial[27].Contains("Win+") && initial[28].Contains("Win+") && initial[29].Contains("Win+"),
+        var categories = new[] {
+            "Перемещение окон", "Переключение фокуса", "Режим изменения размера", "Изменение размера без входа в режим",
+            "Управление окнами", "Перенос между рабочими столами", "Смена рабочего стола", "Выбор стола по номеру"
+        };
+        Require(Enumerable.Range(520, categories.Length).Select(id => ControlText(GetDlgItem(viewHwnd, id))).SequenceEqual(categories),
+            "Every section should identify the operation it configures");
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1050) == IntPtr.Zero,
             "The page should expose all 50 editable shortcuts");
-        Require(initial[34].EndsWith("Win+Колесо ↑") && initial[35].EndsWith("Win+Колесо ↓"),
+        Require(initial[8].EndsWith(", Win+Enter") && initial[17].EndsWith(", Enter") && initial[18].EndsWith(", Esc"),
+            "The editor should show the English key names for entering and leaving resize mode");
+        Require(initial[27].EndsWith(", Win+Q") && initial[28].EndsWith(", Win+F") && initial[29].EndsWith(", Win+Y"),
+            "Window commands should display the English letter printed on each key");
+        Require(initial[34].EndsWith(", Win+Wheel Up") && initial[35].EndsWith(", Win+Wheel Down"),
             "The editor should show both desktop wheel bindings");
         for (int number = 1; number <= 10; number++)
             Require(initial[35 + number].EndsWith("Win+" + (number % 10)),
                 "Wrong desktop number key for slot " + number);
-        var arrows = new[] { "←", "→", "↑", "↓" };
+        var arrows = new[] { "Left", "Right", "Up", "Down" };
         for (int i = 0; i < arrows.Length; ++i) {
+            Require(initial[i].EndsWith(", Win+" + arrows[i]) && initial[4 + i].EndsWith(", Win+Shift+" + arrows[i]),
+                "Focus and move should display the English arrow name for " + arrows[i]);
+            Require(initial[9 + i].EndsWith(", " + arrows[i]) && initial[13 + i].EndsWith(", Shift+" + arrows[i]),
+                "Resize mode should display the English arrow name for " + arrows[i]);
             Require(initial[30 + i].EndsWith("Ctrl+Win+" + arrows[i]),
                 "Desktop navigation should display its default shortcut for " + arrows[i]);
             Require(initial[46 + i].EndsWith("Ctrl+Win+Shift+" + arrows[i]),
@@ -990,12 +1003,13 @@ internal static class DesktopSmoke {
         CaptureKey(up, Keys.Menu, true, true);
         CaptureKey(up, Keys.Oemcomma, true, true);
         CaptureKey(up, Keys.Oemcomma, false, true);
-        Until("The row should preview Alt plus the OEM key while Alt is held", () => ControlText(up).Contains("Alt+"));
+        Until("The row and preview should show Alt and the US comma while Alt is held", () =>
+            ControlText(up).EndsWith("Alt+,") && ControlText(preview) == ControlText(up));
         Require(File.ReadAllText(file) == beforeCapture, "The chord was saved before the last key was released");
         CaptureKey(up, Keys.Menu, false, true);
         Until("Releasing Alt must persist VK_OEM_COMMA", () =>
             System.Text.RegularExpressions.Regex.IsMatch(File.ReadAllText(file), @"\bkey\s*=\s*188\b")
-            && ControlText(up).Contains("Alt+"));
+            && ControlText(up).EndsWith("Alt+,"));
         var punctuation = ControlText(up);
         BeginRecording(editor, up);
         CaptureKey(up, Keys.Escape, true);
@@ -1006,13 +1020,14 @@ internal static class DesktopSmoke {
         EnterChord(left, Keys.LWin, Keys.Left);
         ChooseConflict(manager, editor, ConflictChoice.TabEnter);
         Until("Reassignment must transfer the chord and unbind its former action", () =>
-            ControlText(focusLeft).EndsWith("Не назначено") && ControlText(left).EndsWith("Win+←"));
+            ControlText(focusLeft).EndsWith("Не назначено") && ControlText(left).EndsWith("Win+Left"));
         VerifyIdleHeader(editor);
         var oneOverride = File.ReadAllText(file);
         BeginRecording(editor, right);
-        EnterChord(right, Keys.ControlKey, Keys.F9);
-        Until("Rebinding a second row should allow resetting it independently", () =>
-            File.ReadAllText(file) != oneOverride && ControlText(right).Contains("Ctrl+F9"));
+        EnterChord(right, Keys.ControlKey, Keys.Oemplus);
+        Until("The plus key should survive recording and display beside Ctrl", () =>
+            File.ReadAllText(file) != oneOverride && ControlText(right).EndsWith(", Ctrl++")
+            && ControlText(preview) == ControlText(right));
         MouseClick(EditorControl(editor, 1105));
         Until("Resetting Move right should recover its original binding", () => ControlText(right) == initial[5]);
         var expected = (string[])initial.Clone();
@@ -1381,6 +1396,9 @@ internal static class DesktopSmoke {
             () => noHint() && handles.Select(Bounds).SequenceEqual(expanded));
         manager.Send(RustileShortcut, 1, active);
         Until("The modal hint should appear again", () => !noHint());
+        var hint = ControlText(ManagerWindow(manager, "Rustile.ResizeHint", true));
+        Require(new[] { "Left или Up или Down или Right", "Shift+Left или Shift+Up или Shift+Down или Shift+Right", "Enter или Esc" }
+            .All(hint.Contains), "The resize guide should announce all the English key names: " + hint);
         manager.Send(RustileShortcut, 30 + moved - 20, active);
         Until("The inverse modal command should update the same divider", () => extent(Bounds(active)) < extent(expanded[index]));
         var latest = Bounds(active);

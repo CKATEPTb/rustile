@@ -1,6 +1,4 @@
-use crate::settings::{Settings, Shortcut};
-
-const ARROWS: &str = "← ↑ ↓ →";
+use crate::settings::{Chord, Settings, Shortcut};
 
 pub(super) struct Guide {
     pub(super) rows: Vec<HintRow>,
@@ -8,7 +6,38 @@ pub(super) struct Guide {
 
 pub(super) struct HintRow {
     pub(super) action: String,
-    pub(super) keys: Vec<String>,
+    choices: Vec<Chord>,
+}
+
+impl HintRow {
+    // Each cap has a separate printed connector. For Shift+any arrow, the
+    // repeated modifiers appear just once before the four direction choices.
+    pub(super) fn keycaps(&self) -> Vec<(&'static str, String)> {
+        let same_mods = self
+            .choices
+            .windows(2)
+            .all(|pair| pair[0].mods == pair[1].mods);
+        let mut caps = Vec::new();
+        for (choice, chord) in self.choices.iter().enumerate() {
+            let mods = if choice > 0 && same_mods {
+                0
+            } else {
+                chord.mods
+            };
+            for (index, label) in Chord::key_labels(mods, Some(chord.key))
+                .into_iter()
+                .enumerate()
+            {
+                let connector = match (choice, index) {
+                    (0, 0) => "",
+                    (_, 0) => "/",
+                    _ => "+",
+                };
+                caps.push((connector, label));
+            }
+        }
+        caps
+    }
 }
 
 impl Guide {
@@ -18,59 +47,47 @@ impl Guide {
         use Shortcut::*;
 
         let mut rows = Vec::new();
-        for (label, keys, actions) in [
+        for (label, actions) in [
             (
                 "Сдвинуть границу по стрелке",
-                ARROWS,
-                [
-                    (GrowLeft, "Сдвинуть влево"),
-                    (GrowRight, "Сдвинуть вправо"),
-                    (GrowUp, "Сдвинуть вверх"),
-                    (GrowDown, "Сдвинуть вниз"),
-                ],
+                [GrowLeft, GrowUp, GrowDown, GrowRight],
             ),
             (
                 "Сдвинуть её против стрелки",
-                "Shift + стрелка",
-                [
-                    (ShrinkLeft, "Развернуть шаг «Влево»"),
-                    (ShrinkRight, "Развернуть шаг «Вправо»"),
-                    (ShrinkUp, "Развернуть шаг «Вверх»"),
-                    (ShrinkDown, "Развернуть шаг «Вниз»"),
-                ],
+                [ShrinkLeft, ShrinkUp, ShrinkDown, ShrinkRight],
             ),
         ] {
             if actions
                 .iter()
-                .all(|(action, _)| settings.binding(*action) == Some(action.default_chord()))
+                .all(|&action| settings.binding(action) == Some(action.default_chord()))
             {
                 rows.push(HintRow {
                     action: label.into(),
-                    keys: vec![keys.into()],
+                    choices: actions.into_iter().map(Shortcut::default_chord).collect(),
                 });
             } else {
-                for (action, label) in actions {
+                for action in actions {
                     if let Some(chord) = settings.binding(action) {
                         rows.push(HintRow {
-                            action: label.into(),
-                            keys: vec![chord.label()],
+                            action: action.label().into(),
+                            choices: vec![chord],
                         });
                     }
                 }
             }
         }
-        let keys: Vec<_> = [Confirm, Cancel]
+        let choices: Vec<_> = [Confirm, Cancel]
             .into_iter()
-            .filter_map(|action| settings.binding(action).map(|chord| chord.label()))
+            .filter_map(|action| settings.binding(action))
             .collect();
         rows.push(HintRow {
-            action: if keys.is_empty() {
+            action: if choices.is_empty() {
                 "Для выхода выберите другое окно"
             } else {
                 "Выйти из режима"
             }
             .into(),
-            keys,
+            choices,
         });
         Self { rows }
     }
@@ -80,13 +97,9 @@ impl Guide {
         for row in &self.rows {
             text.push_str("\r\n");
             text.push_str(&row.action);
-            for (index, key) in row.keys.iter().enumerate() {
+            for (index, chord) in row.choices.iter().enumerate() {
                 text.push_str(if index == 0 { " — " } else { " или " });
-                text.push_str(if key == ARROWS {
-                    "клавиши со стрелками"
-                } else {
-                    key
-                });
+                text.push_str(&chord.label());
             }
         }
         text
@@ -97,14 +110,37 @@ impl Guide {
 mod tests {
     use super::*;
 
+    fn assert_caps(row: &HintRow, expected: &[(&str, &str)]) {
+        let caps = row.keycaps();
+        let parts: Vec<_> = caps
+            .iter()
+            .map(|(join, key)| (*join, key.as_str()))
+            .collect();
+        assert_eq!(parts, expected);
+    }
+
     #[test]
     fn standard_bindings_share_rows_and_exits_are_alternatives() {
         let guide = Guide::new(&Settings::default());
         assert_eq!(guide.rows.len(), 3);
-        assert_eq!(guide.rows[0].keys, [ARROWS]);
-        assert_eq!(guide.rows[1].keys, ["Shift + стрелка"]);
-        assert_eq!(guide.rows[2].keys, ["Enter", "Esc"]);
-        assert!(guide.accessible_text().contains("Enter или Esc"));
+        assert_caps(
+            &guide.rows[0],
+            &[("", "Left"), ("/", "Up"), ("/", "Down"), ("/", "Right")],
+        );
+        assert_caps(
+            &guide.rows[1],
+            &[
+                ("", "Shift"),
+                ("+", "Left"),
+                ("/", "Up"),
+                ("/", "Down"),
+                ("/", "Right"),
+            ],
+        );
+        assert_caps(&guide.rows[2], &[("", "Enter"), ("/", "Esc")]);
+        let text = guide.accessible_text();
+        assert!(text.contains("Shift+Left или Shift+Up или Shift+Down или Shift+Right"));
+        assert!(text.contains("Enter или Esc"));
     }
 
     #[test]
@@ -119,13 +155,13 @@ mod tests {
         .unwrap();
         let guide = Guide::new(&settings);
         assert_eq!(guide.rows.len(), 8);
-        assert_eq!(guide.rows[0].action, "Сдвинуть влево");
-        assert_eq!(guide.rows[0].keys, ["F6"]);
-        assert_eq!(guide.rows[3].action, "Развернуть шаг «Влево»");
-        assert_eq!(guide.rows[3].keys, ["Shift+F6"]);
-        assert!(guide.rows.last().unwrap().keys.is_empty());
+        assert_eq!(guide.rows[0].action, Shortcut::GrowLeft.label());
+        assert_caps(&guide.rows[0], &[("", "F6")]);
+        assert_eq!(guide.rows[3].action, Shortcut::ShrinkLeft.label());
+        assert_caps(&guide.rows[3], &[("", "Shift"), ("+", "F6")]);
+        assert!(guide.rows.last().unwrap().choices.is_empty());
         let text = guide.accessible_text();
         assert!(text.contains("другое окно"));
-        assert!(!text.contains("Сдвинуть вверх") && !text.contains("Esc"));
+        assert!(!text.contains(Shortcut::GrowUp.label()) && !text.contains("Esc"));
     }
 }

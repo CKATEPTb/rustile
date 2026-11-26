@@ -2,6 +2,7 @@ mod appearance;
 mod capture;
 mod conflict;
 mod header;
+mod keycaps;
 mod view;
 
 use std::{
@@ -153,7 +154,7 @@ impl ShortcutWindow {
                 GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut y_dpi);
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
-                    right: self.p(1232),
+                    right: self.p(1408),
                     bottom: self.p(852),
                     ..Default::default()
                 };
@@ -211,6 +212,7 @@ impl ShortcutWindow {
     pub(super) fn set_settings(&self, settings: Settings) {
         if self.settings.replace(settings) != settings && !self.hwnd.get().is_null() {
             self.update_rows();
+            self.layout(self.hwnd.get());
         }
     }
 

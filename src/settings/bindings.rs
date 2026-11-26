@@ -42,56 +42,56 @@ macro_rules! shortcuts {
 }
 
 shortcuts! {
-    FocusLeft,   "Фокус влево",        Focus, VK_LEFT;
-    FocusRight,  "Фокус вправо",       Focus, VK_RIGHT;
-    FocusUp,     "Фокус вверх",        Focus, VK_UP;
-    FocusDown,   "Фокус вниз",         Focus, VK_DOWN;
-    MoveLeft,    "Переместить влево",  Move, VK_LEFT;
-    MoveRight,   "Переместить вправо", Move, VK_RIGHT;
-    MoveUp,      "Переместить вверх",  Move, VK_UP;
-    MoveDown,    "Переместить вниз",   Move, VK_DOWN;
-    StartResize, "Войти в режим",      StartResize, VK_RETURN;
-    GrowLeft,    "Влево",              Grow, VK_LEFT;
-    GrowRight,   "Вправо",             Grow, VK_RIGHT;
-    GrowUp,      "Вверх",              Grow, VK_UP;
-    GrowDown,    "Вниз",               Grow, VK_DOWN;
-    ShrinkLeft,  "Влево (обратно)",    Shrink, VK_LEFT;
-    ShrinkRight, "Вправо (обратно)",   Shrink, VK_RIGHT;
-    ShrinkUp,    "Вверх (обратно)",    Shrink, VK_UP;
-    ShrinkDown,  "Вниз (обратно)",     Shrink, VK_DOWN;
-    Confirm,     "Выйти из режима",    Finish, VK_RETURN;
-    Cancel,      "Выйти из режима (доп.)", Finish, VK_ESCAPE;
-    QuickLeft,         "Влево",              Quick, VK_LEFT;
-    QuickRight,        "Вправо",             Quick, VK_RIGHT;
-    QuickUp,           "Вверх",              Quick, VK_UP;
-    QuickDown,         "Вниз",               Quick, VK_DOWN;
-    QuickReverseLeft,  "Влево (обратно)",    QuickReverse, VK_LEFT;
-    QuickReverseRight, "Вправо (обратно)",   QuickReverse, VK_RIGHT;
-    QuickReverseUp,    "Вверх (обратно)",    QuickReverse, VK_UP;
-    QuickReverseDown,  "Вниз (обратно)",     QuickReverse, VK_DOWN;
-    CloseWindow,    "Закрыть окно",              Window, VK_Q;
-    ToggleMaximize, "Развернуть или восстановить", Window, VK_F;
-    ToggleMosaic,   "Переключить мозаику",        Window, VK_Y;
-    PreviousDesktop,    "Предыдущий стол",        Desktop, VK_LEFT;
-    NextDesktop,        "Следующий стол",         Desktop, VK_RIGHT;
-    PreviousDesktopAlt, "Предыдущий стол (доп.)", Desktop, VK_UP;
-    NextDesktopAlt,     "Следующий стол (доп.)",  Desktop, VK_DOWN;
-    PreviousDesktopWheel, "Предыдущий стол (колесо)", Desktop, WHEEL_UP;
-    NextDesktopWheel,     "Следующий стол (колесо)",  Desktop, WHEEL_DOWN;
-    Desktop1,  "Рабочий стол 1",  Desktop, VK_1;
-    Desktop2,  "Рабочий стол 2",  Desktop, VK_2;
-    Desktop3,  "Рабочий стол 3",  Desktop, VK_3;
-    Desktop4,  "Рабочий стол 4",  Desktop, VK_4;
-    Desktop5,  "Рабочий стол 5",  Desktop, VK_5;
-    Desktop6,  "Рабочий стол 6",  Desktop, VK_6;
-    Desktop7,  "Рабочий стол 7",  Desktop, VK_7;
-    Desktop8,  "Рабочий стол 8",  Desktop, VK_8;
-    Desktop9,  "Рабочий стол 9",  Desktop, VK_9;
-    Desktop10, "Рабочий стол 10", Desktop, VK_0;
-    MovePreviousDesktop,    "На предыдущий стол",        DesktopMove, VK_LEFT;
-    MoveNextDesktop,        "На следующий стол",         DesktopMove, VK_RIGHT;
-    MovePreviousDesktopAlt, "На предыдущий стол (доп.)", DesktopMove, VK_UP;
-    MoveNextDesktopAlt,     "На следующий стол (доп.)",  DesktopMove, VK_DOWN;
+    FocusLeft,             "Выбрать окно слева",             Focus, VK_LEFT;
+    FocusRight,            "Выбрать окно справа",            Focus, VK_RIGHT;
+    FocusUp,               "Выбрать окно сверху",            Focus, VK_UP;
+    FocusDown,             "Выбрать окно снизу",             Focus, VK_DOWN;
+    MoveLeft,              "Переместить влево",              Move, VK_LEFT;
+    MoveRight,             "Переместить вправо",             Move, VK_RIGHT;
+    MoveUp,                "Переместить вверх",              Move, VK_UP;
+    MoveDown,              "Переместить вниз",               Move, VK_DOWN;
+    StartResize,           "Начать изменение размера",       StartResize, VK_RETURN;
+    GrowLeft,              "Сдвинуть к левому краю",         Grow, VK_LEFT;
+    GrowRight,             "Сдвинуть к правому краю",        Grow, VK_RIGHT;
+    GrowUp,                "Сдвинуть к верхнему краю",       Grow, VK_UP;
+    GrowDown,              "Сдвинуть к нижнему краю",        Grow, VK_DOWN;
+    ShrinkLeft,            "Сдвинуть от левого края",        Shrink, VK_LEFT;
+    ShrinkRight,           "Сдвинуть от правого края",       Shrink, VK_RIGHT;
+    ShrinkUp,              "Сдвинуть от верхнего края",      Shrink, VK_UP;
+    ShrinkDown,            "Сдвинуть от нижнего края",       Shrink, VK_DOWN;
+    Confirm,               "Завершить изменение размера",    Finish, VK_RETURN;
+    Cancel,                "Завершить (второе сочетание)",   Finish, VK_ESCAPE;
+    QuickLeft,             "Сдвинуть к левому краю",         Quick, VK_LEFT;
+    QuickRight,            "Сдвинуть к правому краю",        Quick, VK_RIGHT;
+    QuickUp,               "Сдвинуть к верхнему краю",       Quick, VK_UP;
+    QuickDown,             "Сдвинуть к нижнему краю",        Quick, VK_DOWN;
+    QuickReverseLeft,      "Сдвинуть от левого края",        QuickReverse, VK_LEFT;
+    QuickReverseRight,     "Сдвинуть от правого края",       QuickReverse, VK_RIGHT;
+    QuickReverseUp,        "Сдвинуть от верхнего края",      QuickReverse, VK_UP;
+    QuickReverseDown,      "Сдвинуть от нижнего края",       QuickReverse, VK_DOWN;
+    CloseWindow,           "Закрыть окно",                   Window, VK_Q;
+    ToggleMaximize,        "Развернуть или восстановить",    Window, VK_F;
+    ToggleMosaic,          "Переключить мозаику",            Window, VK_Y;
+    PreviousDesktop,       "Предыдущий стол",                Desktop, VK_LEFT;
+    NextDesktop,           "Следующий стол",                 Desktop, VK_RIGHT;
+    PreviousDesktopAlt,    "Предыдущий стол (вариант 2)",    Desktop, VK_UP;
+    NextDesktopAlt,        "Следующий стол (вариант 2)",     Desktop, VK_DOWN;
+    PreviousDesktopWheel,  "Предыдущий стол (вариант 3)",    Desktop, WHEEL_UP;
+    NextDesktopWheel,      "Следующий стол (вариант 3)",     Desktop, WHEEL_DOWN;
+    Desktop1,              "Рабочий стол 1",                 Desktop, VK_1;
+    Desktop2,              "Рабочий стол 2",                 Desktop, VK_2;
+    Desktop3,              "Рабочий стол 3",                 Desktop, VK_3;
+    Desktop4,              "Рабочий стол 4",                 Desktop, VK_4;
+    Desktop5,              "Рабочий стол 5",                 Desktop, VK_5;
+    Desktop6,              "Рабочий стол 6",                 Desktop, VK_6;
+    Desktop7,              "Рабочий стол 7",                 Desktop, VK_7;
+    Desktop8,              "Рабочий стол 8",                 Desktop, VK_8;
+    Desktop9,              "Рабочий стол 9",                 Desktop, VK_9;
+    Desktop10,             "Рабочий стол 10",                Desktop, VK_0;
+    MovePreviousDesktop,   "На предыдущий стол",             DesktopMove, VK_LEFT;
+    MoveNextDesktop,       "На следующий стол",              DesktopMove, VK_RIGHT;
+    MovePreviousDesktopAlt,"На предыдущий стол (вариант 2)", DesktopMove, VK_UP;
+    MoveNextDesktopAlt,    "На следующий стол (вариант 2)",  DesktopMove, VK_DOWN;
 }
 
 impl Shortcut {
@@ -206,20 +206,20 @@ impl Chord {
             VK_SHIFT | VK_LSHIFT | VK_RSHIFT => "Shift",
             VK_CONTROL | VK_LCONTROL | VK_RCONTROL => "Ctrl",
             VK_MENU | VK_LMENU | VK_RMENU => "Alt",
-            VK_A..=VK_Z | VK_0..=VK_9 => {
-                return layout_key_name(key).unwrap_or_else(|| char::from(key as u8).to_string());
-            }
+            // A binding stores a virtual key. Its legend stays the same when
+            // the user switches input languages or edits a saved binding.
+            VK_A..=VK_Z | VK_0..=VK_9 => return char::from(key as u8).to_string(),
             VK_F1..=VK_F24 => return format!("F{}", key - VK_F1 + 1),
             VK_NUMPAD0..=VK_NUMPAD9 => return format!("Num {}", key - VK_NUMPAD0),
-            VK_LEFT => "←",
-            VK_RIGHT => "→",
-            VK_UP => "↑",
-            VK_DOWN => "↓",
-            WHEEL_UP => "Колесо ↑",
-            WHEEL_DOWN => "Колесо ↓",
+            VK_LEFT => "Left",
+            VK_RIGHT => "Right",
+            VK_UP => "Up",
+            VK_DOWN => "Down",
+            WHEEL_UP => "Wheel Up",
+            WHEEL_DOWN => "Wheel Down",
             VK_RETURN => "Enter",
             VK_ESCAPE => "Esc",
-            VK_SPACE => "Пробел",
+            VK_SPACE => "Space",
             VK_TAB => "Tab",
             VK_BACK => "Backspace",
             VK_DELETE => "Delete",
@@ -229,36 +229,99 @@ impl Chord {
             VK_PRIOR => "Page Up",
             VK_NEXT => "Page Down",
             VK_ADD => "Num +",
-            VK_SUBTRACT => "Num −",
+            VK_SUBTRACT => "Num -",
             VK_MULTIPLY => "Num *",
             VK_DIVIDE => "Num /",
             VK_DECIMAL => "Num .",
             VK_SEPARATOR => "Num Separator",
-            VK_APPS => "Меню",
+            VK_APPS => "Menu",
             VK_SNAPSHOT => "Print Screen",
             VK_PAUSE => "Pause",
             VK_SCROLL => "Scroll Lock",
             VK_CAPITAL => "Caps Lock",
             VK_NUMLOCK => "Num Lock",
-            VK_BROWSER_BACK => "Браузер назад",
-            VK_BROWSER_FORWARD => "Браузер вперёд",
-            VK_BROWSER_REFRESH => "Обновить страницу",
-            VK_BROWSER_STOP => "Остановить загрузку",
-            VK_BROWSER_SEARCH => "Поиск в браузере",
-            VK_BROWSER_FAVORITES => "Избранное",
-            VK_BROWSER_HOME => "Домашняя страница",
-            VK_VOLUME_MUTE => "Без звука",
-            VK_VOLUME_DOWN => "Тише",
-            VK_VOLUME_UP => "Громче",
-            VK_MEDIA_NEXT_TRACK => "Следующий трек",
-            VK_MEDIA_PREV_TRACK => "Предыдущий трек",
-            VK_MEDIA_STOP => "Стоп",
-            VK_MEDIA_PLAY_PAUSE => "Пуск / пауза",
-            VK_LAUNCH_MAIL => "Почта",
-            VK_LAUNCH_MEDIA_SELECT => "Медиаплеер",
-            VK_LAUNCH_APP1 => "Приложение 1",
-            VK_LAUNCH_APP2 => "Приложение 2",
-            _ => return layout_key_name(key).unwrap_or_else(|| format!("VK {key:02X}")),
+            VK_CANCEL => "Break",
+            VK_CLEAR => "Clear",
+            VK_SELECT => "Select",
+            VK_PRINT => "Print",
+            VK_EXECUTE => "Execute",
+            VK_HELP => "Help",
+            VK_SLEEP => "Sleep",
+            VK_KANA => "Kana/Hangul",
+            VK_IME_ON => "IME On",
+            VK_IME_OFF => "IME Off",
+            VK_JUNJA => "Junja",
+            VK_FINAL => "Final",
+            VK_HANJA => "Hanja/Kanji",
+            VK_CONVERT => "Convert",
+            VK_NONCONVERT => "Nonconvert",
+            VK_ACCEPT => "Accept",
+            VK_MODECHANGE => "Mode Change",
+            VK_BROWSER_BACK => "Browser Back",
+            VK_BROWSER_FORWARD => "Browser Forward",
+            VK_BROWSER_REFRESH => "Browser Refresh",
+            VK_BROWSER_STOP => "Browser Stop",
+            VK_BROWSER_SEARCH => "Browser Search",
+            VK_BROWSER_FAVORITES => "Browser Favorites",
+            VK_BROWSER_HOME => "Browser Home",
+            VK_VOLUME_MUTE => "Mute",
+            VK_VOLUME_DOWN => "Volume Down",
+            VK_VOLUME_UP => "Volume Up",
+            VK_MEDIA_NEXT_TRACK => "Next Track",
+            VK_MEDIA_PREV_TRACK => "Previous Track",
+            VK_MEDIA_STOP => "Media Stop",
+            VK_MEDIA_PLAY_PAUSE => "Play/Pause",
+            VK_LAUNCH_MAIL => "Mail",
+            VK_LAUNCH_MEDIA_SELECT => "Media Player",
+            VK_LAUNCH_APP1 => "Launch App 1",
+            VK_LAUNCH_APP2 => "Launch App 2",
+            VK_OEM_1 => ";",
+            VK_OEM_PLUS => "+",
+            VK_OEM_COMMA => ",",
+            VK_OEM_MINUS => "-",
+            VK_OEM_PERIOD => ".",
+            VK_OEM_2 => "/",
+            VK_OEM_3 => "`",
+            VK_OEM_4 => "[",
+            VK_OEM_5 => "\\",
+            VK_OEM_6 => "]",
+            VK_OEM_7 => "'",
+            VK_OEM_8 => "OEM 8",
+            VK_OEM_102 => "ISO \\",
+            VK_ABNT_C1 => "ABNT C1",
+            VK_ABNT_C2 => "ABNT C2",
+            VK_OEM_NEC_EQUAL => "Num =",
+            VK_OEM_FJ_MASSHOU => "Dictionary Delete",
+            VK_OEM_FJ_TOUROKU => "Dictionary Add",
+            VK_OEM_FJ_LOYA => "Left OYAYUBI",
+            VK_OEM_FJ_ROYA => "Right OYAYUBI",
+            VK_OEM_AX => "AX",
+            VK_ICO_HELP => "ICO Help",
+            VK_ICO_00 => "ICO 00",
+            VK_ICO_CLEAR => "ICO Clear",
+            VK_OEM_RESET => "OEM Reset",
+            VK_OEM_JUMP => "OEM Jump",
+            VK_OEM_PA1 => "OEM PA1",
+            VK_OEM_PA2 => "OEM PA2",
+            VK_OEM_PA3 => "OEM PA3",
+            VK_OEM_WSCTRL => "OEM WS Ctrl",
+            VK_OEM_CUSEL => "OEM CuSel",
+            VK_OEM_ATTN => "OEM Attn",
+            VK_OEM_FINISH => "OEM Finish",
+            VK_OEM_COPY => "OEM Copy",
+            VK_OEM_AUTO => "OEM Auto",
+            VK_OEM_ENLW => "OEM Enlw",
+            VK_OEM_BACKTAB => "OEM BackTab",
+            VK_ATTN => "Attn",
+            VK_CRSEL => "CrSel",
+            VK_EXSEL => "ExSel",
+            VK_EREOF => "Erase EOF",
+            VK_PLAY => "Play",
+            VK_ZOOM => "Zoom",
+            VK_NONAME => "NoName",
+            VK_PA1 => "PA1",
+            VK_OEM_CLEAR => "OEM Clear",
+            _ => return format!("VK {key:02X}"),
         }
         .into()
     }
@@ -274,14 +337,15 @@ impl Chord {
         .filter_map(move |(bit, name)| (mods & bit != 0).then_some(name))
     }
 
+    pub fn key_labels(mods: u32, key: Option<u16>) -> Vec<String> {
+        Self::modifier_labels(mods)
+            .map(str::to_owned)
+            .chain(key.map(Self::key_label))
+            .collect()
+    }
+
     pub fn label(self) -> String {
-        let mut text = String::new();
-        for modifier in Self::modifier_labels(self.mods) {
-            text.push_str(modifier);
-            text.push('+');
-        }
-        text.push_str(&Self::key_label(self.key));
-        text
+        Self::key_labels(self.mods, Some(self.key)).join("+")
     }
 
     pub(crate) fn validate(self, action: Shortcut) -> Result<(), String> {
@@ -311,53 +375,6 @@ impl Chord {
         }
         Ok(())
     }
-}
-
-// Called by the settings UI for a key legend. Use a neutral synthetic state
-// and the editor's active layout, without consuming or setting any dead key.
-fn layout_key_name(key: u16) -> Option<String> {
-    let layout = unsafe { GetKeyboardLayout(0) };
-    let scan = unsafe { MapVirtualKeyExW(key.into(), MAPVK_VK_TO_VSC_EX, layout) };
-    let mut buf = [0u16; 64];
-    if matches!(key, VK_A..=VK_Z | VK_0..=VK_9 | VK_OEM_1..=VK_ABNT_C2 | VK_OEM_4..=VK_OEM_8 | VK_OEM_102)
-    {
-        let len = unsafe {
-            ToUnicodeEx(
-                key.into(),
-                scan,
-                [0u8; 256].as_ptr(),
-                buf.as_mut_ptr(),
-                buf.len() as i32,
-                4,
-                layout,
-            )
-        };
-        if len != 0 {
-            // For dead keys Windows returns a negative value of unspecified
-            // magnitude and places the spacing form in the first UTF-16 unit.
-            let used = if len < 0 { 1 } else { len as usize };
-            let text = String::from_utf16_lossy(&buf[..used]);
-            if let Some(c) = text.chars().next()
-                && !c.is_control()
-                && !c.is_whitespace()
-            {
-                let mut upper = c.to_uppercase();
-                let first = upper.next()?;
-                return Some(if upper.next().is_none() {
-                    first.to_string()
-                } else {
-                    c.to_string()
-                });
-            }
-        }
-    }
-    if scan == 0 {
-        return None;
-    }
-    let extended = i32::from(scan >> 8 == 0xe0) << 24;
-    let param = ((scan as i32 & 0xff) << 16) | extended;
-    let len = unsafe { GetKeyNameTextW(param, buf.as_mut_ptr(), buf.len() as i32) };
-    (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 // In memory, a fixed table keeps the hook allocation-free. The file contains
