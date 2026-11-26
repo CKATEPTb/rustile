@@ -157,9 +157,11 @@ fn smoke_desktop() -> String {
 #[test]
 #[ignore = "driven by desktop-smoke on a private Win32 desktop"]
 fn isolated_shortcut_ownership() {
+    use crate::manager::ShortcutTarget;
     use crate::settings::{Assignment, Chord, Shortcut};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18, VK_LSHIFT,
+        INPUT_KEYBOARD, KEYEVENTF_KEYUP, MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18,
+        VK_LSHIFT, VK_LWIN,
     };
 
     smoke_desktop();
@@ -277,16 +279,56 @@ fn isolated_shortcut_ownership() {
     expect_navigation_without_window();
 
     let wheel = |message, delta, mods| shortcuts::test_wheel_event(message, delta, mods, owner);
+    let plain_win = |down| {
+        assert!(!shortcuts::test_win_key(VK_LWIN, down, |_| {
+            panic!("a plain Win press must reach the Shell without replacement")
+        }));
+    };
+    let release_after_scroll = || {
+        let mut sent = Vec::new();
+        assert!(shortcuts::test_win_key(VK_LWIN, false, |inputs| {
+            assert_eq!(inputs.len(), 3, "send the mask and Win-up in one batch");
+            for input in inputs {
+                assert_eq!(input.r#type, INPUT_KEYBOARD);
+                let key = unsafe { input.Anonymous.ki };
+                sent.push((key.wVk, key.dwFlags & KEYEVENTF_KEYUP != 0));
+            }
+            inputs.len() as u32
+        }));
+        assert_eq!(sent, [(0xff, false), (0xff, true), (VK_LWIN, true)]);
+        assert_eq!(next_command(), None, "release must not repeat the switch");
+    };
+    plain_win(true);
+    plain_win(false);
+    plain_win(true);
     assert!(!wheel(WM_MOUSEWHEEL, 120, 0));
     assert!(!wheel(WM_MOUSEHWHEEL, 120, MOD_WIN));
+    plain_win(false);
+
+    // A short high-resolution scroll still used Win, even without a full detent.
+    plain_win(true);
     assert!(wheel(WM_MOUSEWHEEL, 60, MOD_WIN));
     assert_eq!(next_command(), None);
+    release_after_scroll();
+
+    plain_win(true);
+    assert!(wheel(WM_MOUSEWHEEL, 60, MOD_WIN));
+    assert_eq!(
+        next_command(),
+        None,
+        "each hold starts with a fresh remainder"
+    );
     assert!(wheel(WM_MOUSEWHEEL, 60, MOD_WIN));
     assert_eq!(next_command(), Some((DESKTOP_PREVIOUS, 0, 0)));
     assert!(wheel(WM_MOUSEWHEEL, -240, MOD_WIN));
     assert_eq!(next_command(), Some((DESKTOP_NEXT, 0, 0)));
     assert_eq!(next_command(), Some((DESKTOP_NEXT, 0, 0)));
     assert_eq!(next_command(), None);
+    // The destination gains focus after the last wheel packet and before Win-up.
+    shortcuts::update(Some(ShortcutTarget::Tile(123)), Mode::Normal, 0);
+    release_after_scroll();
+    plain_win(true);
+    plain_win(false);
 }
 
 #[test]

@@ -379,14 +379,12 @@ thread_local! {
     static PENDING: Cell<Pending> = const { Cell::new(Pending::NEW) };
 }
 
-fn modifiers() -> u32 {
+// Retain the individual Win keys from the same sample that matched the binding.
+fn modifiers() -> (u32, u8) {
     // Read only modifier states preceding the chord's main key transition.
     let down = |vk: u16| unsafe { GetAsyncKeyState(vk.into()) } < 0;
-    let mut mods = if down(VK_LWIN) || down(VK_RWIN) {
-        MOD_WIN
-    } else {
-        0
-    };
+    let win_keys = u8::from(down(VK_LWIN)) | (u8::from(down(VK_RWIN)) << 1);
+    let mut mods = if win_keys != 0 { MOD_WIN } else { 0 };
     for (key, flag) in [
         (VK_SHIFT, MOD_SHIFT),
         (VK_CONTROL, MOD_CONTROL),
@@ -396,24 +394,37 @@ fn modifiers() -> u32 {
             mods |= flag;
         }
     }
-    mods
+    (mods, win_keys)
+}
+
+fn keyboard_input(key: KEYBDINPUT) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: key },
+    }
+}
+
+fn menu_marker(flags: u32) -> INPUT {
+    keyboard_input(KEYBDINPUT {
+        wVk: 0xff,
+        dwFlags: flags,
+        ..Default::default()
+    })
+}
+
+fn send_keys(inputs: &[INPUT]) -> u32 {
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    }
 }
 
 fn mark_modifier_used() {
-    // The shell or foreground app otherwise sees a bare Win or Alt release
-    // after a consumed chord and can activate Start or its menu bar.
-    let dummy = |flags| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: 0xff,
-                dwFlags: flags,
-                ..Default::default()
-            },
-        },
-    };
-    let marker = [dummy(0), dummy(KEYEVENTF_KEYUP)];
-    unsafe { SendInput(2, marker.as_ptr(), size_of::<INPUT>() as i32) };
+    // Let the shell see an intervening key even though Rustile owns the chord.
+    send_keys(&[menu_marker(0), menu_marker(KEYEVENTF_KEYUP)]);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -461,7 +472,7 @@ fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
     key?.binding(
         state,
         pending,
-        modifiers(),
+        modifiers().0,
         || unsafe { GetForegroundWindow() } as isize,
     )
 }
@@ -469,7 +480,9 @@ fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
 unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isize {
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
-        let vk = unsafe { (*(data as *const KBDLLHOOKSTRUCT)).vkCode };
+        let event = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
+        let vk = event.vkCode;
+        let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let modifier = matches!(
             vk as u16,
             VK_LWIN
@@ -484,14 +497,17 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
                 | VK_LMENU
                 | VK_RMENU
         );
-        if matches!(message as u32, WM_KEYUP | WM_SYSKEYUP) && modifier {
+        if matches!(vk as u16, VK_LWIN | VK_RWIN) {
+            if wheel::win_key(event, down, send_keys) {
+                return 1;
+            }
+        } else if !down && modifier {
             wheel::reset();
         }
         if let Ok(vk) = u8::try_from(vk)
             && !modifier
             && vk != 0xff
         {
-            let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let slot = usize::from(vk);
             let previous = HELD.with(|held| held[slot].get());
             let pending = PENDING.get();
@@ -559,9 +575,20 @@ pub(super) fn test_keyboard_event(key: u16, down: bool, owner: u32) -> isize {
 #[cfg(test)]
 pub(super) fn test_wheel_event(message: u32, delta: i16, mods: u32, owner: u32) -> bool {
     let saved = OWNER.replace(owner);
-    let consumed = message == WM_MOUSEWHEEL && wheel::handle(delta, || mods, || {});
+    let consumed = message == WM_MOUSEWHEEL
+        && wheel::handle(delta, || (mods, u8::from(mods & MOD_WIN != 0)), || {});
     OWNER.set(saved);
     consumed
+}
+
+#[cfg(test)]
+pub(super) fn test_win_key(key: u16, down: bool, send: impl FnMut(&[INPUT]) -> u32) -> bool {
+    let event = KBDLLHOOKSTRUCT {
+        vkCode: u32::from(key),
+        flags: LLKHF_EXTENDED,
+        ..Default::default()
+    };
+    wheel::win_key(&event, down, send)
 }
 
 pub(super) struct Hook {
