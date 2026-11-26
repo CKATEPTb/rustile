@@ -50,8 +50,10 @@ impl State {
             .get()
             .into_iter()
             .chain(queued.iter().copied())
-            .fold(self.settings.get(), |s, cmd| s.changed(cmd).unwrap_or(s));
-        measure.value(settings)
+            .fold(self.settings.borrow().clone(), |s, cmd| {
+                s.changed(cmd).unwrap_or(s)
+            });
+        measure.value(&settings)
     }
 
     fn propose(&self, hwnd: HWND, measure: Measure, value: u8) {
@@ -98,7 +100,7 @@ impl State {
     }
 
     fn enable_arrows(&self, hwnd: HWND, index: usize, m: Measure) {
-        let value = m.value(self.settings.get());
+        let value = m.value(&self.settings.borrow());
         for (offset, enabled) in [value > 0, value < m.max()].into_iter().enumerate() {
             let arrow = unsafe { GetDlgItem(hwnd, (ARROW_BASE + index * 2 + offset) as i32) };
             if !arrow.is_null() {

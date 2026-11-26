@@ -147,15 +147,17 @@ impl Keycaps {
 }
 
 impl ShortcutWindow {
-    pub(super) fn editor_chord(&self, action: Shortcut) -> (u32, Option<u16>) {
+    pub(super) fn editor_chord(&self, action: Shortcut, slot: usize) -> (u32, Option<u16>) {
         if self.selected.get() == action
+            && self.selected_slot.get() == slot
             && let Some(capture) = self.capture.borrow().as_ref()
         {
             return capture.keys.preview();
         }
         self.settings
-            .get()
-            .binding(action)
+            .borrow()
+            .bindings(action)
+            .get(slot)
             .map(|chord| (chord.mods, Some(chord.key)))
             .unwrap_or_default()
     }

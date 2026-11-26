@@ -77,9 +77,9 @@ fn mosaic_switch_smooths_both_curves_on_the_current_row_surface() {
         let left = right - p(34);
         let cy = height / 2;
         let settings = Settings::default();
-        for settings in [settings, settings.changed(Command::Toggle).unwrap()] {
+        for settings in [settings.changed(Command::Toggle).unwrap(), settings] {
             let enabled = settings.enabled;
-            let row = menu::rows(settings, Some(Startup::Off))
+            let row = menu::rows(&settings, Some(Startup::Off))
                 .into_iter()
                 .find(|row| matches!(row.action, Action::Apply(Command::Toggle)))
                 .unwrap();

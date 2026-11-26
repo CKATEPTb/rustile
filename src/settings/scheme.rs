@@ -164,7 +164,7 @@ impl Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Command, Settings, Shortcut, WHEEL_UP};
+    use crate::settings::{Assignment, Command, Settings, Shortcut, WHEEL_UP};
 
     fn loaded(text: &str) -> Settings {
         toml::from_str::<Settings>(text)
@@ -180,7 +180,9 @@ mod tests {
             "[scheme]\nbase = 18\ngrab = 17\ndesktop = 16\nresize = 91\nleft = 72\n\
              [shortcuts]\nmove_down = 'disabled'\nmove_right = { mods = 8, key = 81 }",
         );
-        let changed = previous.changed(Command::ResetShortcut(FocusLeft)).unwrap();
+        let changed = previous
+            .changed(Command::Assign(Assignment::Reset(FocusLeft)))
+            .unwrap();
         let reloaded = loaded(&toml::to_string_pretty(&changed).unwrap());
         assert_eq!(changed, reloaded);
         assert_eq!(
@@ -209,7 +211,6 @@ mod tests {
             (ShrinkLeft, MOD_CONTROL, VK_H),
             (StartResize, MOD_ALT, VK_RETURN),
             (CloseWindow, MOD_ALT, VK_Q),
-            (PreviousDesktopWheel, MOD_ALT, WHEEL_UP),
             (MoveRight, MOD_WIN, VK_Q),
         ] {
             assert_eq!(
@@ -219,6 +220,10 @@ mod tests {
             );
         }
         assert_eq!(reloaded.binding(MoveDown), None);
+        assert!(reloaded.bindings(PreviousDesktop).contains(&Chord {
+            mods: MOD_ALT,
+            key: WHEEL_UP
+        }));
         assert!(reloaded.resize_alias(
             ShrinkLeft,
             Chord {
@@ -243,13 +248,13 @@ mod tests {
     fn resetting_to_a_factory_chord_keeps_its_current_owner_until_confirmed() {
         use Shortcut::*;
         let settings = loaded("scheme.left = 72\nshortcuts.move_up = { mods = 8, key = 37 }");
-        assert!(settings.changed(Command::ResetShortcut(FocusLeft)).is_err());
+        assert!(
+            settings
+                .changed(Command::Assign(Assignment::Reset(FocusLeft)))
+                .is_err()
+        );
         let reassigned = settings
-            .changed(Command::ReassignShortcut(
-                FocusLeft,
-                FocusLeft.default_chord(),
-                MoveUp.into(),
-            ))
+            .transfer_primary(FocusLeft, FocusLeft.default_chord(), MoveUp.into())
             .unwrap();
         let reloaded = loaded(&toml::to_string_pretty(&reassigned).unwrap());
         assert_eq!(reloaded.binding(MoveUp), None);

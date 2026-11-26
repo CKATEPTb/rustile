@@ -93,7 +93,7 @@ impl ResizeHud {
             return;
         };
         let hint = Hint {
-            settings: *settings,
+            settings: settings.clone(),
             dpi,
             work,
             tile,

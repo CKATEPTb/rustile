@@ -1,3 +1,4 @@
+use super::slots::{button, create};
 use super::*;
 use Shortcut::*;
 use windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
@@ -21,8 +22,6 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
             ShrinkRight,
             ShrinkUp,
             ShrinkDown,
-            Confirm,
-            Cancel,
         ],
     ),
     (
@@ -44,24 +43,9 @@ pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
     ),
     (
         "Перенос между рабочими столами",
-        &[
-            MovePreviousDesktop,
-            MovePreviousDesktopAlt,
-            MoveNextDesktop,
-            MoveNextDesktopAlt,
-        ],
+        &[MovePreviousDesktop, MoveNextDesktop],
     ),
-    (
-        "Смена рабочего стола",
-        &[
-            PreviousDesktop,
-            PreviousDesktopAlt,
-            PreviousDesktopWheel,
-            NextDesktop,
-            NextDesktopAlt,
-            NextDesktopWheel,
-        ],
-    ),
+    ("Смена рабочего стола", &[PreviousDesktop, NextDesktop]),
     (
         "Выбор стола по номеру",
         &[
@@ -76,48 +60,6 @@ const READING_ORDER: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
 
 impl ShortcutWindow {
     pub(super) fn create_controls(&self, hwnd: HWND) -> Result<(), String> {
-        let create = |parent: HWND, class, label: &str, id: i32, style, ex| {
-            let window = unsafe {
-                CreateWindowExW(
-                    ex,
-                    class,
-                    wide(label).as_ptr(),
-                    WS_VISIBLE | WS_CHILD | style,
-                    0,
-                    0,
-                    1,
-                    1,
-                    parent,
-                    id as _,
-                    GetModuleHandleW(null()),
-                    null(),
-                )
-            };
-            if window.is_null() {
-                Err(io::Error::last_os_error().to_string())
-            } else {
-                Ok(window)
-            }
-        };
-        let button = |parent: HWND, label: &str, id: i32| -> Result<HWND, String> {
-            // The pencil is the row's primary keyboard action.
-            let tab_stop = if row_action(id).is_some() {
-                0
-            } else {
-                WS_TABSTOP
-            };
-            let hwnd = create(
-                parent,
-                w!("BUTTON"),
-                label,
-                id,
-                tab_stop | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
-                0,
-            )?;
-            unsafe { SetWindowSubclass(hwnd, Some(button_proc), 1, 0) };
-            Ok(hwnd)
-        };
-
         create(hwnd, w!("STATIC"), "", STATUS, 0, 0)?;
         create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW, 0)?;
         let reset_all = button(hwnd, "Сбросить всё", RESET_ALL)?;
@@ -146,20 +88,8 @@ impl ShortcutWindow {
                 null(),
             )
         };
-        let hint = |parent, control: HWND, text: *const u16| {
-            if !tooltip.is_null() {
-                let tool = TTTOOLINFOW {
-                    cbSize: size_of::<TTTOOLINFOW>() as u32,
-                    uFlags: TTF_IDISHWND | TTF_SUBCLASS,
-                    hwnd: parent,
-                    uId: control as usize,
-                    lpszText: text.cast_mut(),
-                    ..Default::default()
-                };
-                unsafe { SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize) };
-            }
-        };
-        hint(hwnd, reset_all, w!("Сбросить все сочетания"));
+        self.tooltip.set(tooltip);
+        self.hint(hwnd, reset_all, w!("Сбросить все сочетания"));
         for i in READING_ORDER {
             let (label, actions) = GROUPS[i];
             create(
@@ -171,19 +101,19 @@ impl ShortcutWindow {
                 0,
             )?;
             for &action in actions {
-                button(view, action.label(), row_id(action))?;
-                let edit = button(
+                self.sync_slots(action, self.settings.borrow().bindings(action).len().max(1))?;
+                let add = button(
                     view,
-                    &format!("Изменить сочетание для «{}» — {label}", action.label()),
-                    EDIT_ROW + action.index() as i32,
+                    &format!("Добавить сочетание для «{}» — {label}", action.label()),
+                    ADD_ROW + action.index() as i32,
                 )?;
                 let reset = button(
                     view,
-                    &format!("Сбросить сочетание для «{}» — {label}", action.label()),
+                    &format!("Сбросить сочетания для «{}» — {label}", action.label()),
                     RESET_ROW + action.index() as i32,
                 )?;
-                hint(view, edit, w!("Изменить сочетание"));
-                hint(view, reset, w!("Вернуть сочетание по умолчанию"));
+                self.hint(view, add, w!("Добавить сочетание"));
+                self.hint(view, reset, w!("Восстановить сочетания действия"));
             }
         }
         Ok(())
@@ -340,11 +270,13 @@ impl ShortcutWindow {
         };
         let margin = self.margin(width);
         let gap = p(24);
-        let button_w = p(28);
+        let button_w = p(25);
+        let tools_gap = p(5);
+        let tools_w = 4 * button_w + tools_gap;
         let column_width = |viewport| (viewport - 2 * margin - (columns - 1) * gap) / columns;
         let header_h = p(34);
         let row_gap = |action| {
-            if matches!(action, GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft) {
+            if matches!(action, GrowLeft | ShrinkLeft | QuickReverseLeft) {
                 p(5)
             } else {
                 0
@@ -353,7 +285,7 @@ impl ShortcutWindow {
         let dc = unsafe { GetDC(view) };
         let measure = |viewport| {
             let col = column_width(viewport);
-            let heights = Shortcut::ALL.map(|a| self.action_row_height(dc, a, col - 2 * button_w));
+            let heights = Shortcut::ALL.map(|a| self.action_row_height(dc, a, col - tools_w));
             let mut starts = [(0, 0); GROUPS.len()];
             let mut ends = [p(12); 3];
             for (order, &i) in READING_ORDER.iter().enumerate() {
@@ -367,7 +299,7 @@ impl ShortcutWindow {
                 let rows: i32 = GROUPS[i]
                     .1
                     .iter()
-                    .map(|&a| heights[a.index()] + row_gap(a))
+                    .map(|&a| heights[a.index()] + row_gap(a) + self.extra_height(a))
                     .sum();
                 ends[column] += header_h + rows + p(15);
             }
@@ -408,23 +340,31 @@ impl ShortcutWindow {
             for &action in actions {
                 y += row_gap(action);
                 let row_h = heights[action.index()];
-                let label_width = col - 2 * button_w;
-                place(self.row(action), x, y, label_width, row_h);
-                place(
-                    child(view, EDIT_ROW + action.index() as i32),
-                    x + label_width,
-                    y,
-                    button_w,
-                    row_h,
-                );
-                place(
-                    child(view, RESET_ROW + action.index() as i32),
-                    x + col - button_w,
-                    y,
-                    button_w,
-                    row_h,
-                );
-                y += row_h;
+                let label_width = col - tools_w;
+                let slots = self.slots.borrow()[action.index()].clone();
+                for (index, slot) in slots.into_iter().enumerate() {
+                    let h = if index == 0 { row_h } else { self.p(27) };
+                    place(slot.row, x, y, label_width, h);
+                    place(slot.edit, x + label_width, y, button_w, h);
+                    place(slot.remove, x + label_width + button_w, y, button_w, h);
+                    if index == 0 {
+                        place(
+                            child(view, ADD_ROW + action.index() as i32),
+                            x + col - 2 * button_w,
+                            y,
+                            button_w,
+                            h,
+                        );
+                        place(
+                            child(view, RESET_ROW + action.index() as i32),
+                            x + col - button_w,
+                            y,
+                            button_w,
+                            h,
+                        );
+                    }
+                    y += h;
+                }
             }
         }
     }
@@ -483,7 +423,7 @@ impl ShortcutWindow {
     }
 }
 
-fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+pub(super) fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe {
         SetWindowPos(
             hwnd,
@@ -547,7 +487,7 @@ unsafe extern "system" fn view_proc(
     }
 }
 
-unsafe extern "system" fn button_proc(
+pub(super) unsafe extern "system" fn button_proc(
     hwnd: HWND,
     msg: u32,
     wp: WPARAM,

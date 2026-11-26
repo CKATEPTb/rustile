@@ -345,15 +345,17 @@ impl Preferences<'_> {
         let next = self.live.changed(command)?;
         // The command-line resize shortcut applies only to this launch unless
         // the user explicitly chooses a new resize binding in the tray.
-        let saved = self.saved.changed_for_save(command, self.live)?;
+        let saved = self.saved.changed_for_save(command, &self.live)?;
         let write = (saved != self.saved)
             .then(|| saved.prepare(self.path))
             .transpose()?;
-        manager.apply_settings_with(next, || write.map_or(Ok(()), |pending| pending.commit()))?;
+        manager.apply_settings_with(next.clone(), || {
+            write.map_or(Ok(()), |pending| pending.commit())
+        })?;
+        hook.set_settings(&next);
+        tray.set_settings(next.clone());
         self.live = next;
         self.saved = saved;
-        hook.set_settings(next);
-        tray.set_settings(next);
         Ok(())
     }
 }
@@ -869,7 +871,7 @@ fn pump(
             if let Err(detail) = &result {
                 // The inline control must display the last accepted value when
                 // the layout rejects a spacing change or the save fails.
-                tray.set_settings(preferences.live);
+                tray.set_settings(preferences.live.clone());
                 if !command.changes_shortcuts() {
                     show_error(detail);
                 }
@@ -924,12 +926,12 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
     };
     let live = match resize_override {
         Some(modifier) => saved.with_resize_override(modifier)?,
-        None => saved,
+        None => saved.clone(),
     };
     // Establish the thread message queue before any callback can post to it.
     unsafe { PeekMessageW(&mut MSG::default(), null_mut(), 0, 0, PM_NOREMOVE) };
     let mut preferences = Preferences {
-        live,
+        live: live.clone(),
         saved,
         path: &path,
     };
@@ -938,8 +940,8 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
         Err(error) => eprintln!("{error}"),
         Ok(_) => println!("Ctrl+C в консоли Rustile — выйти и восстановить окна."),
     }
-    let mut tray = Tray::new(live)?;
-    let keyboard = shortcuts::Hook::install(live)?;
+    let mut tray = Tray::new(live.clone())?;
+    let keyboard = shortcuts::Hook::install(&live)?;
     let hooks = EventHooks::install()?;
     let mut manager = Manager::with_settings(live);
     manager.sync();

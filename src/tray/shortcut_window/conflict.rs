@@ -7,14 +7,13 @@ const CHORD: i32 = 1011;
 impl ShortcutWindow {
     pub(super) fn ask_transfer(
         &self,
-        action: Shortcut,
-        chord: Chord,
-        previous: BindingOwners,
+        assignment: Assignment,
+        conflicts: BindingConflicts,
     ) -> Result<(), String> {
         let owner = self.hwnd.get();
-        let transfer = Command::ReassignShortcut(action, chord, previous);
+        let transfer = Command::Transfer(assignment, conflicts);
         // Validate against the live profile before offering a destructive change.
-        self.settings.get().changed(transfer)?;
+        self.settings.borrow().changed(transfer)?;
         let dialog = unsafe {
             CreateDialogParamW(
                 GetModuleHandleW(null()),
@@ -32,16 +31,26 @@ impl ShortcutWindow {
         }
         self.transfer.set(Some(transfer));
         self.conflict.set(dialog);
-        caption(child(dialog, CHORD), &chord.label());
-        let verb = match previous {
-            BindingOwners::One(_) => "останется",
-            BindingOwners::Both(_, _) => "останутся",
+        let entries: Vec<_> = conflicts.iter().collect();
+        let action = assignment.action();
+        let legends = entries
+            .iter()
+            .map(|(chord, owners)| format!("{} — {}", chord.label(), owners.labels()))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        caption(child(dialog, CHORD), &legends);
+        let message = if let [(_, owners)] = entries.as_slice() {
+            format!(
+                "Переназначить сочетание действию «{}»?\r\nТекущее назначение — {}.",
+                action.label(),
+                owners.labels()
+            )
+        } else {
+            format!(
+                "Восстановить сочетания для «{}»? Они будут сняты с перечисленных действий.",
+                action.label()
+            )
         };
-        let message = format!(
-            "Назначить действию «{}»?\r\n{} {verb} без сочетания.",
-            action.label(),
-            previous.labels(),
-        );
         caption(child(dialog, BODY), &message);
         unsafe {
             let mut owner_rect = RECT::default();
@@ -49,7 +58,9 @@ impl ShortcutWindow {
             GetWindowRect(owner, &mut owner_rect);
             GetWindowRect(dialog, &mut rect);
             let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top + fit_message(dialog, &message);
+            let height = rect.bottom - rect.top
+                + self.fit_conflicts(dialog, conflicts)
+                + fit_message(dialog, &message);
             let mut x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
             let mut y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
             let mut info = MONITORINFO {
@@ -72,6 +83,42 @@ impl ShortcutWindow {
         Ok(())
     }
 
+    fn fit_conflicts(&self, dialog: HWND, conflicts: BindingConflicts) -> i32 {
+        if conflicts.iter().count() == 1 {
+            return 0;
+        }
+        unsafe {
+            let chord = child(dialog, CHORD);
+            let mut bounds = RECT::default();
+            GetClientRect(chord, &mut bounds);
+            let dc = GetDC(chord);
+            let Some(fonts) = self.fonts.borrow().as_ref().map(|f| f.regular) else {
+                ReleaseDC(chord, dc);
+                return 0;
+            };
+            let mut height = 0;
+            for (_, owners) in conflicts.iter() {
+                height +=
+                    self.p(32) + wrapped(dc, fonts, &owners.labels(), bounds.right) + self.p(5);
+            }
+            ReleaseDC(chord, dc);
+            let delta = height - bounds.bottom;
+            SetWindowPos(
+                chord,
+                null_mut(),
+                0,
+                0,
+                bounds.right,
+                height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            for id in [BODY, IDCANCEL, IDOK] {
+                move_down(dialog, id, delta);
+            }
+            delta
+        }
+    }
+
     pub(super) fn finish_transfer(&self, dialog: HWND, accept: bool) {
         let command = self.transfer.take();
         let owner = self.hwnd.get();
@@ -81,7 +128,7 @@ impl ShortcutWindow {
             DestroyWindow(dialog);
             if return_focus {
                 SetActiveWindow(owner);
-                SetFocus(self.row(self.selected.get()));
+                SetFocus(self.selected_row());
             }
         }
         if accept && let Some(command) = command {
@@ -125,21 +172,46 @@ fn fit_message(dialog: HWND, message: &str) -> i32 {
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
         for id in [IDCANCEL, IDOK] {
-            let button = child(dialog, id);
-            let mut pos = RECT::default();
-            GetWindowRect(button, &mut pos);
-            MapWindowPoints(null_mut(), dialog, (&raw mut pos).cast(), 2);
-            SetWindowPos(
-                button,
-                null_mut(),
-                pos.left,
-                pos.top + delta,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+            move_down(dialog, id, delta);
         }
         delta
+    }
+}
+
+fn move_down(dialog: HWND, id: i32, delta: i32) {
+    unsafe {
+        let hwnd = child(dialog, id);
+        let mut pos = RECT::default();
+        GetWindowRect(hwnd, &mut pos);
+        MapWindowPoints(null_mut(), dialog, (&raw mut pos).cast(), 2);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            pos.left,
+            pos.top + delta,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn wrapped(dc: HDC, font: HFONT, text: &str, width: i32) -> i32 {
+    let mut rect = RECT {
+        right: width,
+        ..RECT::default()
+    };
+    unsafe {
+        let old = SelectObject(dc, font);
+        let height = DrawTextW(
+            dc,
+            wide(text).as_ptr(),
+            -1,
+            &mut rect,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+        height
     }
 }
 
@@ -177,15 +249,41 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 paint::fill(dc, &r, colors.background, 0);
                 SetBkMode(dc, TRANSPARENT as i32);
                 if item.CtlID == CHORD as u32 {
-                    if let Some(Command::ReassignShortcut(_, chord, _)) = ui.transfer.get() {
-                        let caps = keycaps::Keycaps::new(
-                            ui,
-                            dc,
-                            fonts,
-                            (chord.mods, Some(chord.key)),
-                            keycaps::Size::Compact,
-                        );
-                        caps.draw(dc, r, colors);
+                    if let Some(Command::Transfer(_, conflicts)) = ui.transfer.get() {
+                        let grouped = conflicts.iter().count() > 1;
+                        let mut top = r.top;
+                        for (chord, owners) in conflicts.iter() {
+                            let bottom = if grouped { top + ui.p(30) } else { r.bottom };
+                            let caps = keycaps::Keycaps::new(
+                                ui,
+                                dc,
+                                fonts,
+                                (chord.mods, Some(chord.key)),
+                                keycaps::Size::Compact,
+                            );
+                            caps.draw(dc, RECT { top, bottom, ..r }, colors);
+                            if grouped {
+                                let name = owners.labels();
+                                top += ui.p(32);
+                                let height = wrapped(dc, fonts.regular, &name, r.right - r.left);
+                                let mut bounds = RECT {
+                                    top,
+                                    bottom: top + height,
+                                    ..r
+                                };
+                                let old = SelectObject(dc, fonts.regular);
+                                SetTextColor(dc, colors.secondary);
+                                DrawTextW(
+                                    dc,
+                                    wide(&name).as_ptr(),
+                                    -1,
+                                    &mut bounds,
+                                    DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
+                                );
+                                SelectObject(dc, old);
+                                top += height + ui.p(5);
+                            }
+                        }
                     }
                     return 1;
                 }

@@ -1304,8 +1304,8 @@ fn move_windows() {
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));
     run(|manager, windows, _| {
-        let settings = manager.settings;
-        let area = super::WorkArea::read().unwrap().tiles(settings);
+        let settings = manager.settings.clone();
+        let area = super::WorkArea::read().unwrap().tiles(settings.padding);
         manager.area = Some(area);
         let id = windows[0];
         assert!(manager.admit(id, None));
@@ -1320,7 +1320,7 @@ fn move_windows() {
         );
         manager.apply();
         settle(manager, 1);
-        let mut tighter = settings;
+        let mut tighter = settings.clone();
         tighter.padding += 1;
         assert!(
             manager
@@ -1330,11 +1330,11 @@ fn move_windows() {
         assert_eq!(manager.settings, settings);
         assert_eq!(frame(id), area);
 
-        let mut paused = settings;
+        let mut paused = settings.clone();
         paused.enabled = false;
         assert!(
             manager
-                .apply_settings_with(paused, || Err("read-only configuration".into()))
+                .apply_settings_with(paused.clone(), || Err("read-only configuration".into()))
                 .is_err()
         );
         assert_eq!(manager.settings, settings);
@@ -1410,7 +1410,7 @@ fn panel_reservations(manager: &mut Manager, windows: [Id; 6], area: Rect) {
         manager.reconcile_in(Some(work));
         settle(manager, 2);
         let (a, b) = (frame(first), frame(second));
-        let expected = work.tiles(manager.settings);
+        let expected = work.tiles(manager.settings.padding);
         assert_eq!((a.x.min(b.x), a.y.min(b.y)), (expected.x, expected.y));
         assert_eq!(
             ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h)),
@@ -1456,7 +1456,7 @@ fn panel_reservations(manager: &mut Manager, windows: [Id; 6], area: Rect) {
     select(manager, DesktopId(2));
     manager.reconcile_in(Some(work));
     settle(manager, 1);
-    assert_eq!(frame(parked), work.tiles(manager.settings));
+    assert_eq!(frame(parked), work.tiles(manager.settings.padding));
     // Let the harness restore all three fixtures on shutdown.
     manager
         .desktops

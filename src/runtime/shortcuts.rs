@@ -133,34 +133,38 @@ struct Routes([Option<KeyRoutes>; INPUT_SLOTS]);
 impl Routes {
     const EMPTY: Self = Self([None; INPUT_SLOTS]);
 
-    fn new(settings: Settings) -> Self {
+    fn new(settings: &Settings) -> Self {
         let mut keys = [None; INPUT_SLOTS];
-        for action in Shortcut::ALL {
-            let id = command_id(action);
-            let Some(chord) = settings.binding(action) else {
+        let bindings: Vec<_> = Shortcut::ALL
+            .into_iter()
+            .flat_map(|action| {
+                settings
+                    .bindings(action)
+                    .into_iter()
+                    .map(move |chord| (action, chord))
+            })
+            .collect();
+        for &(action, chord) in &bindings {
+            if !action.is_resize() {
                 continue;
-            };
+            }
+            let id = command_id(action);
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
-            if action.is_resize() {
-                for mods in 0..16 {
-                    if settings.resize_alias(
-                        action,
-                        Chord {
-                            mods,
-                            key: chord.key,
-                        },
-                    ) {
-                        row.resize[mods as usize] = id;
-                    }
+            for mods in 0..16 {
+                if settings.resize_alias(
+                    action,
+                    Chord {
+                        mods,
+                        key: chord.key,
+                    },
+                ) {
+                    row.resize[mods as usize] = id;
                 }
             }
         }
         // An explicitly assigned modal chord wins over the implicit variants
         // that let a user keep the opener's modifiers held in resize mode.
-        for action in Shortcut::ALL {
-            let Some(chord) = settings.binding(action) else {
-                continue;
-            };
+        for (action, chord) in bindings {
             let row = keys[usize::from(chord.key)].get_or_insert_with(KeyRoutes::default);
             row.bind(action, chord.mods);
         }
@@ -561,10 +565,11 @@ pub(super) struct Hook {
 }
 
 impl Hook {
-    pub(super) fn install(settings: Settings) -> Result<Self, String> {
+    pub(super) fn install(settings: &Settings) -> Result<Self, String> {
         let owner = unsafe { GetCurrentThreadId() };
         let desktop = unsafe { GetThreadDesktop(owner) } as usize;
         let (ready, status) = mpsc::sync_channel(1);
+        let keys = Routes::new(settings);
         let thread = thread::Builder::new()
             .name("rustile-shortcuts".into())
             .spawn(move || {
@@ -577,7 +582,6 @@ impl Hook {
                 let mut message = MSG::default();
                 unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
                 // The first callback must already see the user's assignments.
-                let keys = Routes::new(settings);
                 ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = keys;
                 let module = unsafe { GetModuleHandleW(null()) };
                 let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) };
@@ -619,7 +623,7 @@ impl Hook {
         }
     }
 
-    pub(super) fn set_settings(&self, settings: Settings) {
+    pub(super) fn set_settings(&self, settings: &Settings) {
         let keys = Routes::new(settings);
         let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
         routing.keys = keys;
@@ -643,7 +647,7 @@ impl Drop for Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Command, Modifier};
+    use crate::settings::{Assignment, Command, Modifier};
 
     const WIN_SHIFT: u32 = MOD_WIN | MOD_SHIFT;
 
@@ -672,9 +676,14 @@ mod tests {
         }
 
         fn assign(&mut self, shortcut: Shortcut, mods: u32, key: u16) {
+            let old = self.settings.bindings(shortcut)[0];
             self.settings = self
                 .settings
-                .changed(Command::Shortcut(shortcut, Chord { mods, key }))
+                .changed(Command::Assign(Assignment::Edit(
+                    shortcut,
+                    old,
+                    Chord { mods, key },
+                )))
                 .unwrap();
         }
 
@@ -695,7 +704,7 @@ mod tests {
             active: isize,
         ) -> Action {
             let slot = usize::from(key);
-            let routes = Routes::new(self.settings);
+            let routes = Routes::new(&self.settings);
             let binding = routes.0[slot]
                 .and_then(|route| route.binding(self.state, self.pending, mods, || active));
             let action = self.held[slot].route(down, binding);
@@ -715,7 +724,7 @@ mod tests {
             toml::from_str("[scheme]\nbase = 18\ngrab = 17\ndesktop = 16\nresize = 91\nleft = 72")
                 .unwrap();
         keyboard.assign(Shortcut::MoveRight, MOD_CONTROL, VK_F9);
-        let routes = Routes::new(keyboard.settings);
+        let routes = Routes::new(&keyboard.settings);
         let command = |mode, key: u16, mods| {
             let state = Snapshot {
                 mode,
@@ -784,7 +793,7 @@ mod tests {
     fn desktop_move_targets_the_foreground_in_both_modes_and_leaves_neighboring_chords_alone() {
         let mods = MOD_WIN | MOD_CONTROL | MOD_SHIFT;
         let mut keyboard = Keyboard::new();
-        let routes = Routes::new(keyboard.settings);
+        let routes = Routes::new(&keyboard.settings);
         for mode in [Mode::Normal, Mode::Resize] {
             keyboard.state.mode = mode;
             for (slot, (key, transfer, navigate)) in [
@@ -893,7 +902,7 @@ mod tests {
             let mods = action.default_chord().mods;
             let mut keyboard = Keyboard::new();
             keyboard.assign(action, MOD_ALT, VK_F8);
-            let routes = Routes::new(keyboard.settings);
+            let routes = Routes::new(&keyboard.settings);
             for mode in [Mode::Normal, Mode::Resize] {
                 keyboard.state.mode = mode;
                 let command = |key: u16, mods| {
@@ -939,7 +948,7 @@ mod tests {
     fn window_chords_capture_the_live_foreground_and_global_chords_need_no_target() {
         let mut keyboard = Keyboard::new();
         keyboard.assign(Shortcut::ToggleMosaic, MOD_ALT, VK_F8);
-        let routes = Routes::new(keyboard.settings);
+        let routes = Routes::new(&keyboard.settings);
         for mode in [Mode::Normal, Mode::Resize] {
             keyboard.state.mode = mode;
             let command = |key: u16, mods| {
@@ -976,7 +985,7 @@ mod tests {
     #[test]
     fn navigation_with_no_foreground_posts_the_observed_null_target() {
         let keyboard = Keyboard::new(); // The snapshot still names the outgoing tile.
-        let routes = Routes::new(keyboard.settings);
+        let routes = Routes::new(&keyboard.settings);
         for (slot, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
             let binding = |mods| {
                 routes.0[key as usize]?
@@ -1074,7 +1083,7 @@ mod tests {
             keyboard.settings.enabled = false;
             keyboard.state.target = None;
             let binding = |keyboard: &Keyboard, key: u16, mods, active| {
-                Routes::new(keyboard.settings).0[key as usize]?
+                Routes::new(&keyboard.settings).0[key as usize]?
                     .binding(keyboard.state, Pending::NEW, mods, || active)
                     .map(|b| (b.id, b.target))
             };
@@ -1336,18 +1345,39 @@ mod tests {
         let mut k = Keyboard::new();
         k.assign(Shortcut::StartResize, MOD_ALT, VK_F8);
         k.assign(Shortcut::GrowUp, 0, VK_K);
-        k.assign(Shortcut::Confirm, 0, VK_SPACE);
-        k.assign(Shortcut::Cancel, 0, VK_BACK);
         assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
         assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
         assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
         assert_eq!(k.key(VK_UP, true, MOD_WIN), Action::Consume); // still bound to normal FocusUp
-        assert_eq!(k.key(VK_ESCAPE, true, 0), Action::Pass);
-        assert_eq!(k.key(VK_RETURN, true, 0), Action::Pass);
-        assert_eq!(k.key(VK_SPACE, true, 0), Action::Command(CONFIRM));
+        assert_eq!(k.key(VK_SPACE, true, 0), Action::Pass);
+        assert_eq!(k.key(VK_RETURN, true, 0), Action::Command(CONFIRM));
         assert_eq!(k.key(VK_F8, false, 0), Action::Consume);
         assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
-        assert_eq!(k.key(VK_BACK, true, 0), Action::Command(CANCEL));
+        assert_eq!(k.key(VK_BACK, true, 0), Action::Pass);
+        assert_eq!(k.key(VK_ESCAPE, true, 0), Action::Command(CANCEL));
+    }
+
+    #[test]
+    fn movement_alternatives_route_to_the_same_command_and_can_be_removed_individually() {
+        let mut k = Keyboard::new();
+        let extra = Chord {
+            mods: WIN_SHIFT,
+            key: VK_J,
+        };
+        k.settings = k
+            .settings
+            .changed(Command::Assign(Assignment::Add(Shortcut::MoveLeft, extra)))
+            .unwrap();
+        for key in [VK_LEFT, VK_J] {
+            assert_eq!(k.key(key, true, WIN_SHIFT), Action::Command(MOVE));
+            assert_eq!(k.key(key, false, 0), Action::Consume);
+        }
+        k.settings = k
+            .settings
+            .changed(Command::RemoveShortcut(Shortcut::MoveLeft, extra))
+            .unwrap();
+        assert_eq!(k.key(VK_J, true, WIN_SHIFT), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, true, WIN_SHIFT), Action::Command(MOVE));
     }
 
     #[test]
@@ -1364,30 +1394,33 @@ mod tests {
         assert_eq!(k.key(VK_Q, false, 0), Action::Consume);
         k.settings = k
             .settings
-            .changed(Command::ResetShortcut(Shortcut::MoveLeft))
+            .changed(Command::Assign(Assignment::Reset(Shortcut::MoveLeft)))
             .unwrap();
         assert_eq!(k.key(VK_Q, true, mods), Action::Pass);
         assert_eq!(k.key(VK_LEFT, true, WIN_SHIFT), Action::Command(MOVE));
     }
 
     #[test]
-    fn transferred_resize_action_leaves_no_implicit_shortcuts_in_the_hook() {
+    fn assigning_an_implicit_variant_leaves_the_original_resize_step_available() {
         let mut keyboard = Keyboard::new();
         let chord = Chord {
             mods: MOD_WIN,
             key: VK_LEFT,
         };
+        let edit = Assignment::Edit(
+            Shortcut::ShrinkUp,
+            Shortcut::ShrinkUp.default_chord(),
+            chord,
+        );
+        let conflicts = keyboard.settings.conflicts(edit).unwrap();
+        assert!(!conflicts.is_empty());
         keyboard.settings = keyboard
             .settings
-            .changed(Command::ReassignShortcut(
-                Shortcut::ShrinkUp,
-                chord,
-                Shortcut::GrowLeft.into(),
-            ))
+            .changed(Command::Transfer(edit, conflicts))
             .unwrap();
         keyboard.state.mode = Mode::Resize;
-        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
-        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Command(EXPAND));
+        assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Consume);
         assert_eq!(
             keyboard.key(VK_LEFT, true, MOD_WIN),
             Action::Command(SHRINK + 2)

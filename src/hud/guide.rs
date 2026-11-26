@@ -7,19 +7,16 @@ pub(super) struct Guide {
 pub(super) struct HintRow {
     pub(super) action: String,
     choices: Vec<Chord>,
+    compact_directions: bool,
 }
 
 impl HintRow {
     // Each cap has a separate printed connector. For Shift+any arrow, the
     // repeated modifiers appear just once before the four direction choices.
     pub(super) fn keycaps(&self) -> Vec<(&'static str, String)> {
-        let same_mods = self
-            .choices
-            .windows(2)
-            .all(|pair| pair[0].mods == pair[1].mods);
         let mut caps = Vec::new();
         for (choice, chord) in self.choices.iter().enumerate() {
-            let mods = if choice > 0 && same_mods {
+            let mods = if choice > 0 && self.compact_directions {
                 0
             } else {
                 chord.mods
@@ -59,35 +56,30 @@ impl Guide {
         ] {
             if actions
                 .iter()
-                .all(|&action| settings.binding(action) == Some(action.default_chord()))
+                .all(|&action| settings.bindings(action) == [action.default_chord()])
             {
                 rows.push(HintRow {
                     action: label.into(),
                     choices: actions.into_iter().map(Shortcut::default_chord).collect(),
+                    compact_directions: true,
                 });
             } else {
                 for action in actions {
-                    if let Some(chord) = settings.binding(action) {
+                    let choices = settings.bindings(action);
+                    if !choices.is_empty() {
                         rows.push(HintRow {
                             action: action.label().into(),
-                            choices: vec![chord],
+                            choices,
+                            compact_directions: false,
                         });
                     }
                 }
             }
         }
-        let choices: Vec<_> = [Confirm, Cancel]
-            .into_iter()
-            .filter_map(|action| settings.binding(action))
-            .collect();
         rows.push(HintRow {
-            action: if choices.is_empty() {
-                "Для выхода выберите другое окно"
-            } else {
-                "Выйти из режима"
-            }
-            .into(),
-            choices,
+            action: "Выйти из режима".into(),
+            choices: vec![Confirm.default_chord(), Cancel.default_chord()],
+            compact_directions: false,
         });
         Self { rows }
     }
@@ -144,6 +136,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_alternatives_show_each_complete_chord() {
+        use crate::settings::{Assignment, Command};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_SHIFT, VK_J};
+        let action = Shortcut::ShrinkLeft;
+        let settings = Settings::default()
+            .changed(Command::Assign(Assignment::Add(
+                action,
+                Chord {
+                    mods: MOD_SHIFT,
+                    key: VK_J,
+                },
+            )))
+            .unwrap();
+        let guide = Guide::new(&settings);
+        let row = guide
+            .rows
+            .iter()
+            .find(|row| row.action == action.label())
+            .unwrap();
+        assert_caps(
+            row,
+            &[("", "Shift"), ("+", "Left"), ("/", "Shift"), ("+", "J")],
+        );
+        assert!(guide.accessible_text().contains("Shift+Left или Shift+J"));
+    }
+
+    #[test]
     fn custom_bindings_name_their_steps_and_omit_disabled_keys() {
         let settings = toml::from_str(
             "shortcuts.grow_left = { mods = 0, key = 117 }\n\
@@ -159,9 +178,9 @@ mod tests {
         assert_caps(&guide.rows[0], &[("", "F6")]);
         assert_eq!(guide.rows[3].action, Shortcut::ShrinkLeft.label());
         assert_caps(&guide.rows[3], &[("", "Shift"), ("+", "F6")]);
-        assert!(guide.rows.last().unwrap().choices.is_empty());
+        assert_caps(guide.rows.last().unwrap(), &[("", "Enter"), ("/", "Esc")]);
         let text = guide.accessible_text();
-        assert!(text.contains("другое окно"));
-        assert!(!text.contains(Shortcut::GrowUp.label()) && !text.contains("Esc"));
+        assert!(text.contains("Enter или Esc"));
+        assert!(!text.contains(Shortcut::GrowUp.label()));
     }
 }

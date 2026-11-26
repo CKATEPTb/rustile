@@ -349,8 +349,8 @@ pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area
 
     // A workspace command also works while tiling is paused; resume computes
     // the destination layout from the new membership without recapturing it.
-    let settings = manager.settings;
-    let mut paused = settings;
+    let settings = manager.settings.clone();
+    let mut paused = settings.clone();
     paused.enabled = false;
     manager.apply_settings(paused).unwrap();
     let before = windows.map(frame);
@@ -472,7 +472,7 @@ pub(super) fn fullscreen_transfer(manager: &mut Manager, windows: [Id; 6], _area
     let fullscreen = appearance();
     let homes = |home| [(game, home), (left, A), (right, B)];
     for (source, destination, enabled) in [(A, B, true), (B, A, false)] {
-        let mut settings = manager.settings;
+        let mut settings = manager.settings.clone();
         settings.enabled = enabled;
         manager.apply_settings(settings).unwrap();
         select_desktop(manager, &homes(source), source, None);

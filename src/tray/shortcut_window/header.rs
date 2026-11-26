@@ -21,7 +21,7 @@ impl ShortcutWindow {
         let colors = self.colors.get();
         let action = self.selected.get();
         let recording = self.recording(action);
-        let chord = self.editor_chord(action);
+        let chord = self.editor_chord(action, self.selected_slot.get());
         let category = if recording {
             "Запись сочетания"
         } else {

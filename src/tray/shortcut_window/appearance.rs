@@ -29,16 +29,18 @@ impl ShortcutWindow {
             && unsafe {
                 GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == item.hwndItem
             };
-        let action = row_action(id);
-        let selected = action == Some(self.selected.get());
-        let icon = if edit_action(id).is_some() {
-            Some("\u{e70f}")
-        } else if reset_action(id).is_some() {
-            Some("\u{e777}")
-        } else {
-            None
-        };
-        let recording = action.is_some_and(|a| self.recording(a));
+        let control = row_control(id);
+        let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
+        let action = control.and_then(|(kind, a)| (kind == Control::Row).then_some(a));
+        let selected = action == Some(self.selected.get()) && slot == self.selected_slot.get();
+        let icon = control.and_then(|(kind, _)| match kind {
+            Control::Edit => Some("\u{e70f}"),
+            Control::Remove => Some("\u{e711}"),
+            Control::Add => Some("\u{e710}"),
+            Control::Reset => Some("\u{e777}"),
+            Control::Row => None,
+        });
+        let recording = selected && self.capture.borrow().is_some();
         let highlighted = colors.high_contrast && (selected || hovered || pressed);
         let surface = if highlighted {
             colors.hover
@@ -97,6 +99,10 @@ impl ShortcutWindow {
                 fonts.symbol,
                 if disabled {
                     colors.disabled
+                } else if control.is_some_and(|c| c.0 == Control::Remove)
+                    && !(hovered || pressed || focused || colors.high_contrast)
+                {
+                    blend(colors.secondary, colors.background, 28)
                 } else {
                     row_colors.secondary
                 },
@@ -156,7 +162,7 @@ impl ShortcutWindow {
         let Some(fonts) = fonts.as_ref() else {
             return self.p(32);
         };
-        let binding = self.settings.get().binding(action);
+        let binding = self.settings.borrow().bindings(action).first().copied();
         let width = if let Some(chord) = binding {
             keycaps::Keycaps::new(
                 self,
@@ -186,6 +192,7 @@ impl ShortcutWindow {
         colors: Colors,
     ) {
         let dc = item.hDC;
+        let slot = unsafe { GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) } as usize;
         let mut label = item.rcItem;
         label.left += self.p(11);
         label.right -= self.p(5);
@@ -194,7 +201,7 @@ impl ShortcutWindow {
             self,
             dc,
             fonts,
-            self.editor_chord(action),
+            self.editor_chord(action, slot),
             keycaps::Size::Row,
         );
         let placeholder = if recording {
@@ -208,7 +215,10 @@ impl ShortcutWindow {
         } else {
             width
         };
-        if label.bottom - label.top >= self.p(44) {
+        if slot > 0 {
+            value.left = (value.right - visible_width).max(value.left + self.p(22));
+            label.right = value.left - self.p(5);
+        } else if label.bottom - label.top >= self.p(44) {
             label.bottom = label.top + self.p(22);
             value.top = label.bottom;
             value.bottom -= self.p(2);
@@ -219,10 +229,22 @@ impl ShortcutWindow {
         paint::text(
             dc,
             label,
-            action.label(),
-            fonts.regular,
-            colors.text,
-            DT_LEFT | DT_END_ELLIPSIS,
+            if slot == 0 { action.label() } else { "или" },
+            if slot == 0 {
+                fonts.regular
+            } else {
+                fonts.small
+            },
+            if slot == 0 {
+                colors.text
+            } else {
+                colors.secondary
+            },
+            if slot == 0 {
+                DT_LEFT | DT_END_ELLIPSIS
+            } else {
+                DT_RIGHT
+            },
         );
         if width == 0 {
             paint::text(

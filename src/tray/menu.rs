@@ -17,7 +17,7 @@ impl Measure {
         }
     }
 
-    pub fn value(self, settings: Settings) -> u8 {
+    pub fn value(self, settings: &Settings) -> u8 {
         match self {
             Self::Outline => settings.outline,
             Self::Gap => settings.gap,
@@ -98,7 +98,7 @@ impl Row {
     }
 }
 
-pub(super) fn rows(s: Settings, startup: Option<Startup>) -> Vec<Row> {
+pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
     let mut rows = vec![Row::new("Rustile", "", Action::None)];
     rows.push(
         Row::new("Мозаика", "\u{e8a9}", Action::Apply(Command::Toggle)).switch(
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn unreadable_startup_setting_has_no_toggle_or_admin_action() {
-        let rows = rows(Settings::default(), None);
+        let rows = rows(&Settings::default(), None);
         let launch = rows
             .iter()
             .find(|row| row.label == "Запускать при входе в Windows")

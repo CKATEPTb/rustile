@@ -113,9 +113,9 @@ impl WorkArea {
         })
     }
 
-    fn tiles(self, settings: Settings) -> Rect {
+    fn tiles(self, padding: u8) -> Rect {
         self.bounds
-            .inset_for_tiles(native::scaled_spacing(settings.padding, self.dpi))
+            .inset_for_tiles(native::scaled_spacing(padding, self.dpi))
     }
 }
 
@@ -150,7 +150,6 @@ impl Manager {
     pub fn with_settings(settings: Settings) -> Self {
         let work_area = WorkArea::read();
         Self {
-            settings,
             desktops: Desktops::new(),
             current: None,
             workspace: Workspace::new(native::spacing_px(settings.gap)),
@@ -162,7 +161,8 @@ impl Manager {
             pending_app_cloaks: HashSet::new(),
             needs_desktop_retry: false,
             work_area,
-            area: work_area.map(|work| work.tiles(settings)),
+            area: work_area.map(|work| work.tiles(settings.padding)),
+            settings,
             dragging: None,
             session: None,
             hud: ResizeHud::default(),
@@ -328,7 +328,7 @@ impl Manager {
         let dpi_changed = self
             .work_area
             .is_some_and(|previous| previous.dpi != work.dpi);
-        let area = work.tiles(self.settings);
+        let area = work.tiles(self.settings.padding);
         let gap = native::scaled_spacing(self.settings.gap, work.dpi);
         let windows = &mut self.windows;
         for window in windows.values_mut() {
@@ -543,13 +543,13 @@ impl Manager {
         updated: Settings,
         persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        let previous = self.settings;
+        let previous = &self.settings;
         let resuming = updated.enabled && !previous.enabled;
         let geometry = updated.gap != previous.gap || updated.padding != previous.padding;
         let proposed = if geometry {
             let work = WorkArea::read()
                 .ok_or_else(|| "Windows не сообщила размер рабочей области.".to_owned())?;
-            let area = work.tiles(updated);
+            let area = work.tiles(updated.padding);
             // Validate the whole layout before changing the live model or any HWND.
             let gap = native::scaled_spacing(updated.gap, work.dpi);
             let refit = |layout: &Layout| {
@@ -584,10 +584,10 @@ impl Manager {
             }
         }
         self.settings = updated;
-        if geometry || !updated.enabled {
+        if geometry || !self.settings.enabled {
             self.finish_mode();
         }
-        if !updated.enabled {
+        if !self.settings.enabled {
             self.dragging = None;
             self.transfer_anchor = None;
             self.unconfirmed_focus.set(None);

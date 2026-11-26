@@ -59,7 +59,7 @@ pub(crate) fn load_app_icon(width: i32, height: i32) -> HICON {
 }
 
 struct State {
-    settings: Cell<Settings>,
+    settings: RefCell<Settings>,
     startup: Cell<Option<Startup>>,
     startup_pending: Cell<bool>,
     commands: RefCell<VecDeque<Command>>,
@@ -117,7 +117,7 @@ impl Tray {
                 return Err(format!("Значок Rustile: {}", io::Error::last_os_error()));
             }
             let state = Box::new(State {
-                settings: Cell::new(settings),
+                settings: RefCell::new(settings),
                 startup: Cell::new(None),
                 startup_pending: Cell::new(false),
                 commands: RefCell::default(),
@@ -169,9 +169,10 @@ impl Tray {
 
     pub fn set_settings(&self, settings: Settings) {
         self.state.applying.set(None);
-        self.state.shortcuts.set_settings(settings);
+        self.state.shortcuts.set_settings(settings.clone());
+        let enabled = settings.enabled;
         let previous = self.state.settings.replace(settings);
-        if previous.enabled != settings.enabled && self.state.registered.get() {
+        if previous.enabled != enabled && self.state.registered.get() {
             let mut data = self.state.icon_data(self.hwnd);
             data.uFlags = NIF_TIP | NIF_SHOWTIP;
             if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
@@ -325,7 +326,7 @@ impl Drop for State {
 
 impl State {
     fn menu_rows(&self) -> Vec<Row> {
-        let mut rows = menu::rows(self.settings.get(), self.startup.get());
+        let mut rows = menu::rows(&self.settings.borrow(), self.startup.get());
         if self.startup_pending.get() {
             for row in &mut rows {
                 if matches!(row.action, Action::Apply(Command::SetStartup(_))) {
@@ -346,7 +347,7 @@ impl State {
             uCallbackMessage: CALLBACK,
             ..Default::default()
         };
-        let tip = if self.settings.get().enabled {
+        let tip = if self.settings.borrow().enabled {
             "Rustile — мозаика включена"
         } else {
             "Rustile — мозаика выключена"
@@ -658,10 +659,8 @@ impl State {
             Some(Action::Adjust(_)) => self.start_edit(hwnd, index),
             Some(Action::EditShortcuts) => {
                 self.hide(hwnd, false);
-                if let Err(detail) =
-                    self.shortcuts
-                        .show(hwnd, self.anchor.get(), self.settings.get())
-                {
+                let settings = self.settings.borrow().clone();
+                if let Err(detail) = self.shortcuts.show(hwnd, self.anchor.get(), settings) {
                     let text: Vec<_> = detail.encode_utf16().chain([0]).collect();
                     unsafe {
                         MessageBoxW(hwnd, text.as_ptr(), w!("Rustile"), MB_OK | MB_ICONWARNING)

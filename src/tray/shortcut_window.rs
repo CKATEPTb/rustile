@@ -3,6 +3,7 @@ mod capture;
 mod conflict;
 mod header;
 mod keycaps;
+mod slots;
 mod view;
 
 use std::{
@@ -24,7 +25,7 @@ use super::{
     paint::{self, Colors, Fonts},
     scale,
 };
-use crate::settings::{BindingOwners, Chord, Command, Settings, Shortcut};
+use crate::settings::{Assignment, BindingConflicts, Chord, Command, Settings, Shortcut};
 
 const CLASS: *const u16 = w!("Rustile.Shortcuts");
 const TITLE: *const u16 = w!("Горячие клавиши — Rustile");
@@ -37,6 +38,40 @@ const SECTION: i32 = 520;
 const ROW: i32 = 1000;
 const RESET_ROW: i32 = 1100;
 const EDIT_ROW: i32 = 1200;
+const ADD_ROW: i32 = 1300;
+const REMOVE_ROW: i32 = 1400;
+const ALT_ROW: i32 = 2000;
+const ALT_EDIT: i32 = 2100;
+const ALT_REMOVE: i32 = 2200;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Row,
+    Edit,
+    Remove,
+    Add,
+    Reset,
+}
+
+fn row_control(id: i32) -> Option<(Control, Shortcut)> {
+    let kind = match id / 100 * 100 {
+        ROW | ALT_ROW => Control::Row,
+        EDIT_ROW | ALT_EDIT => Control::Edit,
+        REMOVE_ROW | ALT_REMOVE => Control::Remove,
+        ADD_ROW => Control::Add,
+        RESET_ROW => Control::Reset,
+        _ => return None,
+    };
+    let action = *Shortcut::ALL.get((id % 100) as usize)?;
+    action.is_editable().then_some((kind, action))
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    row: HWND,
+    edit: HWND,
+    remove: HWND,
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -50,31 +85,15 @@ fn caption(hwnd: HWND, s: &str) {
     unsafe { SetWindowTextW(hwnd, wide(s).as_ptr()) };
 }
 
-fn row_id(action: Shortcut) -> i32 {
-    ROW + action.index() as i32
-}
-
-fn row_action(id: i32) -> Option<Shortcut> {
-    Shortcut::ALL.get(id.checked_sub(ROW)? as usize).copied()
-}
-
-fn reset_action(id: i32) -> Option<Shortcut> {
-    Shortcut::ALL
-        .get(id.checked_sub(RESET_ROW)? as usize)
-        .copied()
-}
-
-fn edit_action(id: i32) -> Option<Shortcut> {
-    Shortcut::ALL
-        .get(id.checked_sub(EDIT_ROW)? as usize)
-        .copied()
-}
-
 pub(super) struct ShortcutWindow {
     hwnd: Cell<HWND>,
     owner: Cell<HWND>,
     dpi: Cell<u32>,
-    settings: Cell<Settings>,
+    settings: RefCell<Settings>,
+    slots: RefCell<[Vec<Slot>; Shortcut::ALL.len()]>,
+    tooltip: Cell<HWND>,
+    selected_slot: Cell<usize>,
+    after_save: Cell<Option<(Shortcut, Chord)>>,
     selected: Cell<Shortcut>,
     command: Cell<Option<Command>>,
     saving: Cell<bool>,
@@ -92,7 +111,11 @@ impl Default for ShortcutWindow {
             hwnd: Cell::default(),
             owner: Cell::default(),
             dpi: Cell::new(96),
-            settings: Cell::new(Settings::default()),
+            settings: RefCell::default(),
+            slots: RefCell::new(std::array::from_fn(|_| Vec::new())),
+            tooltip: Cell::default(),
+            selected_slot: Cell::new(0),
+            after_save: Cell::default(),
             selected: Cell::new(Shortcut::MoveLeft),
             command: Cell::default(),
             saving: Cell::new(false),
@@ -188,8 +211,8 @@ impl ShortcutWindow {
                 }
                 self.update_fonts(hwnd);
                 self.apply_theme(hwnd);
-                self.layout(hwnd);
                 self.update_rows();
+                self.layout(hwnd);
             }
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -204,15 +227,42 @@ impl ShortcutWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             );
             SetForegroundWindow(hwnd);
-            SetFocus(self.row(self.selected.get()));
+            SetFocus(self.selected_row());
         }
         Ok(())
     }
 
     pub(super) fn set_settings(&self, settings: Settings) {
-        if self.settings.replace(settings) != settings && !self.hwnd.get().is_null() {
+        if *self.settings.borrow() == settings {
+            return;
+        }
+        self.settings.replace(settings);
+        let hwnd = self.hwnd.get();
+        if !hwnd.is_null() {
+            self.end_capture();
+            if let Some((action, chord)) = self.after_save.take()
+                && action == self.selected.get()
+                && let Some(index) = self
+                    .settings
+                    .borrow()
+                    .bindings(action)
+                    .iter()
+                    .position(|&c| c == chord)
+            {
+                self.selected_slot.set(index);
+            }
             self.update_rows();
-            self.layout(self.hwnd.get());
+            self.layout(hwnd);
+            let foreground = unsafe { GetForegroundWindow() };
+            if foreground == hwnd || foreground.is_null() {
+                let focus = unsafe { GetFocus() };
+                if unsafe { IsChild(hwnd, focus) } != 0
+                    && row_control(unsafe { GetDlgCtrlID(focus) })
+                        .is_some_and(|(kind, _)| kind == Control::Row)
+                {
+                    unsafe { SetFocus(self.selected_row()) };
+                }
+            }
         }
     }
 
@@ -222,6 +272,7 @@ impl ShortcutWindow {
 
     pub(super) fn result(&self, error: Option<&str>) {
         self.saving.set(false);
+        self.after_save.set(None);
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
             self.update_rows();
@@ -260,18 +311,18 @@ impl ShortcutWindow {
                 return true;
             }
             let id = unsafe { GetDlgCtrlID(msg.hwnd) };
-            if let Some(action) = row_action(id).or_else(|| edit_action(id))
-                && matches!(key, VK_RETURN | VK_F2)
-            {
-                // Start on release so the activation key cannot bind itself.
-                if !down {
-                    self.start_capture(action);
+            if let Some((control, action)) = row_control(id) {
+                let slot = unsafe { GetWindowLongPtrW(msg.hwnd, GWLP_USERDATA) as usize };
+                if matches!(control, Control::Edit | Control::Row)
+                    && matches!(key, VK_RETURN | VK_F2)
+                {
+                    if !down {
+                        self.start_capture(action, slot, false);
+                    }
+                    return true;
                 }
-                return true;
             }
-            if key == VK_RETURN && (reset_action(id).is_some() || id == RESET_ALL) {
-                // Reset returns focus to the row. Consume the release here
-                // before it could be taken for a request to record a new chord.
+            if key == VK_RETURN && (row_control(id).is_some() || id == RESET_ALL) {
                 if !down {
                     unsafe { SendMessageW(msg.hwnd, BM_CLICK, 0, 0) };
                 }
@@ -288,93 +339,138 @@ impl ShortcutWindow {
         scale(dip, self.dpi.get())
     }
 
-    fn row(&self, action: Shortcut) -> HWND {
-        child(child(self.hwnd.get(), VIEW), row_id(action))
-    }
-
     fn recording(&self, action: Shortcut) -> bool {
         self.selected.get() == action && self.capture.borrow().is_some()
     }
 
-    fn binding_text(&self, action: Shortcut) -> String {
-        if self.selected.get() == action
-            && let Some(capture) = self.capture.borrow().as_ref()
-        {
-            return capture.keys.label();
-        }
-        self.settings
-            .get()
-            .binding(action)
-            .map(|chord| chord.label())
-            .unwrap_or_else(|| "Не назначено".into())
-    }
-
     fn update_row(&self, action: Shortcut) {
-        let row = self.row(action);
-        let name = format!("{}, {}", action.label(), self.binding_text(action));
-        caption(row, &name);
-        unsafe { InvalidateRect(row, null(), 0) };
-        if action == self.selected.get() {
-            let preview = child(self.hwnd.get(), PREVIEW);
-            caption(preview, &name);
-            unsafe { InvalidateRect(preview, null(), 0) };
+        let bindings = self.settings.borrow().bindings(action);
+        let selected = self.selected.get() == action;
+        let recording = selected && self.capture.borrow().is_some();
+        let pos = self.selected_slot.get();
+        let count = if recording {
+            bindings.len().max(pos + 1)
+        } else {
+            bindings.len()
+        }
+        .max(1);
+        if selected && pos >= count {
+            self.selected_slot.set(count - 1);
+        }
+        if let Err(error) = self.sync_slots(action, count) {
+            self.set_status(&error);
+            return;
+        }
+        let mut legends = bindings
+            .iter()
+            .map(|chord| chord.label())
+            .collect::<Vec<_>>();
+        legends.resize(count, "Не назначено".into());
+        if recording && let Some(rec) = self.capture.borrow().as_ref() {
+            legends[pos] = rec.keys.label();
+        }
+        let slots = self.slots.borrow()[action.index()].clone();
+        let category = view::GROUPS
+            .iter()
+            .find(|(_, actions)| actions.contains(&action))
+            .map_or("", |g| g.0);
+        let base = format!("{}, {}", action.label(), legends.join(" или "));
+        for (i, (&slot, value)) in slots.iter().zip(&legends).enumerate() {
+            let detail = format!("{}, {}", action.label(), value);
+            caption(slot.row, if i == 0 { &base } else { &detail });
+            caption(
+                slot.edit,
+                &format!("Изменить {value} для «{}» — {category}", action.label()),
+            );
+            caption(
+                slot.remove,
+                &format!("Удалить {value} для «{}» — {category}", action.label()),
+            );
+            unsafe {
+                EnableWindow(slot.edit, i32::from(!self.saving.get()));
+                EnableWindow(
+                    slot.remove,
+                    i32::from(!self.saving.get() && i < bindings.len()),
+                );
+                InvalidateRect(slot.row, null(), 0);
+            }
+            if selected && i == self.selected_slot.get() {
+                let preview = child(self.hwnd.get(), PREVIEW);
+                caption(preview, &detail);
+                unsafe { InvalidateRect(preview, null(), 0) };
+            }
+        }
+        let view = child(self.hwnd.get(), VIEW);
+        unsafe {
+            EnableWindow(
+                child(view, ADD_ROW + action.index() as i32),
+                i32::from(!self.saving.get()),
+            );
+            EnableWindow(
+                child(view, RESET_ROW + action.index() as i32),
+                i32::from(!self.saving.get() && bindings != action.factory_bindings()),
+            );
         }
     }
 
     fn update_rows(&self) {
-        let hwnd = self.hwnd.get();
-        let view = child(hwnd, VIEW);
-        let settings = self.settings.get();
-        for action in Shortcut::ALL {
-            self.update_row(action);
-            let changed = settings.binding(action) != Some(action.default_chord());
-            unsafe {
-                EnableWindow(
-                    child(view, EDIT_ROW + action.index() as i32),
-                    i32::from(!self.saving.get()),
-                );
-                EnableWindow(
-                    child(view, RESET_ROW + action.index() as i32),
-                    (changed && !self.saving.get()) as i32,
-                )
-            };
+        for (_, actions) in view::GROUPS {
+            for &action in actions {
+                self.update_row(action);
+            }
         }
-        // Profiles in older files can differ even when individual overrides
-        // happen to reproduce all factory chords.
+        let settings = self.settings.borrow();
         let can_reset = settings
             .changed(Command::ResetShortcuts)
-            .is_ok_and(|s| s != settings);
+            .is_ok_and(|next| next != *settings);
         unsafe {
             EnableWindow(
-                child(hwnd, RESET_ALL),
-                (can_reset && !self.saving.get()) as i32,
-            )
-        };
+                child(self.hwnd.get(), RESET_ALL),
+                i32::from(can_reset && !self.saving.get()),
+            );
+        }
     }
 
-    fn select(&self, action: Shortcut) {
+    fn select(&self, action: Shortcut, slot: usize) {
         let old = self.selected.get();
-        if old != action {
+        if old != action || self.selected_slot.get() != slot {
             self.end_capture();
             self.selected.set(action);
+            self.selected_slot.set(slot);
             self.update_row(action);
-            unsafe {
-                InvalidateRect(self.row(old), null(), 0);
+            if old != action {
+                for slot in &self.slots.borrow()[old.index()] {
+                    unsafe { InvalidateRect(slot.row, null(), 0) };
+                }
             }
             self.set_status("");
         }
     }
 
-    fn start_capture(&self, action: Shortcut) {
-        if self.saving.get() || !self.conflict.get().is_null() || self.recording(action) {
+    fn start_capture(&self, action: Shortcut, index: usize, append: bool) {
+        if self.saving.get() || !self.conflict.get().is_null() {
             return;
         }
-        self.select(action);
-        unsafe { SetFocus(self.row(action)) };
-        match capture::Capture::start(self.hwnd.get()) {
+        if self.recording(action) && self.selected_slot.get() == index {
+            return;
+        }
+        self.end_capture();
+        let bindings = self.settings.borrow().bindings(action);
+        let slot = if append {
+            bindings.len()
+        } else {
+            index.min(bindings.len())
+        };
+        let original = bindings.get(slot).copied();
+        self.select(action, slot.min(bindings.len().saturating_sub(1)));
+        match capture::Capture::start(self.hwnd.get(), original) {
             Ok(capture) => {
+                self.selected_slot.set(slot);
                 self.capture.replace(Some(capture));
                 self.update_row(action);
+                self.layout(self.hwnd.get());
+                unsafe { SetFocus(self.selected_row()) };
+                self.reveal_row(self.hwnd.get(), self.selected_row());
                 self.set_status("");
             }
             Err(e) => self.result(Some(&e)),
@@ -384,6 +480,7 @@ impl ShortcutWindow {
     fn end_capture(&self) {
         if self.capture.take().is_some() {
             self.update_row(self.selected.get());
+            self.layout(self.hwnd.get());
             self.set_status("");
         }
     }
@@ -407,8 +504,13 @@ impl ShortcutWindow {
                 ));
             }
             Some(Event::Complete(chord)) => {
+                let original = self.capture.borrow().as_ref().and_then(|rec| rec.original);
                 self.end_capture();
-                self.submit(Command::Shortcut(action, chord));
+                let assignment = match original {
+                    Some(old) => Assignment::Edit(action, old, chord),
+                    None => Assignment::Add(action, chord),
+                };
+                self.submit(Command::Assign(assignment));
             }
         }
     }
@@ -418,25 +520,38 @@ impl ShortcutWindow {
             return;
         }
         self.end_capture();
-        let settings = self.settings.get();
-        let assignment = match command {
-            Command::Shortcut(action, chord) => Some((action, chord)),
-            Command::ResetShortcut(action) => Some((action, action.default_chord())),
-            _ => None,
-        };
-        if let Some((action, chord)) = assignment
-            && settings.binding(action) != Some(chord)
-            && let Some(previous) = settings.conflict(action, chord)
-        {
-            if let Err(error) = self.ask_transfer(action, chord, previous) {
-                self.result(Some(&error));
+        let settings = self.settings.borrow().clone();
+        if let Command::Assign(assignment) = command {
+            match settings.conflicts(assignment) {
+                Ok(owners) if !owners.is_empty() => {
+                    if let Err(error) = self.ask_transfer(assignment, owners) {
+                        self.result(Some(&error));
+                    }
+                    return;
+                }
+                Err(error) => {
+                    self.result(Some(&error));
+                    return;
+                }
+                _ => {}
             }
-            return;
         }
         match settings.changed(command) {
             Err(e) => self.result(Some(&e)),
             Ok(next) if next == settings => {}
             Ok(_) => {
+                let target = match command {
+                    Command::Assign(assignment) | Command::Transfer(assignment, _) => {
+                        match assignment {
+                            Assignment::Add(action, chord) | Assignment::Edit(action, _, chord) => {
+                                Some((action, chord))
+                            }
+                            Assignment::Reset(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                self.after_save.set(target);
                 self.saving.set(true);
                 self.command.set(Some(command));
                 self.update_rows();
@@ -517,28 +632,34 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
                 let event = (wp >> 16) as u32;
-                if let Some(action) = row_action(id) {
-                    if event == BN_CLICKED {
-                        ui.select(action);
-                    } else if event == BN_SETFOCUS {
-                        ui.select(action);
+                if let Some((control, action)) = row_control(id) {
+                    let pos = GetWindowLongPtrW(lp as HWND, GWLP_USERDATA) as usize;
+                    if event == BN_SETFOCUS {
+                        if control != Control::Row {
+                            ui.end_capture();
+                        }
+                        ui.select(action, pos);
                         ui.reveal_row(hwnd, lp as HWND);
-                    }
-                } else if let Some(action) = edit_action(id).or_else(|| reset_action(id)) {
-                    if event == BN_CLICKED && edit_action(id).is_some() {
-                        ui.start_capture(action);
                     } else if event == BN_CLICKED {
-                        ui.select(action);
-                        SetFocus(ui.row(action));
-                        ui.submit(Command::ResetShortcut(action));
-                    } else if event == BN_SETFOCUS {
-                        ui.end_capture();
-                        ui.select(action);
-                        ui.reveal_row(hwnd, lp as HWND);
+                        match control {
+                            Control::Row => ui.select(action, pos),
+                            Control::Edit => ui.start_capture(action, pos, false),
+                            Control::Add => ui.start_capture(action, pos, true),
+                            Control::Remove | Control::Reset => {
+                                ui.select(action, pos);
+                                SetFocus(ui.selected_row());
+                                let old = ui.settings.borrow().bindings(action).get(pos).copied();
+                                if control == Control::Reset {
+                                    ui.submit(Command::Assign(Assignment::Reset(action)));
+                                } else if let Some(chord) = old {
+                                    ui.submit(Command::RemoveShortcut(action, chord));
+                                }
+                            }
+                        }
                     }
                 } else if id == RESET_ALL {
                     if event == BN_CLICKED {
-                        SetFocus(ui.row(ui.selected.get()));
+                        SetFocus(ui.selected_row());
                         ui.submit(Command::ResetShortcuts);
                     } else if event == BN_SETFOCUS {
                         ui.end_capture();
@@ -591,6 +712,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_NCDESTROY => {
                 ui.capture.take();
+                ui.slots.borrow_mut().iter_mut().for_each(Vec::clear);
+                ui.tooltip.set(null_mut());
+                ui.after_save.set(None);
+                ui.selected_slot.set(0);
                 ui.hwnd.set(null_mut());
                 ui.scroll.set(0);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

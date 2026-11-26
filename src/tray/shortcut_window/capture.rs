@@ -11,6 +11,7 @@ thread_local! {
 }
 
 pub(super) struct Capture {
+    pub(super) original: Option<Chord>,
     keyboard: HHOOK,
     mouse: HHOOK,
     pub(super) generation: usize,
@@ -18,7 +19,7 @@ pub(super) struct Capture {
 }
 
 impl Capture {
-    pub(super) fn start(hwnd: HWND) -> Result<Self, String> {
+    pub(super) fn start(hwnd: HWND, original: Option<Chord>) -> Result<Self, String> {
         // A modifier can already be held when recording starts.
         let held = [
             VK_LCONTROL,
@@ -54,6 +55,7 @@ impl Capture {
         });
         DELIVERY_FAILED.set(false);
         Ok(Self {
+            original,
             keyboard,
             mouse,
             generation,

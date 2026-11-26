@@ -2,8 +2,10 @@ mod bindings;
 mod scheme;
 
 use crate::profile_io;
-use bindings::Overrides;
-pub(crate) use bindings::{BindingOwners, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
+#[cfg(test)]
+pub(crate) use bindings::BindingOwners;
+pub(crate) use bindings::{Assignment, BindingConflicts, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
+use bindings::{Overrides, StoredOverrides};
 use scheme::{Scheme, SchemeKey};
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
@@ -60,9 +62,9 @@ pub(crate) enum Command {
     Outline(u8),
     Gap(u8),
     Padding(u8),
-    Shortcut(Shortcut, Chord),
-    ReassignShortcut(Shortcut, Chord, BindingOwners),
-    ResetShortcut(Shortcut),
+    Assign(Assignment),
+    Transfer(Assignment, BindingConflicts),
+    RemoveShortcut(Shortcut, Chord),
     ResetShortcuts,
     Exit,
 }
@@ -71,15 +73,12 @@ impl Command {
     pub fn changes_shortcuts(self) -> bool {
         matches!(
             self,
-            Self::Shortcut(..)
-                | Self::ReassignShortcut(..)
-                | Self::ResetShortcut(_)
-                | Self::ResetShortcuts
+            Self::Assign(..) | Self::Transfer(..) | Self::RemoveShortcut(..) | Self::ResetShortcuts
         )
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(from = "StoredSettings")]
 pub(crate) struct Settings {
     version: u16,
@@ -122,7 +121,7 @@ struct StoredSettings {
     resize: Option<Modifier>,
     scheme: Option<Scheme>,
     #[serde(default)]
-    shortcuts: Overrides,
+    shortcuts: StoredOverrides,
 }
 
 impl From<StoredSettings> for Settings {
@@ -135,11 +134,15 @@ impl From<StoredSettings> for Settings {
             gap: file.gap.unwrap_or(defaults.gap),
             padding: file.padding.unwrap_or(defaults.padding),
             scheme: file.scheme.unwrap_or_default(),
-            shortcuts: file.shortcuts,
+            shortcuts: Overrides::default(),
         };
-        if file.scheme.is_none() {
-            settings.import_legacy_bindings(file.focus, file.movement, file.resize);
-        }
+        settings.import_bindings(
+            file.shortcuts,
+            file.scheme.is_none(),
+            file.focus,
+            file.movement,
+            file.resize,
+        );
         settings
     }
 }
@@ -148,7 +151,7 @@ impl Settings {
     pub const MAX_OUTLINE: u8 = 4;
     pub const MAX_SPACING: u8 = 32;
 
-    fn validated(self) -> Result<Self, String> {
+    fn validated(&self) -> Result<Self, String> {
         if self.version != 1 {
             return Err(format!("Неизвестная версия настроек: {}.", self.version));
         }
@@ -164,48 +167,55 @@ impl Settings {
         }
         self.scheme.validate()?;
         self.validate_shortcuts()?;
-        Ok(self)
+        Ok(self.clone())
     }
 
-    pub fn changed(mut self, command: Command) -> Result<Self, String> {
+    pub fn changed(&self, command: Command) -> Result<Self, String> {
+        let mut next = self.clone();
         match command {
-            Command::Toggle => self.enabled = !self.enabled,
-            Command::Outline(value) => self.outline = value,
-            Command::Gap(value) => self.gap = value,
-            Command::Padding(value) => self.padding = value,
-            Command::Shortcut(action, chord) => self.assign(action, chord)?,
-            Command::ReassignShortcut(action, chord, owner) => {
-                if self.conflict(action, chord) != Some(owner) {
-                    return Err(OWNER_CHANGED.into());
-                }
-                self.transfer_confirmed(action, chord, owner)?;
+            Command::Toggle => next.enabled = !next.enabled,
+            Command::Outline(value) => next.outline = value,
+            Command::Gap(value) => next.gap = value,
+            Command::Padding(value) => next.padding = value,
+            Command::Assign(assignment) => {
+                next.apply_assignment(assignment, BindingConflicts::default())?
             }
-            Command::ResetShortcut(action) => self.assign(action, action.default_chord())?,
+            Command::Transfer(assignment, confirmed) => {
+                next.apply_assignment(assignment, confirmed)?
+            }
+            Command::RemoveShortcut(action, chord) => next.remove_chord(action, chord)?,
             Command::ResetShortcuts => {
                 let defaults = Self::default();
-                self.scheme = defaults.scheme;
-                self.shortcuts = defaults.shortcuts;
+                next.scheme = defaults.scheme;
+                next.shortcuts = defaults.shortcuts;
             }
             Command::SetStartup(_) | Command::Exit => {}
         }
-        self.validated()
+        next.validated()
     }
 
-    pub fn changed_for_save(mut self, command: Command, live: Self) -> Result<Self, String> {
-        // A launch-only opener can own a chord (or supply an alias) which is
-        // free in the stored profile. Persist exactly the transfer shown in the editor.
-        if let Command::ReassignShortcut(action, chord, owners) = command {
-            if live.conflict(action, chord) != Some(owners)
-                || self.conflict(action, chord).is_some_and(|stored| {
-                    stored.actions().any(|s| !owners.actions().any(|a| a == s))
-                })
-            {
-                return Err(OWNER_CHANGED.into());
-            }
-            self.transfer_confirmed(action, chord, owners)?;
-            return self.validated();
+    pub fn changed_for_save(&self, command: Command, live: &Self) -> Result<Self, String> {
+        if self == live {
+            return self.changed(command);
         }
-        self.changed(command)
+        let mut next = self.clone();
+        // Only explicitly edited actions can persist a launch-only resize opener.
+        match command {
+            Command::Transfer(edit, confirmed) => {
+                next.copy_confirmed_bindings(live, edit, confirmed)?
+            }
+            Command::Assign(edit) => {
+                next.copy_confirmed_bindings(live, edit, BindingConflicts::default())?
+            }
+            Command::RemoveShortcut(action, chord) => {
+                live.changed(command)?;
+                if let Some(stored) = next.stored_source(live, action, chord) {
+                    next.remove_chord(action, stored)?;
+                }
+            }
+            _ => return self.changed(command),
+        }
+        next.validated()
     }
 
     pub fn path() -> Result<PathBuf, String> {
@@ -308,10 +318,10 @@ mod tests {
         );
         assert!(
             partial
-                .changed(Command::Shortcut(
+                .assign_primary(
                     Shortcut::MoveLeft,
                     partial.binding(Shortcut::FocusLeft).unwrap()
-                ))
+                )
                 .is_err()
         );
         assert!(partial.changed(Command::Outline(5)).is_err());
@@ -338,11 +348,7 @@ mod tests {
             Some(Shortcut::FocusLeft.into())
         );
         let remapped = profile
-            .changed(Command::ReassignShortcut(
-                Shortcut::QuickLeft,
-                quick_left,
-                Shortcut::FocusLeft.into(),
-            ))
+            .transfer_primary(Shortcut::QuickLeft, quick_left, Shortcut::FocusLeft.into())
             .unwrap();
         assert_eq!(remapped.binding(Shortcut::FocusLeft), None);
         assert_eq!(remapped.binding(Shortcut::QuickLeft), Some(quick_left));
@@ -373,7 +379,7 @@ mod tests {
             assert_eq!(profile.binding(owner), Some(chord));
             assert_eq!(profile.conflict(action, chord), Some(owner.into()));
             let moved = profile
-                .changed(Command::ReassignShortcut(action, chord, owner.into()))
+                .transfer_primary(action, chord, owner.into())
                 .unwrap();
             let roundtrip: Settings = toml::from_str(&toml::to_string(&moved).unwrap()).unwrap();
             assert_eq!(roundtrip.binding(action), Some(chord));
@@ -412,16 +418,12 @@ mod tests {
             if matches!(owners, BindingOwners::Both(_, _)) {
                 assert!(
                     settings
-                        .changed(Command::ReassignShortcut(
-                            ToggleMosaic,
-                            chord,
-                            FocusUp.into()
-                        ))
+                        .transfer_primary(ToggleMosaic, chord, FocusUp.into())
                         .is_err()
                 );
             }
             let moved = settings
-                .changed(Command::ReassignShortcut(ToggleMosaic, chord, owners))
+                .transfer_primary(ToggleMosaic, chord, owners)
                 .unwrap();
             assert_eq!(moved.binding(ToggleMosaic), Some(chord));
             for owner in owners.actions() {
@@ -449,24 +451,27 @@ mod tests {
         .unwrap();
         let settings = settings.validated().unwrap();
         let chord = PreviousDesktop.default_chord();
-        assert_eq!(settings.binding(PreviousDesktop), None);
+        assert!(!settings.bindings(PreviousDesktop).contains(&chord));
         let owners = BindingOwners::Both(FocusUp, GrowUp);
         assert_eq!(settings.conflict(PreviousDesktop, chord), Some(owners));
+        let addition = Assignment::Add(PreviousDesktop, chord);
         let reassigned = settings
-            .changed(Command::ReassignShortcut(PreviousDesktop, chord, owners))
+            .changed(Command::Transfer(
+                addition,
+                settings.conflicts(addition).unwrap(),
+            ))
             .unwrap();
         assert_eq!(
             reassigned.conflict(NextDesktop, chord),
             Some(PreviousDesktop.into())
         );
         let transferred = reassigned
-            .changed(Command::ReassignShortcut(
-                NextDesktop,
-                chord,
-                PreviousDesktop.into(),
-            ))
+            .transfer_primary(NextDesktop, chord, PreviousDesktop.into())
             .unwrap();
-        assert_eq!(transferred.binding(PreviousDesktop), None);
+        assert_eq!(
+            transferred.bindings(PreviousDesktop),
+            settings.bindings(PreviousDesktop)
+        );
         assert_eq!(transferred.binding(NextDesktop), Some(chord));
         let restored: Settings = toml::from_str(&toml::to_string(&transferred).unwrap()).unwrap();
         assert_eq!(restored.validated().unwrap(), transferred);
@@ -482,24 +487,26 @@ mod tests {
             .validated()
             .unwrap();
         let chord = MovePreviousDesktop.default_chord();
-        assert_eq!(settings.binding(MovePreviousDesktop), None);
+        assert_eq!(
+            settings.bindings(MovePreviousDesktop),
+            [MovePreviousDesktopAlt.default_chord()]
+        );
         assert_eq!(settings.binding(FocusLeft), Some(chord));
         assert_eq!(settings.binding(GrowLeft), Some(chord));
         let owners = BindingOwners::Both(FocusLeft, GrowLeft);
         assert_eq!(settings.conflict(MovePreviousDesktop, chord), Some(owners));
+        let addition = Assignment::Add(MovePreviousDesktop, chord);
         let moved = settings
-            .changed(Command::ReassignShortcut(
-                MovePreviousDesktop,
-                chord,
-                owners,
+            .changed(Command::Transfer(
+                addition,
+                settings.conflicts(addition).unwrap(),
             ))
             .unwrap();
         assert_eq!(moved.binding(FocusLeft), None);
         assert_eq!(moved.binding(GrowLeft), None);
-        assert_eq!(moved.binding(MovePreviousDesktop), Some(chord));
         assert_eq!(
-            moved.binding(MovePreviousDesktopAlt),
-            Some(MovePreviousDesktopAlt.default_chord())
+            moved.bindings(MovePreviousDesktop),
+            [MovePreviousDesktopAlt.default_chord(), chord]
         );
         let saved = toml::to_string(&moved).unwrap();
         assert_eq!(
@@ -513,7 +520,7 @@ mod tests {
 
     #[test]
     fn desktop_number_preserves_a_saved_digit_and_wheel_assignments_roundtrip() {
-        use Shortcut::{Desktop1, NextDesktopWheel, PreviousDesktopWheel};
+        use Shortcut::{Desktop1, NextDesktop, NextDesktopWheel, PreviousDesktop};
         let saved = "shortcuts.focus_left = { mods = 8, key = 49 }";
         let settings = toml::from_str::<Settings>(saved)
             .unwrap()
@@ -525,21 +532,14 @@ mod tests {
             Some(Desktop1.default_chord())
         );
         let down = NextDesktopWheel.default_chord();
-        assert_eq!(
-            settings.conflict(Desktop1, down),
-            Some(NextDesktopWheel.into())
-        );
+        assert_eq!(settings.conflict(Desktop1, down), Some(NextDesktop.into()));
         let changed = settings
-            .changed(Command::ReassignShortcut(
-                Desktop1,
-                down,
-                NextDesktopWheel.into(),
-            ))
+            .transfer_primary(Desktop1, down, NextDesktop.into())
             .unwrap();
         assert_eq!(changed.binding(Desktop1), Some(down));
-        assert_eq!(changed.binding(NextDesktopWheel), None);
+        assert!(!changed.bindings(NextDesktop).contains(&down));
         assert_eq!(
-            changed.binding(PreviousDesktopWheel).unwrap().label(),
+            changed.bindings(PreviousDesktop).last().unwrap().label(),
             "Win+Wheel Up"
         );
         let restored: Settings = toml::from_str(&toml::to_string(&changed).unwrap()).unwrap();
@@ -566,17 +566,13 @@ mod tests {
         let chord = FocusLeft.default_chord();
         let owners = BindingOwners::Both(FocusLeft, GrowLeft);
         assert_eq!(settings.conflict(ToggleMosaic, chord), Some(owners));
-        assert!(
-            settings
-                .changed(Command::Shortcut(ToggleMosaic, chord))
-                .is_err()
-        );
+        assert!(settings.assign_primary(ToggleMosaic, chord).is_err());
         let moved = settings
-            .changed(Command::ReassignShortcut(ToggleMosaic, chord, owners))
+            .transfer_primary(ToggleMosaic, chord, owners)
             .unwrap();
         assert_eq!(moved.binding(FocusLeft), None);
-        assert_eq!(moved.binding(GrowLeft), None);
-        assert!(!moved.resize_alias(GrowLeft, chord));
+        assert_eq!(moved.bindings(GrowLeft), GrowLeft.factory_bindings());
+        assert_eq!(moved.conflict(GrowLeft, chord), Some(ToggleMosaic.into()));
         assert_eq!(moved.binding(ToggleMosaic), Some(chord));
     }
 
@@ -599,9 +595,7 @@ mod tests {
             mods: MOD_CONTROL,
             key: VK_H,
         };
-        let next = profile
-            .changed(Command::Shortcut(Shortcut::MoveLeft, custom))
-            .unwrap();
+        let next = profile.assign_primary(Shortcut::MoveLeft, custom).unwrap();
         let text = toml::to_string_pretty(&next).unwrap();
         assert!(text.contains("shortcuts.move_left"));
         let loaded = toml::from_str::<Settings>(&text)
@@ -626,10 +620,10 @@ mod tests {
         );
         assert_eq!(loaded.padding, 12);
         assert_eq!(
-            next.changed(Command::Shortcut(
+            next.assign_primary(
                 Shortcut::MoveLeft,
                 profile.binding(Shortcut::MoveLeft).unwrap()
-            ))
+            )
             .unwrap(),
             profile
         );
@@ -639,30 +633,29 @@ mod tests {
     fn binding_collisions_are_checked_within_each_mode() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F8, VK_H, VK_Q, VK_X};
         let settings = Settings::default()
-            .changed(Command::Shortcut(
+            .assign_primary(
                 Shortcut::FocusLeft,
                 Chord {
                     mods: MOD_CONTROL,
                     key: VK_H,
                 },
-            ))
+            )
             .unwrap();
-        let assign =
-            |action, mods, key| settings.changed(Command::Shortcut(action, Chord { mods, key }));
+        let assign = |action, mods, key| settings.assign_primary(action, Chord { mods, key });
         assert!(
             settings
-                .changed(Command::Shortcut(
+                .assign_primary(
                     Shortcut::GrowUp,
                     settings.binding(Shortcut::FocusLeft).unwrap()
-                ))
+                )
                 .is_ok()
         );
         assert!(
             settings
-                .changed(Command::Shortcut(
+                .assign_primary(
                     Shortcut::GrowUp,
                     settings.binding(Shortcut::GrowRight).unwrap()
-                ))
+                )
                 .is_err()
         );
         assert!(assign(Shortcut::MoveRight, MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_Q).is_ok());
@@ -699,6 +692,233 @@ mod tests {
     }
 
     #[test]
+    fn multiple_shortcuts_roundtrip_and_edit_delete_only_the_selected_chord() {
+        use Shortcut::{MoveLeft, MoveRight};
+        let base = MoveLeft.default_chord();
+        let j = Chord {
+            key: b'J' as u16,
+            ..base
+        };
+        let l = Chord {
+            key: b'L' as u16,
+            ..base
+        };
+        let other = MoveRight.default_chord();
+        let first = Settings::default()
+            .changed(Command::Assign(Assignment::Add(MoveLeft, j)))
+            .unwrap();
+        assert!(
+            first
+                .changed(Command::Assign(Assignment::Add(MoveLeft, j)))
+                .is_err()
+        );
+        assert!(
+            first
+                .changed(Command::Assign(Assignment::Edit(MoveLeft, base, j)))
+                .is_err()
+        );
+        let edited = first
+            .changed(Command::Assign(Assignment::Edit(MoveLeft, j, l)))
+            .unwrap();
+        assert_eq!(edited.bindings(MoveLeft), [base, l]);
+        assert!(
+            edited
+                .changed(Command::RemoveShortcut(MoveLeft, j))
+                .is_err()
+        );
+        let take = Assignment::Add(MoveRight, l);
+        let confirmed = edited.conflicts(take).unwrap();
+        assert_eq!(
+            confirmed.iter().collect::<Vec<_>>(),
+            [(l, BindingOwners::One(MoveLeft))]
+        );
+        let moved = edited.changed(Command::Transfer(take, confirmed)).unwrap();
+        assert_eq!(moved.bindings(MoveLeft), [base]);
+        assert_eq!(moved.bindings(MoveRight), [other, l]);
+        assert!(moved.changed(Command::Transfer(take, confirmed)).is_err());
+        let saved = toml::to_string(&moved).unwrap();
+        let loaded: Settings = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.validated().unwrap(), moved);
+        let removed = moved
+            .changed(Command::RemoveShortcut(MoveRight, other))
+            .unwrap();
+        assert_eq!(removed.bindings(MoveRight), [l]);
+        assert_eq!(
+            removed
+                .changed(Command::Assign(Assignment::Reset(MoveRight)))
+                .unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn legacy_desktop_slots_merge_in_order_and_new_arrays_are_authoritative() {
+        use Shortcut::{PreviousDesktop, PreviousDesktopAlt};
+        let original = PreviousDesktop.factory_bindings();
+        let custom = Chord {
+            mods: MOD_CONTROL,
+            key: b'J' as u16,
+        };
+        let legacy: Settings = toml::from_str("shortcuts.previous_desktop = 'disabled'\nshortcuts.previous_desktop_alt = {mods=2, key=74}").unwrap();
+        assert_eq!(legacy.bindings(PreviousDesktop), [custom, original[2]]);
+        assert!(legacy.bindings(PreviousDesktopAlt).is_empty());
+        let one = legacy
+            .changed(Command::RemoveShortcut(PreviousDesktop, original[2]))
+            .unwrap();
+        let saved = toml::to_string(&one).unwrap();
+        assert!(
+            !saved.contains("previous_desktop_alt") && !saved.contains("previous_desktop_wheel")
+        );
+        let loaded: Settings = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.bindings(PreviousDesktop), [custom]);
+        let empty = loaded
+            .changed(Command::RemoveShortcut(PreviousDesktop, custom))
+            .unwrap();
+        assert_eq!(
+            toml::from_str::<Settings>(&toml::to_string(&empty).unwrap())
+                .unwrap()
+                .bindings(PreviousDesktop),
+            []
+        );
+        assert_eq!(
+            empty
+                .changed(Command::Assign(Assignment::Reset(PreviousDesktop)))
+                .unwrap()
+                .bindings(PreviousDesktop),
+            original
+        );
+    }
+
+    #[test]
+    fn larger_binding_sets_preserve_their_order_and_all_opener_modifiers() {
+        use Shortcut::{GrowLeft, StartResize};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F1, VK_F24, VK_LEFT};
+        let mut saved = Settings::default();
+        let mut expected = StartResize.factory_bindings();
+        for key in VK_F1..=VK_F24 {
+            let chord = Chord {
+                mods: if key % 2 == 0 { MOD_CONTROL } else { MOD_ALT },
+                key,
+            };
+            expected.push(chord);
+            saved = saved
+                .changed(Command::Assign(Assignment::Add(StartResize, chord)))
+                .unwrap();
+        }
+        let old = expected.remove(9);
+        saved = saved
+            .changed(Command::RemoveShortcut(StartResize, old))
+            .unwrap();
+        let profile = toml::from_str::<Settings>(&toml::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(profile.bindings(StartResize), expected);
+        for mods in [MOD_WIN, MOD_CONTROL, MOD_ALT] {
+            assert!(profile.resize_alias(GrowLeft, Chord { mods, key: VK_LEFT }));
+        }
+    }
+
+    #[test]
+    fn a_reset_transfers_all_factory_conflicts_in_one_confirmed_change() {
+        use Shortcut::{MoveLeft, MoveRight, PreviousDesktop};
+        let defaults = PreviousDesktop.factory_bindings();
+        let mut profile = Settings::default();
+        for (owner, &chord) in [MoveLeft, MoveRight].into_iter().zip(&defaults) {
+            let add = Assignment::Add(owner, chord);
+            profile = profile
+                .changed(Command::Transfer(add, profile.conflicts(add).unwrap()))
+                .unwrap();
+        }
+        assert_eq!(profile.bindings(PreviousDesktop), [defaults[2]]);
+        let reset = Assignment::Reset(PreviousDesktop);
+        let conflicts = profile.conflicts(reset).unwrap();
+        assert_eq!(conflicts.iter().count(), 2);
+        assert!(profile.changed(Command::Assign(reset)).is_err());
+        let freed = profile
+            .changed(Command::RemoveShortcut(MoveRight, defaults[1]))
+            .unwrap();
+        assert!(freed.changed(Command::Transfer(reset, conflicts)).is_err());
+        // Both arrows also have inherited modal aliases. Their unmodified keys survive.
+        assert_eq!(
+            profile
+                .changed(Command::Transfer(reset, conflicts))
+                .unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn fixed_resize_exits_ignore_retired_settings_and_preserve_other_bindings() {
+        use Shortcut::{Cancel, Confirm, GrowLeft, MoveLeft};
+        let profile: Settings = toml::from_str("gap=17\n[shortcuts]\nconfirm={unknown=true}\ncancel='disabled'\ngrow_left=[{key=13,mods=0},{key=27,mods=0},{key=74,mods=0}]\nmove_left={key=74,mods=12}").unwrap();
+        let profile = profile.validated().unwrap();
+        assert_eq!(profile.bindings(GrowLeft), [Chord { mods: 0, key: 74 }]);
+        assert_eq!(profile.bindings(MoveLeft), [Chord { mods: 12, key: 74 }]);
+        assert_eq!(profile.gap, 17);
+        for action in [Confirm, Cancel] {
+            assert_eq!(profile.bindings(action), action.factory_bindings());
+            assert!(!action.is_editable());
+            assert!(
+                profile
+                    .changed(Command::RemoveShortcut(action, action.default_chord()))
+                    .is_err()
+            );
+            assert!(
+                profile
+                    .conflicts(Assignment::Add(GrowLeft, action.default_chord()))
+                    .is_err()
+            );
+        }
+        let saved = toml::to_string(&profile).unwrap();
+        assert!(!saved.contains("confirm") && !saved.contains("cancel"));
+    }
+
+    #[test]
+    fn changing_a_secondary_opener_preserves_the_launch_only_primary() {
+        use Shortcut::StartResize;
+        let default = StartResize.default_chord();
+        let a = Chord {
+            mods: MOD_ALT,
+            key: b'J' as u16,
+        };
+        let b = Chord {
+            mods: MOD_ALT,
+            key: b'K' as u16,
+        };
+        for initial in [vec![default], vec![]] {
+            let mut saved = Settings::default();
+            saved.set_bindings(StartResize, initial.clone());
+            let mut live = saved.with_resize_override(Modifier::CtrlAlt).unwrap();
+            for (command, extra) in [
+                (Command::Assign(Assignment::Add(StartResize, a)), Some(a)),
+                (
+                    Command::Assign(Assignment::Edit(StartResize, a, b)),
+                    Some(b),
+                ),
+                (Command::RemoveShortcut(StartResize, b), None),
+            ] {
+                saved = saved.changed_for_save(command, &live).unwrap();
+                live = live.changed(command).unwrap();
+                assert_eq!(
+                    saved.bindings(StartResize),
+                    initial.iter().copied().chain(extra).collect::<Vec<_>>()
+                );
+                assert_eq!(live.bindings(StartResize)[0].mods, MOD_CONTROL | MOD_ALT);
+            }
+            let replace = Command::Assign(Assignment::Edit(
+                StartResize,
+                live.bindings(StartResize)[0],
+                b,
+            ));
+            assert_eq!(
+                saved
+                    .changed_for_save(replace, &live)
+                    .unwrap()
+                    .bindings(StartResize),
+                [b]
+            );
+        }
+    }
+
+    #[test]
     fn one_factory_shortcut_can_replace_a_legacy_profile_setting_and_all_can_be_reset_together() {
         let profile: Settings = toml::from_str(
             "focus = 'ctrl+alt'\nmovement = 'alt+shift'\nresize = 'ctrl+shift'\n\
@@ -709,9 +929,9 @@ mod tests {
         let profile = profile.validated().unwrap();
         let factory = Settings::default();
         let one = profile
-            .changed(Command::ResetShortcut(Shortcut::FocusLeft))
+            .changed(Command::Assign(Assignment::Reset(Shortcut::FocusLeft)))
             .unwrap();
-        for action in Shortcut::ALL {
+        for action in Shortcut::ALL.into_iter().filter(|a| a.is_editable()) {
             let expected = if action == Shortcut::FocusLeft {
                 factory.binding(action).unwrap()
             } else {
@@ -741,21 +961,21 @@ mod tests {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_K;
         let factory = Settings::default();
         let custom = factory
-            .changed(Command::Shortcut(
+            .assign_primary(
                 Shortcut::FocusLeft,
                 Chord {
                     mods: MOD_ALT,
                     key: VK_K,
                 },
-            ))
+            )
             .unwrap()
-            .changed(Command::Shortcut(
+            .assign_primary(
                 Shortcut::MoveDown,
                 factory.binding(Shortcut::FocusLeft).unwrap(),
-            ))
+            )
             .unwrap();
         let error = custom
-            .changed(Command::ResetShortcut(Shortcut::FocusLeft))
+            .changed(Command::Assign(Assignment::Reset(Shortcut::FocusLeft)))
             .unwrap_err();
         assert!(error.contains(Shortcut::MoveDown.label()));
         assert_eq!(custom.changed(Command::ResetShortcuts).unwrap(), factory);
@@ -769,7 +989,7 @@ mod tests {
         let chord = owner.default_chord();
         assert_eq!(original.conflict(action, chord), Some(owner.into()));
         let moved = original
-            .changed(Command::ReassignShortcut(action, chord, owner.into()))
+            .transfer_primary(action, chord, owner.into())
             .unwrap();
         let text = toml::to_string_pretty(&moved).unwrap();
         assert!(text.contains("disabled"));
@@ -787,18 +1007,21 @@ mod tests {
         // A stale confirmation must not transfer the binding again.
         assert!(
             loaded
-                .changed(Command::ReassignShortcut(
-                    Shortcut::MoveUp,
-                    chord,
-                    owner.into()
-                ))
+                .transfer_primary(Shortcut::MoveUp, chord, owner.into())
                 .is_err()
         );
-        assert!(loaded.changed(Command::ResetShortcut(owner)).is_err());
-        let free = loaded.changed(Command::ResetShortcut(action)).unwrap();
+        assert!(
+            loaded
+                .changed(Command::Assign(Assignment::Reset(owner)))
+                .is_err()
+        );
+        let free = loaded
+            .changed(Command::Assign(Assignment::Reset(action)))
+            .unwrap();
         assert_eq!(free.binding(owner), None);
         assert_eq!(
-            free.changed(Command::ResetShortcut(owner)).unwrap(),
+            free.changed(Command::Assign(Assignment::Reset(owner)))
+                .unwrap(),
             original
         );
         assert_eq!(loaded.changed(Command::ResetShortcuts).unwrap(), original);
@@ -816,20 +1039,18 @@ mod tests {
             original.conflict(Shortcut::ShrinkUp, chord),
             Some(Shortcut::GrowLeft.into())
         );
-        assert!(
-            original
-                .changed(Command::Shortcut(Shortcut::ShrinkUp, chord))
-                .is_err()
-        );
+        assert!(original.assign_primary(Shortcut::ShrinkUp, chord).is_err());
         let transferred = original
-            .changed(Command::ReassignShortcut(
-                Shortcut::ShrinkUp,
-                chord,
-                Shortcut::GrowLeft.into(),
-            ))
+            .transfer_primary(Shortcut::ShrinkUp, chord, Shortcut::GrowLeft.into())
             .unwrap();
-        assert_eq!(transferred.binding(Shortcut::GrowLeft), None);
-        assert!(!transferred.resize_alias(Shortcut::GrowLeft, chord));
+        assert_eq!(
+            transferred.binding(Shortcut::GrowLeft),
+            Some(Shortcut::GrowLeft.default_chord())
+        );
+        assert_eq!(
+            transferred.conflict(Shortcut::GrowLeft, chord),
+            Some(Shortcut::ShrinkUp.into())
+        );
         assert_eq!(transferred.binding(Shortcut::FocusLeft), Some(chord));
         // Older profiles could explicitly shadow a convenience alias.
         let legacy: Settings =
@@ -840,11 +1061,7 @@ mod tests {
             Some(Shortcut::ShrinkUp.into())
         );
         let next = legacy
-            .changed(Command::ReassignShortcut(
-                Shortcut::ShrinkDown,
-                chord,
-                Shortcut::ShrinkUp.into(),
-            ))
+            .transfer_primary(Shortcut::ShrinkDown, chord, Shortcut::ShrinkUp.into())
             .unwrap();
         assert_eq!(next.binding(Shortcut::ShrinkUp), None);
         assert_eq!(
@@ -862,19 +1079,18 @@ mod tests {
         let saved = Settings::default();
         let live = saved.with_resize_override(Modifier::CtrlAlt).unwrap();
         let chord = live.binding(Shortcut::StartResize).unwrap();
-        let command =
-            Command::ReassignShortcut(Shortcut::FocusUp, chord, Shortcut::StartResize.into());
+        let assignment =
+            Assignment::Edit(Shortcut::FocusUp, Shortcut::FocusUp.default_chord(), chord);
+        let command = Command::Transfer(assignment, live.conflicts(assignment).unwrap());
         assert!(saved.changed(command).is_err());
-        let persisted = saved.changed_for_save(command, live).unwrap();
+        let persisted = saved.changed_for_save(command, &live).unwrap();
         assert_eq!(persisted, live.changed(command).unwrap());
         assert_eq!(persisted.binding(Shortcut::StartResize), None);
         assert_eq!(persisted.binding(Shortcut::FocusUp), Some(chord));
         // A different stored owner was never confirmed by the user.
-        let other = saved
-            .changed(Command::Shortcut(Shortcut::MoveUp, chord))
-            .unwrap();
-        assert!(other.changed_for_save(command, live).is_err());
-        assert!(live.changed_for_save(command, other).is_err());
+        let other = saved.assign_primary(Shortcut::MoveUp, chord).unwrap();
+        assert!(other.changed_for_save(command, &live).is_err());
+        assert!(live.changed_for_save(command, &other).is_err());
     }
 
     #[test]
@@ -983,10 +1199,7 @@ mod tests {
             MOD_CONTROL | MOD_ALT
         );
         let settings = settings
-            .changed(Command::Shortcut(
-                Shortcut::GrowUp,
-                Chord { mods: 0, key: VK_H },
-            ))
+            .assign_primary(Shortcut::GrowUp, Chord { mods: 0, key: VK_H })
             .unwrap();
         assert!(!settings.resize_alias(Shortcut::GrowUp, held));
     }

@@ -153,7 +153,7 @@ fn smoke_desktop() -> String {
 #[test]
 #[ignore = "driven by desktop-smoke on a private Win32 desktop"]
 fn isolated_shortcut_ownership() {
-    use crate::settings::{Chord, Shortcut};
+    use crate::settings::{Assignment, Chord, Shortcut};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_LSHIFT,
     };
@@ -168,10 +168,13 @@ fn isolated_shortcut_ownership() {
         (Shortcut::MoveNextDesktop, VK_F17),
     ] {
         settings = settings
-            .changed(Command::Shortcut(action, Chord { key, mods: 0 }))
+            .changed(Command::Assign(Assignment::Add(
+                action,
+                Chord { key, mods: 0 },
+            )))
             .unwrap();
     }
-    let hook = shortcuts::Hook::install(settings).unwrap();
+    let hook = shortcuts::Hook::install(&settings).unwrap();
     let owner = unsafe { GetCurrentThreadId() };
     let key = |vk, down| shortcuts::test_keyboard_event(vk, down, owner);
     let next_command = || {
@@ -187,14 +190,14 @@ fn isolated_shortcut_ownership() {
     assert_eq!(key(VK_F13, true), 1, "focus shortcut without a foreground");
     assert_eq!(next_command(), Some((FOCUS, 0, 0)));
     assert!(shortcuts::desktop_focus_uninterrupted());
-    hook.set_settings(Settings::default());
+    hook.set_settings(&Settings::default());
     assert_eq!(key(VK_F13, true), 1, "held repeat after unbinding");
     assert_eq!(key(VK_F13, false), 1, "release after unbinding");
     assert_eq!(key(VK_F13, true), 0, "next press uses the new bindings");
     assert_eq!(key(VK_F13, false), 0);
     assert_eq!(next_command(), None);
 
-    hook.set_settings(settings);
+    hook.set_settings(&settings);
     assert_eq!(key(VK_F14, true), 1);
     assert!(matches!(next_command(), Some((TOGGLE_MOSAIC, ticket, 0)) if ticket != 0));
     assert_eq!(key(VK_F14, true), 1);

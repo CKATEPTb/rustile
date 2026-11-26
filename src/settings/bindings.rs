@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
-use super::{Command, Modifier, SchemeKey, Settings};
+use super::{Modifier, OWNER_CHANGED, SchemeKey, Settings};
 
 // Wheel directions share the binding table with keyboard virtual keys,
 // which occupy 0x00..=0xff.
@@ -95,6 +96,43 @@ shortcuts! {
 }
 
 impl Shortcut {
+    pub const fn canonical(self) -> Self {
+        use Shortcut::*;
+        match self {
+            PreviousDesktopAlt | PreviousDesktopWheel => PreviousDesktop,
+            NextDesktopAlt | NextDesktopWheel => NextDesktop,
+            MovePreviousDesktopAlt => MovePreviousDesktop,
+            MoveNextDesktopAlt => MoveNextDesktop,
+            action => action,
+        }
+    }
+
+    pub fn is_editable(self) -> bool {
+        self == self.canonical() && !matches!(self, Self::Confirm | Self::Cancel)
+    }
+
+    fn legacy_slots(self) -> impl Iterator<Item = Self> {
+        use Shortcut::*;
+        let others: &[Shortcut] = match self {
+            PreviousDesktop => &[PreviousDesktopAlt, PreviousDesktopWheel],
+            NextDesktop => &[NextDesktopAlt, NextDesktopWheel],
+            MovePreviousDesktop => &[MovePreviousDesktopAlt],
+            MoveNextDesktop => &[MoveNextDesktopAlt],
+            _ => &[],
+        };
+        std::iter::once(self).chain(others.iter().copied())
+    }
+
+    pub fn factory_bindings(self) -> Vec<Chord> {
+        self.inherited_bindings(&Settings::default())
+    }
+
+    fn inherited_bindings(self, settings: &Settings) -> Vec<Chord> {
+        self.legacy_slots()
+            .map(|slot| slot.inherited(settings))
+            .collect()
+    }
+
     pub fn label(self) -> &'static str {
         self.spec().0
     }
@@ -165,7 +203,7 @@ impl From<Shortcut> for BindingOwners {
 }
 
 impl BindingOwners {
-    pub(super) fn actions(self) -> impl Iterator<Item = Shortcut> {
+    pub(crate) fn actions(self) -> impl Iterator<Item = Shortcut> {
         let (first, second) = match self {
             Self::One(a) => (a, None),
             Self::Both(a, b) => (a, Some(b)),
@@ -181,7 +219,7 @@ impl BindingOwners {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Chord {
     pub mods: u32,
@@ -377,141 +415,233 @@ impl Chord {
     }
 }
 
-// In memory, a fixed table keeps the hook allocation-free. The file contains
-// only overrides, keyed by action name so adding an action preserves old files.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(from = "StoredOverrides", into = "BTreeMap<Shortcut, Binding>")]
-pub(super) struct Overrides([Option<Binding>; Shortcut::ALL.len()]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Assignment {
+    Add(Shortcut, Chord),
+    Edit(Shortcut, Chord, Chord),
+    Reset(Shortcut),
+}
 
-impl Default for Overrides {
-    fn default() -> Self {
-        Self([None; Shortcut::ALL.len()])
+impl Assignment {
+    pub fn action(self) -> Shortcut {
+        match self {
+            Self::Add(a, _) | Self::Edit(a, _, _) | Self::Reset(a) => a,
+        }
+    }
+
+    fn requested(self) -> Vec<Chord> {
+        match self {
+            Self::Add(_, chord) | Self::Edit(_, _, chord) => vec![chord],
+            Self::Reset(action) => action.factory_bindings(),
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-enum Binding {
-    #[serde(rename = "disabled")]
-    Disabled,
-    // Keep the existing { mods, key } representation for assigned chords.
-    #[serde(untagged)]
-    Assigned(Chord),
+// A single edit requests one chord. Only a factory reset can request several
+// simultaneously, and the widest factory set is the three desktop bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BindingConflicts([Option<(Chord, BindingOwners)>; 3]);
+
+impl BindingConflicts {
+    pub fn iter(self) -> impl Iterator<Item = (Chord, BindingOwners)> {
+        self.0.into_iter().flatten()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0[0].is_none()
+    }
 }
 
-// Accept the retired setting independently, even if its chord is malformed.
-// Keep normal validation for every other key and omit it when writing the file.
-#[derive(Deserialize)]
-struct StoredOverrides {
-    #[serde(rename = "quit")]
-    _legacy_quit: Option<serde::de::IgnoredAny>,
-    #[serde(flatten)]
-    bindings: BTreeMap<Shortcut, Binding>,
-}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Overrides(Option<Arc<BTreeMap<Shortcut, Vec<Chord>>>>);
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(Option::is_none)
+        self.0.is_none()
+    }
+
+    fn get(&self, action: Shortcut) -> Option<&[Chord]> {
+        self.0.as_ref()?.get(&action).map(Vec::as_slice)
+    }
+
+    fn set(&mut self, action: Shortcut, keys: Option<Vec<Chord>>) {
+        if let Some(keys) = keys {
+            Arc::make_mut(self.0.get_or_insert_with(Arc::default)).insert(action, keys);
+        } else if let Some(map) = &mut self.0 {
+            Arc::make_mut(map).remove(&action);
+            if map.is_empty() {
+                self.0 = None;
+            }
+        }
     }
 }
 
-impl From<StoredOverrides> for Overrides {
-    fn from(stored: StoredOverrides) -> Self {
-        let mut overrides = Self::default();
-        for (action, chord) in stored.bindings {
-            overrides.0[action.index()] = Some(chord);
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Disabled {
+    Disabled,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredBinding {
+    Disabled(Disabled),
+    Single(Chord),
+    List(Vec<Chord>),
+}
+
+impl StoredBinding {
+    fn keys(&self) -> &[Chord] {
+        match self {
+            Self::Disabled(_) => &[],
+            Self::Single(chord) => std::slice::from_ref(chord),
+            Self::List(chords) => chords,
         }
-        overrides
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct StoredOverrides {
+    #[serde(rename = "quit")]
+    _quit: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "confirm")]
+    _confirm: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "cancel")]
+    _cancel: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    entries: BTreeMap<Shortcut, StoredBinding>,
+}
+
+impl Serialize for Overrides {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for (action, chords) in self.0.iter().flat_map(|map| map.iter()) {
+            // An array denotes the entire logical action, including its former
+            // alternate slots. A legacy singleton for a desktop is just one slot.
+            if action.legacy_slots().count() > 1 || chords.len() > 1 {
+                map.serialize_entry(action, chords)?;
+            } else if let [chord] = chords.as_slice() {
+                map.serialize_entry(action, chord)?;
+            } else {
+                map.serialize_entry(action, &Disabled::Disabled)?;
+            }
+        }
+        map.end()
     }
 }
 
 impl Settings {
-    pub(super) fn import_legacy_bindings(
+    pub(super) fn import_bindings(
         &mut self,
+        stored: StoredOverrides,
+        legacy_groups: bool,
         focus: Option<Modifier>,
         movement: Option<Modifier>,
         resize: Option<Modifier>,
     ) {
-        let overrides = &mut self.shortcuts;
-        // Older profiles may already assign the default chord of a new action.
-        // Keep the user's binding and leave the newly introduced action unassigned.
-        for action in Shortcut::ALL {
-            if !matches!(
-                action.spec().1,
-                Group::Quick
-                    | Group::QuickReverse
-                    | Group::Window
-                    | Group::Desktop
-                    | Group::DesktopMove
-            ) || overrides.0[action.index()].is_some()
-            {
-                continue;
-            }
-            let chord = Binding::Assigned(action.default_chord());
-            if Shortcut::ALL.into_iter().any(|other| {
-                action.shares_context(other) && overrides.0[other.index()] == Some(chord)
-            }) {
-                overrides.0[action.index()] = Some(Binding::Disabled);
-            }
-        }
-        for action in Shortcut::ALL {
-            if overrides.0[action.index()].is_some() {
-                continue;
-            }
-            let (_, group, key) = action.spec();
-            let legacy = match group {
-                Group::Focus => focus,
-                Group::Move => movement,
-                Group::StartResize => resize,
-                _ => None,
-            };
-            if let Some(modifier) = legacy {
-                let chord = Chord {
-                    mods: modifier.bits(),
-                    key,
-                };
-                if chord != action.default_chord() {
-                    overrides.0[action.index()] = Some(Binding::Assigned(chord));
+        let explicit = &stored.entries;
+        for action in Shortcut::ALL.into_iter().filter(|a| a.is_editable()) {
+            let mut chords = Vec::new();
+            if let Some(StoredBinding::List(all)) = explicit.get(&action) {
+                chords.extend_from_slice(all);
+            } else {
+                for slot in action.legacy_slots() {
+                    if let Some(value) = explicit.get(&slot) {
+                        chords.extend_from_slice(value.keys());
+                        continue;
+                    }
+                    let (_, group, _) = slot.spec();
+                    let modifier = match group {
+                        Group::Focus => focus,
+                        Group::Move => movement,
+                        Group::StartResize => resize,
+                        _ => None,
+                    };
+                    let mut chord = slot.inherited(self);
+                    if legacy_groups && let Some(modifier) = modifier {
+                        chord.mods = modifier.bits();
+                    }
+                    // Older profiles could already use newly introduced defaults.
+                    // Omit only that slot, preserving the other desktop alternatives.
+                    if legacy_groups
+                        && matches!(
+                            group,
+                            Group::Quick
+                                | Group::QuickReverse
+                                | Group::Window
+                                | Group::Desktop
+                                | Group::DesktopMove
+                        )
+                        && explicit.iter().any(|(&other, value)| {
+                            other.canonical() != action
+                                && action.shares_context(other)
+                                && value.keys().contains(&chord)
+                        })
+                    {
+                        continue;
+                    }
+                    chords.push(chord);
                 }
             }
+            if action.is_resize() || action.reserves_both_modes() {
+                chords.retain(|c| !c.fixed_exit());
+            }
+            self.set_bindings(action, chords);
         }
     }
-}
 
-impl From<Overrides> for BTreeMap<Shortcut, Binding> {
-    fn from(overrides: Overrides) -> Self {
-        Shortcut::ALL
-            .into_iter()
-            .filter_map(|action| overrides.0[action.index()].map(|chord| (action, chord)))
-            .collect()
+    pub fn bindings(&self, action: Shortcut) -> Vec<Chord> {
+        if action != action.canonical() {
+            return Vec::new();
+        }
+        self.shortcuts
+            .get(action)
+            .map_or_else(|| action.inherited_bindings(self), <[Chord]>::to_vec)
     }
-}
 
-impl Settings {
-    pub fn with_resize_override(self, modifier: Modifier) -> Result<Self, String> {
+    pub(super) fn set_bindings(&mut self, action: Shortcut, chords: Vec<Chord>) {
+        let override_needed = chords != action.inherited_bindings(self);
+        self.shortcuts
+            .set(action, override_needed.then_some(chords));
+    }
+
+    pub fn with_resize_override(&self, modifier: Modifier) -> Result<Self, String> {
+        let action = Shortcut::StartResize;
         let chord = Chord {
             mods: modifier.bits(),
             key: VK_RETURN,
         };
-        self.changed(Command::Shortcut(Shortcut::StartResize, chord))
+        let keys = self.bindings(action);
+        if keys.contains(&chord) {
+            return Ok(self.clone());
+        }
+        let assignment = keys.first().map_or(Assignment::Add(action, chord), |&old| {
+            Assignment::Edit(action, old, chord)
+        });
+        self.changed(super::Command::Assign(assignment))
     }
 
-    pub fn binding(&self, action: Shortcut) -> Option<Chord> {
-        match self.shortcuts.0[action.index()] {
-            None => Some(action.inherited(self)),
-            Some(Binding::Assigned(chord)) => Some(chord),
-            Some(Binding::Disabled) => None,
-        }
+    fn owns(&self, action: Shortcut, chord: Chord) -> bool {
+        self.shortcuts.get(action).map_or_else(
+            || {
+                action
+                    .legacy_slots()
+                    .any(|slot| slot.inherited(self) == chord)
+            },
+            |chords| chords.contains(&chord),
+        )
     }
 
     pub fn conflict(&self, action: Shortcut, chord: Chord) -> Option<BindingOwners> {
         let owner = |resize| {
-            let context = Shortcut::ALL
-                .into_iter()
-                .filter(|other| other.reserves_both_modes() || other.is_resize() == resize);
-            // Explicit bindings win over the variants that keep the resize opener held.
+            let context = Shortcut::ALL.into_iter().filter(|&other| {
+                other == other.canonical()
+                    && (other.reserves_both_modes() || other.is_resize() == resize)
+            });
             context
                 .clone()
-                .find(|&other| self.binding(other) == Some(chord))
+                .find(|&other| self.owns(other, chord))
                 .or_else(|| {
                     context
                         .into_iter()
@@ -528,79 +658,253 @@ impl Settings {
         }
     }
 
-    pub(super) fn assign(&mut self, action: Shortcut, chord: Chord) -> Result<(), String> {
-        chord.validate(action)?;
-        if let Some(other) = self.conflict(action, chord) {
-            return Err(format!(
-                "{} уже назначено на {}.",
-                chord.label(),
-                other.labels()
-            ));
+    pub fn conflicts(&self, assignment: Assignment) -> Result<BindingConflicts, String> {
+        let action = assignment.action();
+        if !action.is_editable() {
+            return Err("Это системное сочетание Rustile.".into());
         }
-        self.set_assigned(action, chord);
+        let current = self.bindings(action);
+        if let Assignment::Edit(_, old, _) = assignment
+            && !current.contains(&old)
+        {
+            return Err(OWNER_CHANGED.into());
+        }
+        let mut result = BindingConflicts::default();
+        for chord in assignment.requested() {
+            chord.validate(action)?;
+            if (action.is_resize() || action.reserves_both_modes()) && chord.fixed_exit() {
+                return Err("Enter и Esc завершают изменение размера.".into());
+            }
+            if current.contains(&chord) {
+                match assignment {
+                    Assignment::Reset(_) => continue,
+                    Assignment::Edit(_, old, _) if old == chord => continue,
+                    _ => return Err("Это сочетание уже назначено этому действию.".into()),
+                }
+            }
+            if let Some(owners) = self.conflict(action, chord) {
+                let slot = result
+                    .0
+                    .iter_mut()
+                    .find(|slot| slot.is_none())
+                    .expect("factory chord count");
+                *slot = Some((chord, owners));
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn apply_assignment(
+        &mut self,
+        assignment: Assignment,
+        conflicts: BindingConflicts,
+    ) -> Result<(), String> {
+        let actual = self.conflicts(assignment)?;
+        if actual != conflicts {
+            if conflicts.is_empty()
+                && let Some((chord, owners)) = actual.iter().next()
+            {
+                return Err(format!(
+                    "{} уже назначено на {}.",
+                    chord.label(),
+                    owners.labels()
+                ));
+            }
+            return Err(OWNER_CHANGED.into());
+        }
+        for (chord, owners) in conflicts.iter() {
+            for owner in owners.actions() {
+                // An explicit chord takes priority over an inherited held-opener
+                // alias. Transferring an alias must preserve the owner's real keys.
+                if self.owns(owner, chord) {
+                    self.remove_chord(owner, chord)?;
+                }
+            }
+        }
+        let action = assignment.action();
+        let mut chords = self.bindings(action);
+        match assignment {
+            Assignment::Add(_, chord) => chords.push(chord),
+            Assignment::Edit(_, old, new) => {
+                *chords
+                    .iter_mut()
+                    .find(|c| **c == old)
+                    .ok_or(OWNER_CHANGED)? = new;
+            }
+            Assignment::Reset(_) => chords = action.factory_bindings(),
+        }
+        self.set_bindings(action, chords);
         Ok(())
     }
 
-    pub(super) fn transfer_confirmed(
-        &mut self,
+    pub(super) fn remove_chord(&mut self, action: Shortcut, old: Chord) -> Result<(), String> {
+        if !action.is_editable() {
+            return Err("Это системное сочетание Rustile.".into());
+        }
+        let mut keys = self.bindings(action);
+        let index = keys.iter().position(|c| *c == old).ok_or(OWNER_CHANGED)?;
+        keys.remove(index);
+        self.set_bindings(action, keys);
+        Ok(())
+    }
+
+    // The command line may temporarily replace the first resize opener, even
+    // if the stored action was empty. Map just that slot when it is edited.
+    pub(super) fn stored_source(
+        &self,
+        live: &Self,
         action: Shortcut,
         chord: Chord,
-        owners: BindingOwners,
-    ) -> Result<(), String> {
-        chord.validate(action)?;
-        for owner in owners.actions() {
-            self.shortcuts.0[owner.index()] = Some(Binding::Disabled);
+    ) -> Option<Chord> {
+        if self.owns(action, chord) {
+            return Some(chord);
         }
-        self.set_assigned(action, chord);
+        if action == Shortcut::StartResize {
+            let visible = live.bindings(action);
+            if visible.first() == Some(&chord) {
+                return self
+                    .bindings(action)
+                    .first()
+                    .copied()
+                    .filter(|c| !visible.contains(c));
+            }
+        }
+        None
+    }
+
+    pub(super) fn copy_confirmed_bindings(
+        &mut self,
+        live: &Self,
+        assignment: Assignment,
+        confirmed: BindingConflicts,
+    ) -> Result<(), String> {
+        let action = assignment.action();
+        for chord in assignment.requested() {
+            if let Some(stored) = self.conflict(action, chord) {
+                let allowed = confirmed.iter().find(|(c, _)| *c == chord);
+                if stored.actions().any(|owner| {
+                    !allowed.is_some_and(|(_, owners)| owners.actions().any(|a| a == owner))
+                }) {
+                    return Err(OWNER_CHANGED.into());
+                }
+            }
+        }
+        live.changed(super::Command::Transfer(assignment, confirmed))?;
+        for (chord, owners) in confirmed.iter() {
+            for owner in owners.actions() {
+                if let Some(stored) = self.stored_source(live, owner, chord) {
+                    self.remove_chord(owner, stored)?;
+                }
+            }
+        }
+        let mut saved = self.bindings(action);
+        match assignment {
+            Assignment::Add(_, chord) => {
+                if !saved.contains(&chord) {
+                    saved.push(chord);
+                }
+            }
+            Assignment::Edit(_, old, new) if old != new => {
+                let index = self
+                    .stored_source(live, action, old)
+                    .and_then(|c| saved.iter().position(|s| *s == c));
+                if let Some(i) = index {
+                    saved.remove(i);
+                }
+                if !saved.contains(&new) {
+                    saved.insert(index.unwrap_or(0), new);
+                }
+            }
+            Assignment::Edit(..) => {}
+            Assignment::Reset(_) => saved = action.factory_bindings(),
+        }
+        self.set_bindings(action, saved);
         Ok(())
     }
 
-    fn set_assigned(&mut self, action: Shortcut, chord: Chord) {
-        self.shortcuts.0[action.index()] =
-            (chord != action.inherited(self)).then_some(Binding::Assigned(chord));
-    }
-
-    // The original resize mode also accepts its default keys while the opener's
-    // modifiers remain held. An explicit modal binding replaces those aliases.
     pub fn resize_alias(&self, action: Shortcut, input: Chord) -> bool {
         let (_, group, _) = action.spec();
-        let key = action.inherited(self).key;
-        if key != input.key || self.shortcuts.0[action.index()].is_some() {
+        if !matches!(group, Group::Grow | Group::Shrink | Group::Finish) {
+            return false;
+        }
+        let inherited = action.inherited(self);
+        if inherited.key != input.key || !self.owns(action, inherited) {
             return false;
         }
         let base = self.scheme.modifier(SchemeKey::Base);
         let grab = self.scheme.modifier(SchemeKey::Grab);
-        let opener = self.binding(Shortcut::StartResize).map(|chord| chord.mods);
+        let openers = self.bindings(Shortcut::StartResize);
         match group {
             Group::Grow | Group::Shrink => {
                 let inverse = if group == Group::Shrink { grab } else { 0 };
                 input.mods == base | inverse
-                    || opener.is_some_and(|mods| input.mods == (mods & !grab) | inverse)
+                    || openers
+                        .iter()
+                        .any(|c| input.mods == (c.mods & !grab) | inverse)
             }
             Group::Finish => {
-                Some(input.mods) == opener || (action == Shortcut::Cancel && input.mods == base)
+                openers.iter().any(|c| c.mods == input.mods)
+                    || (action == Shortcut::Cancel && input.mods == base)
             }
             _ => false,
         }
     }
 
     pub(super) fn validate_shortcuts(&self) -> Result<(), String> {
-        for (index, action) in Shortcut::ALL.into_iter().enumerate() {
-            let Some(chord) = self.binding(action) else {
-                continue;
-            };
-            chord.validate(action)?;
-            for &other in &Shortcut::ALL[..index] {
-                if action.shares_context(other) && self.binding(other) == Some(chord) {
-                    return Err(format!(
-                        "{} уже назначено на «{}» и «{}».",
-                        chord.label(),
-                        other.label(),
-                        action.label()
-                    ));
+        let mut modes = [BTreeMap::new(), BTreeMap::new()];
+        for action in Shortcut::ALL.into_iter().filter(|a| *a == a.canonical()) {
+            for chord in self.bindings(action) {
+                chord.validate(action)?;
+                for (mode, used) in modes.iter_mut().enumerate() {
+                    if (action.reserves_both_modes() || action.is_resize() == (mode == 1))
+                        && let Some(other) = used.insert(chord, action)
+                    {
+                        return Err(format!(
+                            "{} уже назначено на «{}» и «{}».",
+                            chord.label(),
+                            other.label(),
+                            action.label()
+                        ));
+                    }
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl Chord {
+    fn fixed_exit(self) -> bool {
+        self.mods == 0 && matches!(self.key, VK_RETURN | VK_ESCAPE)
+    }
+}
+
+#[cfg(test)]
+impl Settings {
+    pub(crate) fn binding(&self, action: Shortcut) -> Option<Chord> {
+        self.bindings(action).first().copied()
+    }
+
+    fn edit_primary(&self, action: Shortcut, chord: Chord) -> Assignment {
+        self.binding(action)
+            .map_or(Assignment::Add(action, chord), |old| {
+                Assignment::Edit(action, old, chord)
+            })
+    }
+
+    pub(super) fn assign_primary(&self, action: Shortcut, chord: Chord) -> Result<Self, String> {
+        self.changed(super::Command::Assign(self.edit_primary(action, chord)))
+    }
+
+    pub(super) fn transfer_primary(
+        &self,
+        action: Shortcut,
+        chord: Chord,
+        owners: BindingOwners,
+    ) -> Result<Self, String> {
+        self.changed(super::Command::Transfer(
+            self.edit_primary(action, chord),
+            BindingConflicts([Some((chord, owners)), None, None]),
+        ))
     }
 }
