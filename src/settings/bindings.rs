@@ -5,6 +5,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use super::Settings;
 
+// Wheel directions share the binding table with keyboard virtual keys,
+// which occupy 0x00..=0xff.
+pub(crate) const WHEEL_UP: u16 = 0x100;
+pub(crate) const WHEEL_DOWN: u16 = 0x101;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Group {
     Focus,
@@ -26,7 +31,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 34] = [$( Self::$name, )+];
+            pub const ALL: [Self; 46] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -70,6 +75,18 @@ shortcuts! {
     NextDesktop,        "Следующий стол",         Desktop, VK_RIGHT;
     PreviousDesktopAlt, "Предыдущий стол (доп.)", Desktop, VK_UP;
     NextDesktopAlt,     "Следующий стол (доп.)",  Desktop, VK_DOWN;
+    PreviousDesktopWheel, "Предыдущий стол (колесо)", Desktop, WHEEL_UP;
+    NextDesktopWheel,     "Следующий стол (колесо)",  Desktop, WHEEL_DOWN;
+    Desktop1,  "Рабочий стол 1",  Desktop, VK_1;
+    Desktop2,  "Рабочий стол 2",  Desktop, VK_2;
+    Desktop3,  "Рабочий стол 3",  Desktop, VK_3;
+    Desktop4,  "Рабочий стол 4",  Desktop, VK_4;
+    Desktop5,  "Рабочий стол 5",  Desktop, VK_5;
+    Desktop6,  "Рабочий стол 6",  Desktop, VK_6;
+    Desktop7,  "Рабочий стол 7",  Desktop, VK_7;
+    Desktop8,  "Рабочий стол 8",  Desktop, VK_8;
+    Desktop9,  "Рабочий стол 9",  Desktop, VK_9;
+    Desktop10, "Рабочий стол 10", Desktop, VK_0;
 }
 
 impl Shortcut {
@@ -107,8 +124,10 @@ impl Shortcut {
             Group::Shrink => MOD_SHIFT,
             Group::Quick => MOD_WIN | MOD_ALT,
             Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
-            Group::Window => MOD_WIN,
-            Group::Desktop => MOD_WIN | MOD_CONTROL,
+            Group::Desktop if matches!(key, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN) => {
+                MOD_WIN | MOD_CONTROL
+            }
+            Group::Window | Group::Desktop => MOD_WIN,
         };
         Chord { mods, key }
     }
@@ -152,14 +171,13 @@ pub(crate) struct Chord {
 
 impl Chord {
     pub fn supports_key(key: u16) -> bool {
-        // Keyboard virtual keys only: mouse, controller, modifier, Unicode packet,
-        // IME processing markers and unassigned virtual keys never form a chord.
+        // Accept bindable keyboard keys and the two vertical wheel directions.
         matches!(key,
             VK_CANCEL | VK_BACK | VK_TAB | VK_CLEAR | VK_RETURN | VK_PAUSE..=VK_9
             | VK_A..=VK_Z | VK_APPS | VK_SLEEP..=VK_F24 | VK_NUMLOCK..=VK_OEM_FJ_ROYA
             | VK_BROWSER_BACK..=VK_LAUNCH_APP2 | VK_OEM_1..=VK_ABNT_C2
             | VK_OEM_4..=VK_OEM_8 | VK_OEM_AX..=VK_ICO_00 | VK_ICO_CLEAR
-            | VK_OEM_RESET..=VK_OEM_CLEAR
+            | VK_OEM_RESET..=VK_OEM_CLEAR | WHEEL_UP | WHEEL_DOWN
         )
     }
 
@@ -174,6 +192,8 @@ impl Chord {
             VK_RIGHT => "→",
             VK_UP => "↑",
             VK_DOWN => "↓",
+            WHEEL_UP => "Колесо ↑",
+            WHEEL_DOWN => "Колесо ↓",
             VK_RETURN => "Enter",
             VK_ESCAPE => "Esc",
             VK_SPACE => "Пробел",

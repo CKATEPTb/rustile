@@ -46,8 +46,20 @@ const GROUPS: [(&str, &[Shortcut]); 6] = [
         &[
             PreviousDesktop,
             PreviousDesktopAlt,
+            PreviousDesktopWheel,
             NextDesktop,
             NextDesktopAlt,
+            NextDesktopWheel,
+            Desktop1,
+            Desktop2,
+            Desktop3,
+            Desktop4,
+            Desktop5,
+            Desktop6,
+            Desktop7,
+            Desktop8,
+            Desktop9,
+            Desktop10,
         ],
     ),
 ];
@@ -261,7 +273,10 @@ impl ShortcutWindow {
         let row_h = if stacked { p(43) } else { p(29) };
         let header_h = p(29);
         let row_gap = |action| {
-            if matches!(action, GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft) {
+            if matches!(
+                action,
+                GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft | Desktop1
+            ) {
                 p(3)
             } else {
                 0
@@ -270,7 +285,15 @@ impl ShortcutWindow {
         let mut starts = [(0, 0); GROUPS.len()];
         let mut end = [p(7); 2];
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let column = usize::from(columns && end[1] < end[0]);
+            // Window navigation, window commands and desktops occupy the right
+            // column. The other 23 shortcuts stay together in the left column.
+            let column = usize::from(
+                columns
+                    && matches!(
+                        actions[0],
+                        FocusLeft | Shortcut::CloseWindow | PreviousDesktop
+                    ),
+            );
             starts[i] = (column, end[column]);
             end[column] +=
                 header_h + actions.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(10);

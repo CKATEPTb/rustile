@@ -2,7 +2,7 @@ mod bindings;
 
 use crate::profile_io;
 use bindings::Overrides;
-pub(crate) use bindings::{BindingOwners, Chord, Shortcut};
+pub(crate) use bindings::{BindingOwners, Chord, Shortcut, WHEEL_DOWN, WHEEL_UP};
 
 const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
 
@@ -450,6 +450,53 @@ mod tests {
     }
 
     #[test]
+    fn desktop_number_preserves_a_saved_digit_and_wheel_assignments_roundtrip() {
+        use Shortcut::{Desktop1, NextDesktopWheel, PreviousDesktopWheel};
+        let saved = "shortcuts.focus_left = { mods = 8, key = 49 }";
+        let settings = toml::from_str::<Settings>(saved)
+            .unwrap()
+            .validated()
+            .unwrap();
+        assert_eq!(settings.binding(Desktop1), None);
+        assert_eq!(
+            settings.binding(Shortcut::FocusLeft),
+            Some(Desktop1.default_chord())
+        );
+        let down = NextDesktopWheel.default_chord();
+        assert_eq!(
+            settings.conflict(Desktop1, down),
+            Some(NextDesktopWheel.into())
+        );
+        let changed = settings
+            .changed(Command::ReassignShortcut(
+                Desktop1,
+                down,
+                NextDesktopWheel.into(),
+            ))
+            .unwrap();
+        assert_eq!(changed.binding(Desktop1), Some(down));
+        assert_eq!(changed.binding(NextDesktopWheel), None);
+        assert_eq!(
+            changed.binding(PreviousDesktopWheel).unwrap().label(),
+            "Win+Колесо ↑"
+        );
+        let restored: Settings = toml::from_str(&toml::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(restored.validated().unwrap(), changed);
+        assert_eq!(
+            restored.changed(Command::ResetShortcuts).unwrap(),
+            Settings::default()
+        );
+        assert!(
+            Chord {
+                key: WHEEL_UP,
+                mods: 0
+            }
+            .validate(Desktop1)
+            .is_err()
+        );
+    }
+
+    #[test]
     fn assigning_a_global_chord_confirms_the_normal_binding_and_modal_alias() {
         use Shortcut::{FocusLeft, GrowLeft, ToggleMosaic};
 
@@ -798,7 +845,7 @@ mod tests {
             VK_PACKET,
             VK_PROCESSKEY,
             0xff,
-            0x100,
+            WHEEL_DOWN + 1,
         ] {
             assert!(!Chord::supports_key(key));
         }

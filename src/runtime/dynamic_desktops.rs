@@ -227,6 +227,22 @@ fn forward_neighbor(
     (occupied(tail)?).then_some(next)
 }
 
+fn numbered_target(
+    order: &[DesktopId],
+    current: DesktopId,
+    number: usize,
+    occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
+) -> Option<DesktopId> {
+    let from = order.iter().position(|&id| id == current)?;
+    let to = number.checked_sub(1)?.min(order.len() - 1);
+    // The selected empty desktop becomes the last one as soon as its
+    // last window closes, even while Explorer still lists the previous spare.
+    if to == from || (to > from && !occupied(&order[from..])?) {
+        return None;
+    }
+    Some(order[to])
+}
+
 pub(super) const EVENT_BATCH_MS: u32 = 40;
 const CONFIRM_MS: u32 = 60;
 const RETRY_MS: u32 = 350;
@@ -336,6 +352,19 @@ impl Workspaces {
             return switch_to(self.policy.spare?);
         }
         None
+    }
+
+    pub(super) fn navigate_to(&self, number: usize) -> Option<(DesktopId, DesktopId)> {
+        let shell = self.shell.as_ref()?;
+        let current = shell.current()?;
+        let order = shell.list()?;
+        let target = numbered_target(&order, current, number, |tail| {
+            occupancy::any_occupied(&order, tail)
+        })?;
+        if shell.current()? != current || shell.list()? != order {
+            return None;
+        }
+        shell.switch(target).then_some((current, target))
     }
 }
 
@@ -532,6 +561,47 @@ mod tests {
         assert_eq!(neighbor(&order, DesktopId(3), true), None);
         assert_eq!(neighbor(&order, DesktopId(7), false), None);
         assert_eq!(neighbor(&order, DesktopId(404), true), None);
+    }
+
+    #[test]
+    fn desktop_numbers_use_task_view_order_and_clamp_to_the_last_existing_slot() {
+        let order = [9, 15, 2].map(DesktopId);
+        let here = order[1];
+        let no_scan = |_: &[DesktopId]| panic!("only forward movement needs an occupancy check");
+        assert_eq!(numbered_target(&order, here, 1, no_scan), Some(order[0]));
+        assert_eq!(numbered_target(&order, here, 2, no_scan), None);
+        for number in [3, 5, 10] {
+            assert_eq!(
+                numbered_target(&order, here, number, |_| Some(true)),
+                Some(order[2])
+            );
+        }
+        assert_eq!(numbered_target(&order, order[2], 10, no_scan), None);
+        assert_eq!(numbered_target(&[], here, 1, no_scan), None);
+        assert_eq!(numbered_target(&order, DesktopId(99), 1, no_scan), None);
+        assert_eq!(numbered_target(&order, here, 0, no_scan), None);
+
+        let many: Vec<_> = (20..32).rev().map(DesktopId).collect();
+        assert_eq!(
+            numbered_target(&many, many[0], 10, |_| Some(true)),
+            Some(many[9])
+        );
+    }
+
+    #[test]
+    fn numbered_forward_jump_respects_the_empty_tail_during_cleanup() {
+        let order = [1, 2, 3, 4, 5, 6].map(DesktopId);
+        let here = order[3];
+        let target = |occupancy| {
+            numbered_target(&order, here, 10, |tail| {
+                assert_eq!(tail, &order[3..]);
+                occupancy
+            })
+        };
+        assert_eq!(target(Some(false)), None);
+        assert_eq!(target(None), None);
+        // A window here or farther right keeps the final empty desktop reachable.
+        assert_eq!(target(Some(true)), Some(order[5]));
     }
 
     #[test]

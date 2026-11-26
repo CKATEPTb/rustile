@@ -10,9 +10,12 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+mod wheel;
+
 use super::{
-    CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_NEXT, DESKTOP_PREVIOUS, EXPAND, FOCUS, KEY_COMMAND,
-    MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
+    CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_FIRST, DESKTOP_NEXT, DESKTOP_PREVIOUS, DESKTOP_TENTH,
+    DesktopDestination, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK,
+    START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
 };
 use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
@@ -62,7 +65,7 @@ impl KeyRoutes {
         if id == 0 {
             return None;
         }
-        let target = if matches!(id, TOGGLE_MOSAIC | DESKTOP_PREVIOUS | DESKTOP_NEXT) {
+        let target = if id == TOGGLE_MOSAIC || DesktopDestination::from_command(id).is_some() {
             Some(0) // Global commands need no foreground window.
         } else {
             // Own a configured normal chord even when its action is unavailable
@@ -79,13 +82,14 @@ impl KeyRoutes {
     }
 }
 
-struct Routes([Option<KeyRoutes>; 256]);
+const INPUT_SLOTS: usize = crate::settings::WHEEL_DOWN as usize + 1;
+struct Routes([Option<KeyRoutes>; INPUT_SLOTS]);
 
 impl Routes {
-    const EMPTY: Self = Self([None; 256]);
+    const EMPTY: Self = Self([None; INPUT_SLOTS]);
 
     fn new(settings: Settings) -> Self {
-        let mut keys = [None; 256];
+        let mut keys = [None; INPUT_SLOTS];
         for action in Shortcut::ALL {
             let id = command_id(action);
             let Some(chord) = settings.binding(action) else {
@@ -134,8 +138,18 @@ fn command_id(action: Shortcut) -> u8 {
         CloseWindow => CLOSE_WINDOW,
         ToggleMaximize => TOGGLE_MAXIMIZE,
         ToggleMosaic => TOGGLE_MOSAIC,
-        PreviousDesktop | PreviousDesktopAlt => DESKTOP_PREVIOUS,
-        NextDesktop | NextDesktopAlt => DESKTOP_NEXT,
+        PreviousDesktop | PreviousDesktopAlt | PreviousDesktopWheel => DESKTOP_PREVIOUS,
+        NextDesktop | NextDesktopAlt | NextDesktopWheel => DESKTOP_NEXT,
+        Desktop1 => DESKTOP_FIRST,
+        Desktop2 => DESKTOP_FIRST + 1,
+        Desktop3 => DESKTOP_FIRST + 2,
+        Desktop4 => DESKTOP_FIRST + 3,
+        Desktop5 => DESKTOP_FIRST + 4,
+        Desktop6 => DESKTOP_FIRST + 5,
+        Desktop7 => DESKTOP_FIRST + 6,
+        Desktop8 => DESKTOP_FIRST + 7,
+        Desktop9 => DESKTOP_FIRST + 8,
+        Desktop10 => DESKTOP_TENTH,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -226,6 +240,7 @@ struct Snapshot {
 struct Routing {
     focus: Snapshot,
     keys: Routes,
+    revision: usize,
 }
 
 static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
@@ -239,6 +254,7 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         // Global shortcuts can fire before the manager has sampled a window.
         // Arm them only when the user's actual settings have been loaded.
         keys: Routes::EMPTY,
+        revision: 0,
     })
 });
 
@@ -341,7 +357,7 @@ fn mark_modifier_used() {
     unsafe { SendInput(2, marker.as_ptr(), size_of::<INPUT>() as i32) };
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct BoundCommand {
     id: i32,
     target: Option<isize>,
@@ -357,14 +373,28 @@ impl BoundCommand {
         }
         pending.transition(self.id, self.focus_epoch)
     }
+
+    fn post(self, pending: Pending) {
+        let Some(target) = self.target else { return };
+        let transition = self.transition(pending);
+        let ticket = transition.map_or(0, |next| next.ticket);
+        let command = (ticket << 8) | self.id as usize;
+        if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
+            && let Some(next) = transition
+        {
+            PENDING.set(next);
+        }
+    }
+}
+
+fn route_snapshot(slot: usize) -> (Snapshot, Option<KeyRoutes>, usize) {
+    let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+    (routing.focus, routing.keys.0[slot], routing.revision)
 }
 
 fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
-    let (state, key) = {
-        let routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
-        (routing.focus, routing.keys.0[slot]?)
-    };
-    key.binding(
+    let (state, key, _) = route_snapshot(slot);
+    key?.binding(
         state,
         pending,
         modifiers(),
@@ -376,6 +406,24 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
         let vk = unsafe { (*(data as *const KBDLLHOOKSTRUCT)).vkCode };
+        if matches!(message as u32, WM_KEYUP | WM_SYSKEYUP)
+            && matches!(
+                vk as u16,
+                VK_LWIN
+                    | VK_RWIN
+                    | VK_SHIFT
+                    | VK_LSHIFT
+                    | VK_RSHIFT
+                    | VK_CONTROL
+                    | VK_LCONTROL
+                    | VK_RCONTROL
+                    | VK_MENU
+                    | VK_LMENU
+                    | VK_RMENU
+            )
+        {
+            wheel::reset();
+        }
         if let Ok(vk) = u8::try_from(vk)
             && Chord::supports_key(u16::from(vk))
         {
@@ -392,18 +440,10 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             let action = press.route(down, binding);
             HELD.with(|held| held[slot].set(press));
             if action != Action::Pass {
-                if let Action::Command(id) = action
+                if let Action::Command(_) = action
                     && let Some(binding) = binding
-                    && let Some(target) = binding.target
                 {
-                    let transition = binding.transition(pending);
-                    let ticket = transition.map_or(0, |next| next.ticket);
-                    let command = (ticket << 8) | id as usize;
-                    if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
-                        && let Some(next) = transition
-                    {
-                        PENDING.set(next);
-                    }
+                    binding.post(pending);
                 }
                 if down
                     && previous == Press::Up
@@ -437,6 +477,14 @@ pub(super) fn test_keyboard_event(key: u16, down: bool, owner: u32) -> isize {
     result
 }
 
+#[cfg(test)]
+pub(super) fn test_wheel_event(message: u32, delta: i16, mods: u32, owner: u32) -> bool {
+    let saved = OWNER.replace(owner);
+    let consumed = message == WM_MOUSEWHEEL && wheel::handle(delta, || mods, || {});
+    OWNER.set(saved);
+    consumed
+}
+
 pub(super) struct Hook {
     thread: Option<JoinHandle<()>>,
     id: u32,
@@ -467,12 +515,23 @@ impl Hook {
                     let _ = ready.send(Err(io::Error::last_os_error()));
                     return;
                 }
+                let mouse =
+                    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(wheel::on_mouse), module, 0) };
+                if mouse.is_null() {
+                    let error = io::Error::last_os_error();
+                    unsafe { UnhookWindowsHookEx(hook) };
+                    let _ = ready.send(Err(error));
+                    return;
+                }
                 if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_ok() {
                     while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {
                         unsafe { DispatchMessageW(&message) };
                     }
                 }
-                unsafe { UnhookWindowsHookEx(hook) };
+                unsafe {
+                    UnhookWindowsHookEx(mouse);
+                    UnhookWindowsHookEx(hook);
+                }
             })
             .map_err(|e| format!("Поток сочетаний клавиш: {e}"))?;
         match status.recv() {
@@ -483,7 +542,7 @@ impl Hook {
             result => {
                 let _ = thread.join();
                 match result {
-                    Ok(Err(e)) => Err(format!("Обработка клавиатурных сочетаний: {e}")),
+                    Ok(Err(e)) => Err(format!("Обработка сочетаний клавиш и колёсика: {e}")),
                     _ => Err("Поток сочетаний клавиш неожиданно завершился.".into()),
                 }
             }
@@ -492,7 +551,9 @@ impl Hook {
 
     pub(super) fn set_settings(&self, settings: Settings) {
         let keys = Routes::new(settings);
-        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = keys;
+        let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+        routing.keys = keys;
+        routing.revision = routing.revision.wrapping_add(1);
     }
 }
 
@@ -594,6 +655,26 @@ mod tests {
                 assert_eq!(keyboard.key(key, true, mods), Action::Command(id));
                 assert_eq!(keyboard.key(key, true, mods), Action::Consume);
                 assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+            }
+        }
+    }
+
+    #[test]
+    fn top_row_digits_select_desktop_numbers_even_without_a_tile() {
+        let mut keyboard = Keyboard::new();
+        keyboard.state.target = None;
+        for mode in [Mode::Normal, Mode::Resize] {
+            keyboard.state.mode = mode;
+            for number in 1..=10 {
+                let key = VK_0 + number % 10;
+                let command = DESKTOP_FIRST + i32::from(number) - 1;
+                assert!(matches!(DesktopDestination::from_command(command),
+                    Some(DesktopDestination::Number(slot)) if slot == usize::from(number)));
+                assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
+                assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+                assert_eq!(keyboard.key(key, false, 0), Action::Consume);
+                assert_eq!(keyboard.key(key, true, 0), Action::Pass);
+                assert_eq!(keyboard.key(key, false, 0), Action::Pass);
             }
         }
     }

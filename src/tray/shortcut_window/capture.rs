@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::{WHEEL_DOWN, WHEEL_UP};
 
 pub(super) const KEY_EVENT: u32 = WM_APP + 91;
 
@@ -10,7 +11,8 @@ thread_local! {
 }
 
 pub(super) struct Capture {
-    hook: HHOOK,
+    keyboard: HHOOK,
+    mouse: HHOOK,
     pub(super) generation: usize,
     pub(super) keys: Keys,
 }
@@ -31,13 +33,19 @@ impl Capture {
         .into_iter()
         .filter(|&key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0)
         .collect();
-        let hook =
-            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), GetModuleHandleW(null()), 0) };
-        if hook.is_null() {
+        let module = unsafe { GetModuleHandleW(null()) };
+        let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) };
+        if keyboard.is_null() {
             return Err(format!(
                 "Не удалось начать ввод сочетания. {}",
                 io::Error::last_os_error()
             ));
+        }
+        let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), module, 0) };
+        if mouse.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { UnhookWindowsHookEx(keyboard) };
+            return Err(format!("Не удалось начать ввод сочетания. {error}"));
         }
         let generation = TARGET.with(|target| {
             let generation = target.get().1.wrapping_add(1);
@@ -46,7 +54,8 @@ impl Capture {
         });
         DELIVERY_FAILED.set(false);
         Ok(Self {
-            hook,
+            keyboard,
+            mouse,
             generation,
             keys: Keys {
                 held,
@@ -63,24 +72,44 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         TARGET.with(|target| target.set((null_mut(), self.generation)));
-        unsafe { UnhookWindowsHookEx(self.hook) };
+        unsafe {
+            UnhookWindowsHookEx(self.mouse);
+            UnhookWindowsHookEx(self.keyboard);
+        }
     }
+}
+
+fn post_input(key: u16, down: bool) -> bool {
+    let (hwnd, generation) = TARGET.with(Cell::get);
+    if hwnd.is_null() || unsafe { GetForegroundWindow() } != hwnd {
+        return false;
+    }
+    let packed = key as isize | ((down as isize) << 16);
+    if unsafe { PostMessageW(hwnd, KEY_EVENT, generation, packed) } == 0 {
+        // Discard the incomplete recording once the UI drains its queue.
+        DELIVERY_FAILED.set(true);
+    }
+    true
 }
 
 unsafe extern "system" fn on_key(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
     unsafe {
-        if code == HC_ACTION as i32 {
-            let (hwnd, generation) = TARGET.with(Cell::get);
-            if !hwnd.is_null()
-                && GetForegroundWindow() == hwnd
-                && let Some(down) = is_key_down(message as u32)
-            {
-                let event = &*(data as *const KBDLLHOOKSTRUCT);
-                let packed = event.vkCode as isize | ((down as isize) << 16);
-                if PostMessageW(hwnd, KEY_EVENT, generation, packed) == 0 {
-                    // Discard the incomplete recording once the UI drains its queue.
-                    DELIVERY_FAILED.set(true);
-                }
+        if code == HC_ACTION as i32
+            && let Some(down) = is_key_down(message as u32)
+            && let Ok(key) = u8::try_from((*(data as *const KBDLLHOOKSTRUCT)).vkCode)
+            && post_input(u16::from(key), down)
+        {
+            return 1;
+        }
+        CallNextHookEx(null_mut(), code, message, data)
+    }
+}
+
+unsafe extern "system" fn on_mouse(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
+    unsafe {
+        if code == HC_ACTION as i32 && message as u32 == WM_MOUSEWHEEL {
+            let delta = ((*(data as *const MSLLHOOKSTRUCT)).mouseData >> 16) as i16;
+            if delta != 0 && post_input(if delta > 0 { WHEEL_UP } else { WHEEL_DOWN }, true) {
                 return 1;
             }
         }
@@ -140,6 +169,16 @@ impl Keys {
     }
 
     pub(super) fn key(&mut self, key: u16, down: bool) -> Event {
+        let event = self.update(key, down);
+        // A wheel tick has no physical key-up. Held keyboard modifiers still
+        // delay committing the assignment until the last one is released.
+        if down && matches!(key, WHEEL_UP | WHEEL_DOWN) {
+            return self.update(key, false);
+        }
+        event
+    }
+
+    fn update(&mut self, key: u16, down: bool) -> Event {
         // Shell/menu-mask events (including Rustile's VK 0xff) and Unicode
         // packets do not identify a physical shortcut key.
         if modifier(key) == 0 && !Chord::supports_key(key) {
@@ -216,6 +255,31 @@ mod tests {
         keys.key(VK_A, false);
         assert_eq!(keys.key(VK_B, false), Event::Ambiguous);
         assert_eq!(keys.key(VK_ESCAPE, true), Event::Cancel);
+    }
+
+    #[test]
+    fn repeated_wheel_ticks_commit_when_the_last_modifier_is_released() {
+        let mut keys = Keys::default();
+        keys.key(VK_RWIN, true);
+        for _ in 0..2 {
+            assert_eq!(keys.key(WHEEL_DOWN, true), Event::Changed);
+            assert_eq!(keys.label(), "Win+Колесо ↓");
+        }
+        assert_eq!(
+            keys.key(VK_RWIN, false),
+            Event::Complete(Chord {
+                mods: MOD_WIN,
+                key: WHEEL_DOWN
+            })
+        );
+        let mut bare = Keys::default();
+        assert_eq!(
+            bare.key(WHEEL_UP, true),
+            Event::Complete(Chord {
+                mods: 0,
+                key: WHEEL_UP
+            })
+        );
     }
 
     #[test]

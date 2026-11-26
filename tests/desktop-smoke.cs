@@ -471,7 +471,7 @@ internal static class DesktopSmoke {
         CaptureKey(row, modifier, false, system);
     }
     static string[] ShortcutLabels(IntPtr editor) {
-        return Enumerable.Range(1000, 34).Select(id => ControlText(EditorControl(editor, id))).ToArray();
+        return Enumerable.Range(1000, 46).Select(id => ControlText(EditorControl(editor, id))).ToArray();
     }
     static void EmptyIdleHeader(IntPtr editor) {
         var status = GetDlgItem(editor, 506);
@@ -838,9 +838,14 @@ internal static class DesktopSmoke {
         var initial = ShortcutLabels(editor);
         EmptyIdleHeader(editor);
         var viewHwnd = EditorControl(editor, 510);
-        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1034) == IntPtr.Zero
+        Require(initial.All(t => t.Length > 0) && GetDlgItem(viewHwnd, 1046) == IntPtr.Zero
             && initial[27].Contains("Win+") && initial[28].Contains("Win+") && initial[29].Contains("Win+"),
-            "The page should expose 34 editable shortcuts including the desktop navigation keys");
+            "The page should expose all 46 editable shortcuts");
+        Require(initial[34].EndsWith("Win+Колесо ↑") && initial[35].EndsWith("Win+Колесо ↓"),
+            "The editor should show both desktop wheel bindings");
+        for (int number = 1; number <= 10; number++)
+            Require(initial[35 + number].EndsWith("Win+" + (number % 10)),
+                "Wrong desktop number key for slot " + number);
         var arrows = new[] { "←", "→", "↑", "↓" };
         for (int i = 0; i < arrows.Length; ++i) {
             Require(initial[30 + i].EndsWith("Ctrl+Win+" + arrows[i]),
@@ -850,7 +855,7 @@ internal static class DesktopSmoke {
                 "Quick resize should display the default forward and reverse shortcuts for " + arrows[i]);
         }
         var view = Bounds(viewHwnd);
-        if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 760 * GetDpiForWindow(editor))
+        if (area.Width * 96 >= 920 * GetDpiForWindow(editor) && area.Height * 96 >= 900 * GetDpiForWindow(editor))
             Require(Enumerable.Range(1000, initial.Length).All(i => view.Contains(Bounds(EditorControl(editor, i)))),
                 "Every shortcut should fit on the default-sized editor page");
         TrayOpen(tray, TraySelect, area);

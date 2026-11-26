@@ -19,13 +19,22 @@ fn desktop_focus_waits_for_the_requested_desktop_and_ignores_reorders() {
             .is_none()
     );
     focus.requested(a, b);
+    assert!(
+        focus.awaiting_switch(),
+        "the next wheel step must wait for Explorer"
+    );
     assert!(!focus.observe(Some(a)));
+    assert!(focus.awaiting_switch());
     assert!(
         focus
             .settle(Some(a), |_| panic!("still on the source desktop"))
             .is_some()
     );
     assert!(!focus.observe(Some(b)));
+    assert!(
+        !focus.awaiting_switch(),
+        "navigation can continue before focus settles"
+    );
     assert!(
         focus
             .settle(Some(b), |id| {
@@ -83,7 +92,9 @@ fn smoke_desktop() -> String {
 #[ignore = "driven by desktop-smoke on a private Win32 desktop"]
 fn isolated_shortcut_ownership() {
     use crate::settings::{Chord, Shortcut};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F13, VK_F14, VK_F15};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16,
+    };
 
     smoke_desktop();
     assert!(unsafe { GetForegroundWindow() }.is_null());
@@ -91,6 +102,7 @@ fn isolated_shortcut_ownership() {
     for (action, key) in [
         (Shortcut::FocusLeft, VK_F13),
         (Shortcut::ToggleMosaic, VK_F14),
+        (Shortcut::Desktop10, VK_F16),
     ] {
         settings = settings
             .changed(Command::Shortcut(action, Chord { key, mods: 0 }))
@@ -103,7 +115,7 @@ fn isolated_shortcut_ownership() {
         let mut msg = MSG::default();
         let found =
             unsafe { PeekMessageW(&mut msg, null_mut(), KEY_COMMAND, KEY_COMMAND, PM_REMOVE) };
-        (found != 0).then_some(((msg.wParam & 0xff) as i32, msg.lParam))
+        (found != 0).then_some(((msg.wParam & 0xff) as i32, msg.wParam >> 8, msg.lParam))
     };
     // This also creates the receiving thread's queue. The callback is invoked
     // directly, so no input enters the user's session or the Shell.
@@ -118,7 +130,7 @@ fn isolated_shortcut_ownership() {
 
     hook.set_settings(settings);
     assert_eq!(key(VK_F14, true), 1);
-    assert_eq!(next_command(), Some((TOGGLE_MOSAIC, 0)));
+    assert!(matches!(next_command(), Some((TOGGLE_MOSAIC, ticket, 0)) if ticket != 0));
     assert_eq!(key(VK_F14, true), 1);
     assert_eq!(key(VK_F14, false), 1);
     assert_eq!(next_command(), None);
@@ -130,6 +142,24 @@ fn isolated_shortcut_ownership() {
     assert_eq!(next_command(), None);
     assert_eq!(key(VK_F15, true), 0);
     assert_eq!(key(VK_F15, false), 0);
+
+    assert_eq!(key(VK_F16, true), 1);
+    assert_eq!(key(VK_F16, true), 1);
+    assert_eq!(key(VK_F16, false), 1);
+    assert_eq!(next_command(), Some((DESKTOP_TENTH, 0, 0)));
+    assert_eq!(next_command(), None);
+
+    let wheel = |message, delta, mods| shortcuts::test_wheel_event(message, delta, mods, owner);
+    assert!(!wheel(WM_MOUSEWHEEL, 120, 0));
+    assert!(!wheel(WM_MOUSEHWHEEL, 120, MOD_WIN));
+    assert!(wheel(WM_MOUSEWHEEL, 60, MOD_WIN));
+    assert_eq!(next_command(), None);
+    assert!(wheel(WM_MOUSEWHEEL, 60, MOD_WIN));
+    assert_eq!(next_command(), Some((DESKTOP_PREVIOUS, 0, 0)));
+    assert!(wheel(WM_MOUSEWHEEL, -240, MOD_WIN));
+    assert_eq!(next_command(), Some((DESKTOP_NEXT, 0, 0)));
+    assert_eq!(next_command(), Some((DESKTOP_NEXT, 0, 0)));
+    assert_eq!(next_command(), None);
 }
 
 #[test]

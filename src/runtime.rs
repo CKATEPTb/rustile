@@ -6,6 +6,7 @@ mod shortcuts;
 mod tests;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::ptr::null_mut;
@@ -43,6 +44,8 @@ pub(crate) const CANCEL: i32 = 41;
 const MOVE: i32 = 50;
 pub(crate) const QUICK_RESIZE: i32 = 60;
 pub(crate) const QUICK_REVERSE: i32 = 70;
+const DESKTOP_FIRST: i32 = 80;
+const DESKTOP_TENTH: i32 = DESKTOP_FIRST + 9;
 const WINDOW_EVENTS: u32 = WM_APP + 1;
 const KEY_COMMAND: u32 = WM_APP + 2;
 pub(crate) const OUTLINE_SETTINGS_CHANGED: u32 = WM_APP + 3;
@@ -50,6 +53,25 @@ pub(crate) const RESIZE_HINT_CHANGED: u32 = WM_APP + 4;
 const DESKTOP_LIST_CHANGED: u32 = WM_APP + 5;
 const DESKTOP_SETTLE_MS: u32 = 160;
 const FOCUS_SETTLE_MS: u32 = 40;
+
+enum DesktopDestination {
+    Relative { next: bool },
+    Number(usize),
+}
+
+impl DesktopDestination {
+    fn from_command(command: i32) -> Option<Self> {
+        match command {
+            DESKTOP_PREVIOUS | DESKTOP_NEXT => Some(Self::Relative {
+                next: command == DESKTOP_NEXT,
+            }),
+            DESKTOP_FIRST..=DESKTOP_TENTH => {
+                Some(Self::Number((command - DESKTOP_FIRST + 1) as usize))
+            }
+            _ => None,
+        }
+    }
+}
 
 // GetMessage dispatches out-of-context WinEvents on the hook's installing thread.
 // Defer all application work until the callback returns, including Win32 calls
@@ -333,6 +355,11 @@ struct DesktopFocus {
 }
 
 impl DesktopFocus {
+    fn awaiting_switch(&self) -> bool {
+        self.pending
+            .is_some_and(|(target, _)| Some(target) != self.observed)
+    }
+
     fn requested(&mut self, from: DesktopId, to: DesktopId) {
         self.observed = Some(from);
         self.pending = Some((to, 0));
@@ -380,6 +407,7 @@ fn pump(
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
     let mut focus_timer = MessageTimer::default();
+    let mut navigation = VecDeque::new();
     let mut desktop_focus = DesktopFocus {
         observed: workspaces
             .current_desktop()
@@ -487,9 +515,15 @@ fn pump(
         } else if needs_scan {
             inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
         }
+        let destination = if message.message == KEY_COMMAND && message.lParam == 0 {
+            DesktopDestination::from_command((message.wParam & 0xff) as i32)
+        } else {
+            None
+        };
         if desktops_changed
             || timer_fired
             || focus_due
+            || (destination.is_some() && desktop_focus.awaiting_switch())
             || (desktop_watch.is_none()
                 && (inventory_due || (has_events && !workspaces.available())))
         {
@@ -499,14 +533,19 @@ fn pump(
                 manager.layout_desktop()
             };
             if desktop_focus.observe(actual) {
+                // Task View or another program selected a different desktop.
+                navigation.clear();
                 if actual != manager.layout_desktop() {
                     desktop_timer.schedule_within(FOCUS_SETTLE_MS);
                 }
                 focus_timer.schedule(FOCUS_SETTLE_MS);
             } else if focus_due {
+                let awaiting_switch = desktop_focus.awaiting_switch();
                 let delay = desktop_focus.settle(actual, |id| manager.restore_desktop_focus(id));
                 if let Some(delay) = delay {
                     focus_timer.schedule(delay);
+                } else if awaiting_switch {
+                    navigation.clear();
                 }
                 refresh(manager, 0);
             }
@@ -526,16 +565,12 @@ fn pump(
             let ticket = message.wParam >> 8;
             if command == TOGGLE_MOSAIC && target == 0 {
                 shortcut_command = Some((Command::Toggle, ticket));
-            } else if target == 0 && matches!(command, DESKTOP_PREVIOUS | DESKTOP_NEXT) {
-                if let Some((from, to)) = workspaces.navigate(command == DESKTOP_NEXT) {
-                    manager.finish_mode();
-                    manager.cancel_mouse_move();
-                    desktop_focus.requested(from, to);
-                    desktop_timer.schedule_within(FOCUS_SETTLE_MS);
-                    focus_timer.schedule(FOCUS_SETTLE_MS);
+            } else if let Some(destination) = destination {
+                if matches!(destination, DesktopDestination::Number(_)) {
+                    navigation.clear();
                 }
+                navigation.push_back(destination);
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
-                refresh(manager, ticket);
             } else {
                 if manager.accepts_foreground_shortcut(target) {
                     dispatch(manager, target, command);
@@ -546,6 +581,24 @@ fn pump(
             unsafe {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
+            }
+        }
+        // A wheel can send several detents before Explorer reports the first
+        // switch. Resolve the next step against its confirmed destination.
+        while !desktop_focus.awaiting_switch()
+            && let Some(destination) = navigation.pop_front()
+        {
+            let switched = match destination {
+                DesktopDestination::Relative { next } => workspaces.navigate(next),
+                DesktopDestination::Number(number) => workspaces.navigate_to(number),
+            };
+            if let Some((from, to)) = switched {
+                manager.finish_mode();
+                manager.cancel_mouse_move();
+                desktop_focus.requested(from, to);
+                desktop_timer.schedule_within(FOCUS_SETTLE_MS);
+                focus_timer.schedule(FOCUS_SETTLE_MS);
+                refresh(manager, 0);
             }
         }
         if let Ok(result) = startup_rx.try_recv() {
