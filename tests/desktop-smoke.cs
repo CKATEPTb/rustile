@@ -1298,6 +1298,11 @@ internal static class DesktopSmoke {
             if (!SetThreadDesktop(desktop)) throw new Win32Exception();
             Directory.CreateDirectory(appData);
             Environment.SetEnvironmentVariable("LOCALAPPDATA", appData, EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_DESKTOP", desktopName);
+            using (var keys = new Child(managerTests, "--exact runtime::tests::isolated_shortcut_ownership --ignored", desktopName)) {
+                Require(keys.Exited(10000) && keys.ExitCode == 0, "Shortcut callback ownership test failed on the empty private desktop");
+            }
+            Console.WriteLine("PASS  Shortcut callback consumes assigned presses, repeats and releases with no foreground or failed delivery; unassigned keys pass");
             var self = Process.GetCurrentProcess().MainModule.FileName;
             var windows = new IntPtr[3];
             var originals = new Rectangle[3];
@@ -1399,7 +1404,6 @@ internal static class DesktopSmoke {
             Array.Resize(ref originals, 6);
             Array.Resize(ref fixtures, 6);
             launch(2); launch(3); launch(4); launch(5);
-            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_DESKTOP", desktopName);
             StartupSettings(managerTests, desktopName, area);
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_MIN_HEIGHT", TallMinimum(area).ToString());
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_WINDOWS", string.Join(" ", windows.Select(w => w.ToInt64())));

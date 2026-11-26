@@ -213,7 +213,7 @@ pub(crate) fn dispatch(manager: &mut Manager, target: isize, command: i32) {
             if let Some(dir) = direction(MOVE) {
                 manager.move_window(target, dir);
             } else if let Some(dir) = direction(FOCUS) {
-                manager.focus(dir);
+                manager.focus(target, dir);
             } else if let Some(dir) = direction(QUICK_RESIZE) {
                 manager.quick_resize(target, dir, false);
             } else if let Some(dir) = direction(QUICK_REVERSE) {
@@ -390,7 +390,6 @@ fn pump(
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<startup::Startup, String>>();
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut desktop_watch = None;
-    shortcuts::set_desktop_navigation(workspaces.available());
     if workspaces.supported {
         desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
         inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
@@ -482,7 +481,6 @@ fn pump(
             if let Some(delay) = workspaces.reconcile() {
                 inventory_timer.schedule(delay);
             }
-            shortcuts::set_desktop_navigation(workspaces.available());
             if workspaces.supported && desktop_watch.is_none() {
                 desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
             }
@@ -539,7 +537,7 @@ fn pump(
                 inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 refresh(manager, ticket);
             } else {
-                if target != 0 && target == crate::native::foreground() {
+                if manager.accepts_foreground_shortcut(target) {
                     dispatch(manager, target, command);
                 }
                 refresh(manager, ticket);

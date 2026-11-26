@@ -6,6 +6,7 @@ pub(super) const KEY_EVENT: u32 = WM_APP + 91;
 // one recording only, even if the user immediately starts editing another row.
 thread_local! {
     static TARGET: Cell<(HWND, usize)> = const { Cell::new((null_mut(), 0)) };
+    static DELIVERY_FAILED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) struct Capture {
@@ -43,6 +44,7 @@ impl Capture {
             target.set((hwnd, generation));
             generation
         });
+        DELIVERY_FAILED.set(false);
         Ok(Self {
             hook,
             generation,
@@ -51,6 +53,10 @@ impl Capture {
                 ..Default::default()
             },
         })
+    }
+
+    pub(super) fn take_delivery_failure() -> bool {
+        DELIVERY_FAILED.replace(false)
     }
 }
 
@@ -71,9 +77,11 @@ unsafe extern "system" fn on_key(code: i32, message: WPARAM, data: LPARAM) -> LR
             {
                 let event = &*(data as *const KBDLLHOOKSTRUCT);
                 let packed = event.vkCode as isize | ((down as isize) << 16);
-                if PostMessageW(hwnd, KEY_EVENT, generation, packed) != 0 {
-                    return 1;
+                if PostMessageW(hwnd, KEY_EVENT, generation, packed) == 0 {
+                    // Discard the incomplete recording once the UI drains its queue.
+                    DELIVERY_FAILED.set(true);
                 }
+                return 1;
             }
         }
         CallNextHookEx(null_mut(), code, message, data)

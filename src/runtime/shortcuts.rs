@@ -43,43 +43,38 @@ impl KeyRoutes {
         mods: u32,
         foreground: impl FnOnce() -> isize,
     ) -> Option<BoundCommand> {
-        let commands = match pending.mode(state) {
-            Mode::Normal => self.normal,
-            Mode::Resize => self.resize,
-        };
-        let id = commands
-            .get(mods as usize)
-            .copied()
-            .filter(|&id| id != 0)
-            .map(i32::from)?;
-        if matches!(id, DESKTOP_PREVIOUS | DESKTOP_NEXT) && !state.desktop_navigation {
-            // In particular, leave native Win+Ctrl+Left/Right to Explorer.
+        let normal = *self.normal.get(mods as usize)?;
+        let resize = self.resize[mods as usize];
+        let mode = pending.mode(state);
+        if normal == 0 && (mode == Mode::Normal || resize == 0) {
+            return None;
+        }
+        let active = foreground();
+        let known_tile =
+            matches!(state.target, Some(ShortcutTarget::Tile { id, .. }) if id == active);
+        // Only the window being resized owns modal-only keys like bare arrows.
+        let resizing = mode == Mode::Resize && known_tile;
+        let id = i32::from(if resizing && resize != 0 {
+            resize
+        } else {
+            normal
+        });
+        if id == 0 {
             return None;
         }
         let target = if matches!(id, TOGGLE_MOSAIC | DESKTOP_PREVIOUS | DESKTOP_NEXT) {
-            0 // Global commands also work on an empty desktop or while tiling is paused.
+            Some(0) // Global commands need no foreground window.
         } else {
-            let target = state.target?;
-            match target {
-                ShortcutTarget::Tile {
-                    can_maximize: false,
-                    ..
-                } if id == TOGGLE_MAXIMIZE => return None,
-                ShortcutTarget::Expanded(_) if !matches!(id, CLOSE_WINDOW | TOGGLE_MAXIMIZE) => {
-                    return None;
-                }
-                _ => {}
-            }
-            if target.id() != foreground() {
-                return None;
-            }
-            target.id()
+            // Own a configured normal chord even when its action is unavailable
+            // in resize mode. The manager validates the sampled HWND on delivery.
+            (active != 0 && (!resizing || resize != 0)).then_some(active)
         };
         Some(BoundCommand {
             id,
             target,
             focus_epoch: state.focus_epoch,
             mods,
+            predict_resize: known_tile,
         })
     }
 }
@@ -176,12 +171,12 @@ enum Press {
     Up,
     Passed,
     Consumed,
-    ResizeStep,
+    ResizeStep(isize),
 }
 
 impl Press {
-    fn route(&mut self, down: bool, command: Option<i32>) -> Action {
-        let consumed = matches!(*self, Self::Consumed | Self::ResizeStep);
+    fn route(&mut self, down: bool, binding: Option<BoundCommand>) -> Action {
+        let consumed = matches!(*self, Self::Consumed | Self::ResizeStep(_));
         if !down {
             *self = Self::Up;
             return if consumed {
@@ -193,13 +188,18 @@ impl Press {
         if *self == Self::Passed {
             return Action::Pass;
         }
-        if let Some(id) = command {
+        if let Some(binding) = binding {
+            let Some(target) = binding.target else {
+                *self = Self::Consumed;
+                return Action::Consume;
+            };
+            let id = binding.id;
             let repeatable = [EXPAND, SHRINK, QUICK_RESIZE, QUICK_REVERSE]
                 .into_iter()
                 .any(|first| (first..first + 4).contains(&id));
-            if !consumed || (*self == Self::ResizeStep && repeatable) {
+            if !consumed || (*self == Self::ResizeStep(target) && repeatable) {
                 *self = if repeatable {
-                    Self::ResizeStep
+                    Self::ResizeStep(target)
                 } else {
                     Self::Consumed
                 };
@@ -219,7 +219,6 @@ impl Press {
 struct Snapshot {
     target: Option<ShortcutTarget>,
     mode: Mode,
-    desktop_navigation: bool,
     focus_epoch: usize,
     handled: usize,
 }
@@ -234,7 +233,6 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         focus: Snapshot {
             target: None,
             mode: Mode::Normal,
-            desktop_navigation: false,
             focus_epoch: 0,
             handled: 0,
         },
@@ -243,14 +241,6 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
         keys: Routes::EMPTY,
     })
 });
-
-pub(super) fn set_desktop_navigation(available: bool) {
-    ROUTING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .focus
-        .desktop_navigation = available;
-}
 
 pub(super) fn update(target: Option<ShortcutTarget>, mode: Mode, handled: usize) {
     let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
@@ -354,9 +344,19 @@ fn mark_modifier_used() {
 #[derive(Clone, Copy)]
 struct BoundCommand {
     id: i32,
-    target: isize,
+    target: Option<isize>,
     focus_epoch: usize,
     mods: u32,
+    predict_resize: bool,
+}
+
+impl BoundCommand {
+    fn transition(self, pending: Pending) -> Option<Pending> {
+        if self.id == START_RESIZE && !self.predict_resize {
+            return None;
+        }
+        pending.transition(self.id, self.focus_epoch)
+    }
 }
 
 fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
@@ -389,38 +389,52 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             } else {
                 None
             };
-            match (press.route(down, binding.map(|b| b.id)), binding) {
-                (Action::Consume, _) => {
-                    HELD.with(|held| held[slot].set(press));
-                    return 1;
-                }
-                (Action::Command(id), Some(binding)) => {
-                    let transition = pending.transition(id, binding.focus_epoch);
+            let action = press.route(down, binding);
+            HELD.with(|held| held[slot].set(press));
+            if action != Action::Pass {
+                if let Action::Command(id) = action
+                    && let Some(binding) = binding
+                    && let Some(target) = binding.target
+                {
+                    let transition = binding.transition(pending);
                     let ticket = transition.map_or(0, |next| next.ticket);
                     let command = (ticket << 8) | id as usize;
-                    if unsafe {
-                        PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, binding.target)
-                    } != 0
+                    if unsafe { PostThreadMessageW(OWNER.get(), KEY_COMMAND, command, target) } != 0
+                        && let Some(next) = transition
                     {
-                        HELD.with(|held| held[slot].set(press));
-                        if let Some(next) = transition {
-                            PENDING.set(next);
-                        }
-                        if previous == Press::Up && binding.mods & (MOD_WIN | MOD_ALT) != 0 {
-                            mark_modifier_used();
-                        }
-                        return 1;
+                        PENDING.set(next);
                     }
-                    if previous != Press::Up {
-                        return 1;
-                    }
-                    HELD.with(|held| held[slot].set(Press::Passed));
                 }
-                _ => HELD.with(|held| held[slot].set(press)),
+                if down
+                    && previous == Press::Up
+                    && binding.is_some_and(|b| b.mods & (MOD_WIN | MOD_ALT) != 0)
+                {
+                    mark_modifier_used();
+                }
+                return 1;
             }
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
+}
+
+#[cfg(test)]
+pub(super) fn test_keyboard_event(key: u16, down: bool, owner: u32) -> isize {
+    let saved = OWNER.replace(owner);
+    let event = KBDLLHOOKSTRUCT {
+        vkCode: u32::from(key),
+        ..Default::default()
+    };
+    let message = if down { WM_KEYDOWN } else { WM_KEYUP };
+    let result = unsafe {
+        on_key(
+            HC_ACTION as i32,
+            message as usize,
+            &raw const event as isize,
+        )
+    };
+    OWNER.set(saved);
+    result
 }
 
 pub(super) struct Hook {
@@ -444,6 +458,9 @@ impl Hook {
                 }
                 let mut message = MSG::default();
                 unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
+                // The first callback must already see the user's assignments.
+                let keys = Routes::new(settings);
+                ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = keys;
                 let module = unsafe { GetModuleHandleW(null()) };
                 let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) };
                 if hook.is_null() {
@@ -459,14 +476,10 @@ impl Hook {
             })
             .map_err(|e| format!("Поток сочетаний клавиш: {e}"))?;
         match status.recv() {
-            Ok(Ok(id)) => {
-                let hook = Self {
-                    thread: Some(thread),
-                    id,
-                };
-                hook.set_settings(settings);
-                Ok(hook)
-            }
+            Ok(Ok(id)) => Ok(Self {
+                thread: Some(thread),
+                id,
+            }),
             result => {
                 let _ = thread.join();
                 match result {
@@ -485,12 +498,12 @@ impl Hook {
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        update(None, Mode::Normal, 0);
-        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
         unsafe { PostThreadMessageW(self.id, WM_QUIT, 0, 0) };
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        update(None, Mode::Normal, 0);
+        ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
     }
 }
 
@@ -521,7 +534,6 @@ mod tests {
                         can_maximize: true,
                     }),
                     mode: Mode::Normal,
-                    desktop_navigation: false,
                     focus_epoch: 1,
                     handled: 0,
                 },
@@ -537,18 +549,28 @@ mod tests {
         }
 
         fn key(&mut self, key: u16, down: bool, mods: u32) -> Action {
+            self.key_with_foreground(
+                key,
+                down,
+                mods,
+                self.state.target.map_or(0, ShortcutTarget::id),
+            )
+        }
+
+        fn key_with_foreground(
+            &mut self,
+            key: u16,
+            down: bool,
+            mods: u32,
+            active: isize,
+        ) -> Action {
             let slot = usize::from(key);
             let routes = Routes::new(self.settings);
-            let command = routes.0[slot].and_then(|route| {
-                route
-                    .binding(self.state, self.pending, mods, || {
-                        self.state.target.map_or(0, ShortcutTarget::id)
-                    })
-                    .map(|b| b.id)
-            });
-            let action = self.held[slot].route(down, command);
-            if let Action::Command(id) = action
-                && let Some(next) = self.pending.transition(id, self.state.focus_epoch)
+            let binding = routes.0[slot]
+                .and_then(|route| route.binding(self.state, self.pending, mods, || active));
+            let action = self.held[slot].route(down, binding);
+            if let Action::Command(_) = action
+                && let Some(next) = binding.and_then(|b| b.transition(self.pending))
             {
                 self.pending = next;
             }
@@ -569,13 +591,8 @@ mod tests {
                 (VK_RIGHT, DESKTOP_NEXT),
                 (VK_DOWN, DESKTOP_NEXT),
             ] {
-                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
-                keyboard.state.desktop_navigation = true;
-                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
-                assert_eq!(keyboard.key(key, false, mods), Action::Pass);
                 assert_eq!(keyboard.key(key, true, mods), Action::Command(id));
                 assert_eq!(keyboard.key(key, true, mods), Action::Consume);
-                keyboard.state.desktop_navigation = false;
                 assert_eq!(keyboard.key(key, false, 0), Action::Consume);
             }
         }
@@ -586,7 +603,6 @@ mod tests {
         let mods = MOD_CONTROL | MOD_WIN;
         let mut keyboard = Keyboard::new();
         keyboard.assign(Shortcut::NextDesktop, MOD_ALT, VK_F8);
-        keyboard.state.desktop_navigation = true;
         let routes = Routes::new(keyboard.settings);
         for mode in [Mode::Normal, Mode::Resize] {
             keyboard.state.mode = mode;
@@ -596,8 +612,8 @@ mod tests {
                     .map(|b| (b.id, b.target))
             };
             assert_eq!(command(VK_RIGHT, mods), None);
-            assert_eq!(command(VK_F8, MOD_ALT), Some((DESKTOP_NEXT, 0)));
-            assert_eq!(command(VK_DOWN, mods), Some((DESKTOP_NEXT, 0)));
+            assert_eq!(command(VK_F8, MOD_ALT), Some((DESKTOP_NEXT, Some(0))));
+            assert_eq!(command(VK_DOWN, mods), Some((DESKTOP_NEXT, Some(0))));
         }
     }
 
@@ -629,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_configured_global_chord_can_bypass_a_stale_target() {
+    fn window_chords_capture_the_live_foreground_and_global_chords_need_no_target() {
         let mut keyboard = Keyboard::new();
         keyboard.assign(Shortcut::ToggleMosaic, MOD_ALT, VK_F8);
         let routes = Routes::new(keyboard.settings);
@@ -640,10 +656,10 @@ mod tests {
                     .binding(keyboard.state, Pending::NEW, mods, || 999)
                     .map(|b| (b.id, b.target))
             };
-            assert_eq!(command(VK_F8, MOD_ALT), Some((TOGGLE_MOSAIC, 0)));
+            assert_eq!(command(VK_F8, MOD_ALT), Some((TOGGLE_MOSAIC, Some(0))));
             assert_eq!(command(VK_F8, MOD_ALT | MOD_WIN), None);
             assert_eq!(command(VK_Y, MOD_WIN), None);
-            assert_eq!(command(VK_LEFT, MOD_WIN), None);
+            assert_eq!(command(VK_LEFT, MOD_WIN), Some((FOCUS, Some(999))));
         }
     }
 
@@ -667,6 +683,60 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_resize_snapshot_does_not_capture_plain_keys_on_a_different_window() {
+        let mut keyboard = Keyboard::new();
+        keyboard.state.mode = Mode::Resize;
+        let other = 204;
+        assert_eq!(
+            keyboard.key_with_foreground(VK_UP, true, 0, other),
+            Action::Pass
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_UP, false, 0, other),
+            Action::Pass
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_UP, true, WIN_SHIFT, other),
+            Action::Command(MOVE + 2)
+        );
+        keyboard.state.mode = Mode::Normal;
+        assert_eq!(
+            keyboard.key_with_foreground(VK_RETURN, true, MOD_WIN, other),
+            Action::Command(START_RESIZE)
+        );
+        assert_eq!(
+            keyboard.pending.ticket, 0,
+            "the manager must validate a new resize target"
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_ESCAPE, true, 0, other),
+            Action::Pass
+        );
+    }
+
+    #[test]
+    fn a_quick_resize_repeat_cannot_modify_a_window_that_gained_focus_mid_press() {
+        let mut keyboard = Keyboard::new();
+        let mods = MOD_WIN | MOD_ALT;
+        assert_eq!(
+            keyboard.key_with_foreground(VK_LEFT, true, mods, 100),
+            Action::Command(QUICK_RESIZE)
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_LEFT, true, mods, 200),
+            Action::Consume
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_LEFT, false, 0, 200),
+            Action::Consume
+        );
+        assert_eq!(
+            keyboard.key_with_foreground(VK_LEFT, true, mods, 200),
+            Action::Command(QUICK_RESIZE)
+        );
+    }
+
+    #[test]
     fn window_commands_require_fresh_presses_even_when_the_foreground_changes() {
         for (key, command) in [(VK_Q, CLOSE_WINDOW), (VK_F, TOGGLE_MAXIMIZE)] {
             let mut keyboard = Keyboard::new();
@@ -682,20 +752,23 @@ mod tests {
             assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Command(command));
             assert_eq!(keyboard.key(key, false, 0), Action::Consume);
             keyboard.state.target = None;
-            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Pass);
-            assert_eq!(keyboard.key(key, false, 0), Action::Pass);
+            assert_eq!(keyboard.key(key, true, MOD_WIN), Action::Consume);
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
         }
     }
 
     #[test]
-    fn a_tile_without_a_maximize_button_only_releases_its_maximize_chord() {
+    fn window_capabilities_are_checked_by_the_manager_after_the_hook_claims_the_chord() {
         let mut keyboard = Keyboard::new();
         keyboard.state.target = Some(ShortcutTarget::Tile {
             id: 100,
             can_maximize: false,
         });
-        assert_eq!(keyboard.key(VK_F, true, MOD_WIN), Action::Pass);
-        assert_eq!(keyboard.key(VK_F, false, 0), Action::Pass);
+        assert_eq!(
+            keyboard.key(VK_F, true, MOD_WIN),
+            Action::Command(TOGGLE_MAXIMIZE)
+        );
+        assert_eq!(keyboard.key(VK_F, false, 0), Action::Consume);
         assert_eq!(keyboard.key(VK_LEFT, true, MOD_WIN), Action::Command(FOCUS));
         assert_eq!(
             keyboard.key(VK_Q, true, MOD_WIN),
@@ -704,20 +777,22 @@ mod tests {
     }
 
     #[test]
-    fn expanded_windows_only_receive_their_current_window_bindings() {
+    fn expanded_windows_keep_their_configured_chords_and_wait_for_a_valid_resize_target() {
         let mut keyboard = Keyboard::new();
         keyboard.state.target = Some(ShortcutTarget::Expanded(100));
         keyboard.assign(Shortcut::ToggleMaximize, MOD_ALT, VK_F8);
-        for (mods, key) in [
-            (MOD_WIN, VK_F),
-            (MOD_WIN, VK_LEFT),
-            (WIN_SHIFT, VK_RIGHT),
-            (MOD_WIN, VK_RETURN),
-            (MOD_WIN | MOD_ALT, VK_UP),
+        assert_eq!(keyboard.key(VK_F, true, MOD_WIN), Action::Pass);
+        assert_eq!(keyboard.key(VK_F, false, 0), Action::Pass);
+        for (mods, key, id) in [
+            (MOD_WIN, VK_LEFT, FOCUS),
+            (WIN_SHIFT, VK_RIGHT, MOVE + 1),
+            (MOD_WIN, VK_RETURN, START_RESIZE),
+            (MOD_WIN | MOD_ALT, VK_UP, QUICK_RESIZE + 2),
         ] {
-            assert_eq!(keyboard.key(key, true, mods), Action::Pass);
-            assert_eq!(keyboard.key(key, false, 0), Action::Pass);
+            assert_eq!(keyboard.key(key, true, mods), Action::Command(id));
+            assert_eq!(keyboard.key(key, false, 0), Action::Consume);
         }
+        assert_eq!(keyboard.key(VK_LEFT, true, 0), Action::Pass);
         assert_eq!(
             keyboard.key(VK_F8, true, MOD_ALT),
             Action::Command(TOGGLE_MAXIMIZE)
@@ -753,8 +828,8 @@ mod tests {
         }
         assert_eq!(k.pending.ticket, 0);
         k.state.target = None;
-        assert_eq!(k.key(VK_LEFT, true, mods), Action::Pass);
-        assert_eq!(k.key(VK_LEFT, false, 0), Action::Pass);
+        assert_eq!(k.key(VK_LEFT, true, mods), Action::Consume);
+        assert_eq!(k.key(VK_LEFT, false, 0), Action::Consume);
     }
 
     #[test]
@@ -769,7 +844,7 @@ mod tests {
         );
         assert_eq!(k.key(VK_F8, false, 0), Action::Consume);
         k.state.mode = Mode::Resize;
-        assert_eq!(k.key(VK_F8, true, MOD_CONTROL), Action::Pass);
+        assert_eq!(k.key(VK_F8, true, MOD_CONTROL), Action::Consume);
         assert_eq!(k.key(VK_UP, true, 0), Action::Command(EXPAND + 2));
     }
 
@@ -845,9 +920,9 @@ mod tests {
         keyboard.state.target = None;
         keyboard.state.focus_epoch += 1;
         assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
-        assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Pass);
-        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Pass);
-        assert_eq!(keyboard.key(VK_RIGHT, true, WIN_SHIFT), Action::Pass);
+        assert_eq!(keyboard.key(VK_RETURN, true, MOD_WIN), Action::Consume);
+        assert_eq!(keyboard.key(VK_RETURN, false, 0), Action::Consume);
+        assert_eq!(keyboard.key(VK_RIGHT, true, WIN_SHIFT), Action::Consume);
         keyboard.state.target = Some(ShortcutTarget::Tile {
             id: 100,
             can_maximize: true,
@@ -859,7 +934,7 @@ mod tests {
     #[test]
     fn native_keypresses_keep_their_repeats_and_up_even_if_modifiers_change() {
         let mut keyboard = Keyboard::new();
-        for mods in [0, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_CONTROL | MOD_WIN] {
+        for mods in [0, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_ALT | MOD_SHIFT] {
             assert_eq!(keyboard.key(VK_RIGHT, true, mods), Action::Pass);
             assert_eq!(keyboard.key(VK_RIGHT, true, MOD_WIN), Action::Pass);
             assert_eq!(keyboard.key(VK_RIGHT, false, MOD_WIN), Action::Pass);
@@ -907,7 +982,7 @@ mod tests {
         );
         k.state.target = None;
         assert_eq!(k.key(VK_K, false, 0), Action::Consume);
-        assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Pass);
+        assert_eq!(k.key(VK_H, true, MOD_ALT), Action::Consume);
     }
 
     #[test]
@@ -920,7 +995,7 @@ mod tests {
         assert_eq!(k.key(VK_F8, true, MOD_ALT), Action::Command(START_RESIZE));
         assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
         assert_eq!(k.key(VK_K, true, 0), Action::Command(EXPAND + 2));
-        assert_eq!(k.key(VK_UP, true, MOD_WIN), Action::Pass);
+        assert_eq!(k.key(VK_UP, true, MOD_WIN), Action::Consume); // still bound to normal FocusUp
         assert_eq!(k.key(VK_ESCAPE, true, 0), Action::Pass);
         assert_eq!(k.key(VK_RETURN, true, 0), Action::Pass);
         assert_eq!(k.key(VK_SPACE, true, 0), Action::Command(CONFIRM));

@@ -218,6 +218,9 @@ impl ShortcutWindow {
     }
 
     pub(super) fn pre_translate(&self, msg: &MSG) -> bool {
+        if capture::Capture::take_delivery_failure() {
+            self.end_capture();
+        }
         let dialog = self.conflict.get();
         if !dialog.is_null() && (msg.hwnd == dialog || unsafe { IsChild(dialog, msg.hwnd) } != 0) {
             if msg.wParam == usize::from(VK_RETURN)

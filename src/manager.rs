@@ -890,6 +890,27 @@ impl Manager {
         .then_some(ShortcutTarget::Expanded(id))
     }
 
+    pub(crate) fn accepts_foreground_shortcut(&mut self, target: Id) -> bool {
+        if !self.settings.enabled || target == 0 || target != native::foreground() {
+            return false;
+        }
+        // A key can arrive before the foreground/desktop notifications. If its
+        // HWND belongs to a parked layout, confirm the switch with the Shell.
+        if self
+            .windows
+            .get(&target)
+            .is_some_and(|w| Some(w.desktop) != self.current)
+            && matches!(self.desktops.membership(target), DesktopMembership::Current(home) if Some(home) != self.current)
+        {
+            self.reconcile_desktop();
+        }
+        if self.session.as_ref().is_some_and(|s| s.target != target) {
+            self.finish_mode();
+        }
+        self.shortcut_target(target)
+            .is_some_and(|window| window.id() == native::foreground())
+    }
+
     pub fn close_window(&mut self, target: Id) {
         if self.shortcut_target(target).is_some() {
             self.finish_mode();
@@ -1094,15 +1115,12 @@ impl Manager {
         }
     }
 
-    pub fn focus(&mut self, direction: Direction) {
-        if !self.settings.enabled {
-            return;
-        }
+    pub fn focus(&mut self, from: Id, direction: Direction) {
         let Some(area) = self.area else { return };
-        let from = native::foreground();
         if self.can_act_on(from)
             && let Some(id) = self.workspace.layout.neighbor(from, direction, area)
             && self.can_act_on(id)
+            && native::foreground() == from
         {
             native::focus(id);
         }

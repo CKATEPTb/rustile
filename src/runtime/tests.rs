@@ -71,13 +71,71 @@ fn external_switch_supersedes_pending_focus_and_empty_desktops_stop_retrying() {
     );
 }
 
-#[test]
-#[ignore = "driven by desktop-smoke on a private Win32 desktop"]
-fn isolated_startup_tray() {
+fn smoke_desktop() -> String {
     let desktop = object_name(unsafe { GetThreadDesktop(GetCurrentThreadId()) }).unwrap();
     assert_eq!(desktop, std::env::var("RUSTILE_SMOKE_DESKTOP").unwrap());
     let uuid = desktop.strip_prefix("rustile-smoke-").unwrap();
     assert!(uuid.len() == 32 && uuid.bytes().all(|c| c.is_ascii_hexdigit()));
+    desktop
+}
+
+#[test]
+#[ignore = "driven by desktop-smoke on a private Win32 desktop"]
+fn isolated_shortcut_ownership() {
+    use crate::settings::{Chord, Shortcut};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F13, VK_F14, VK_F15};
+
+    smoke_desktop();
+    assert!(unsafe { GetForegroundWindow() }.is_null());
+    let mut settings = Settings::default();
+    for (action, key) in [
+        (Shortcut::FocusLeft, VK_F13),
+        (Shortcut::ToggleMosaic, VK_F14),
+    ] {
+        settings = settings
+            .changed(Command::Shortcut(action, Chord { key, mods: 0 }))
+            .unwrap();
+    }
+    let hook = shortcuts::Hook::install(settings).unwrap();
+    let owner = unsafe { GetCurrentThreadId() };
+    let key = |vk, down| shortcuts::test_keyboard_event(vk, down, owner);
+    let next_command = || {
+        let mut msg = MSG::default();
+        let found =
+            unsafe { PeekMessageW(&mut msg, null_mut(), KEY_COMMAND, KEY_COMMAND, PM_REMOVE) };
+        (found != 0).then_some(((msg.wParam & 0xff) as i32, msg.lParam))
+    };
+    // This also creates the receiving thread's queue. The callback is invoked
+    // directly, so no input enters the user's session or the Shell.
+    assert_eq!(next_command(), None);
+    assert_eq!(key(VK_F13, true), 1, "window command without a tile");
+    hook.set_settings(Settings::default());
+    assert_eq!(key(VK_F13, true), 1, "held repeat after unbinding");
+    assert_eq!(key(VK_F13, false), 1, "release after unbinding");
+    assert_eq!(key(VK_F13, true), 0, "next press uses the new bindings");
+    assert_eq!(key(VK_F13, false), 0);
+    assert_eq!(next_command(), None);
+
+    hook.set_settings(settings);
+    assert_eq!(key(VK_F14, true), 1);
+    assert_eq!(next_command(), Some((TOGGLE_MOSAIC, 0)));
+    assert_eq!(key(VK_F14, true), 1);
+    assert_eq!(key(VK_F14, false), 1);
+    assert_eq!(next_command(), None);
+
+    // Even a failed PostThreadMessage must consume the entire assigned press.
+    assert_eq!(shortcuts::test_keyboard_event(VK_F14, true, u32::MAX), 1);
+    assert_eq!(key(VK_F14, true), 1);
+    assert_eq!(key(VK_F14, false), 1);
+    assert_eq!(next_command(), None);
+    assert_eq!(key(VK_F15, true), 0);
+    assert_eq!(key(VK_F15, false), 0);
+}
+
+#[test]
+#[ignore = "driven by desktop-smoke on a private Win32 desktop"]
+fn isolated_startup_tray() {
+    let desktop = smoke_desktop();
 
     // This test runs alone in a dedicated process. Even if it crashes, its
     // fake Run key is outside the paths Windows processes at logon.
