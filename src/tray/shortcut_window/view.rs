@@ -2,7 +2,7 @@ use super::*;
 use Shortcut::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-const GROUPS: [(&str, &[Shortcut]); 6] = [
+const GROUPS: [(&str, &[Shortcut]); 7] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
         "Навигация по окнам",
@@ -40,6 +40,15 @@ const GROUPS: [(&str, &[Shortcut]); 6] = [
     (
         "Управление окнами",
         &[Shortcut::CloseWindow, ToggleMaximize, ToggleMosaic],
+    ),
+    (
+        "Перенос окна между столами",
+        &[
+            MovePreviousDesktop,
+            MovePreviousDesktopAlt,
+            MoveNextDesktop,
+            MoveNextDesktopAlt,
+        ],
     ),
     (
         "Рабочие столы",
@@ -285,13 +294,11 @@ impl ShortcutWindow {
         let mut starts = [(0, 0); GROUPS.len()];
         let mut end = [p(7); 2];
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            // Window navigation, window commands and desktops occupy the right
-            // column. The other 23 shortcuts stay together in the left column.
             let column = usize::from(
                 columns
                     && matches!(
                         actions[0],
-                        FocusLeft | Shortcut::CloseWindow | PreviousDesktop
+                        FocusLeft | PreviousDesktop | MovePreviousDesktop
                     ),
             );
             starts[i] = (column, end[column]);

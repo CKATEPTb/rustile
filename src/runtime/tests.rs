@@ -93,7 +93,7 @@ fn smoke_desktop() -> String {
 fn isolated_shortcut_ownership() {
     use crate::settings::{Chord, Shortcut};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16,
+        MOD_WIN, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_LSHIFT,
     };
 
     smoke_desktop();
@@ -103,6 +103,7 @@ fn isolated_shortcut_ownership() {
         (Shortcut::FocusLeft, VK_F13),
         (Shortcut::ToggleMosaic, VK_F14),
         (Shortcut::Desktop10, VK_F16),
+        (Shortcut::MoveNextDesktop, VK_F17),
     ] {
         settings = settings
             .changed(Command::Shortcut(action, Chord { key, mods: 0 }))
@@ -148,6 +149,34 @@ fn isolated_shortcut_ownership() {
     assert_eq!(key(VK_F16, false), 1);
     assert_eq!(next_command(), Some((DESKTOP_TENTH, 0, 0)));
     assert_eq!(next_command(), None);
+
+    assert_eq!(key(VK_F17, true), 1);
+    assert_eq!(key(VK_F17, false), 1);
+    assert_eq!(next_command(), None, "transfer needs a foreground window");
+
+    shortcuts::watch_transfer_focus();
+    key(VK_LSHIFT, true);
+    key(VK_LSHIFT, false);
+    key(0xff, true); // Rustile's Win/Alt usage marker.
+    key(0xff, false);
+    assert!(shortcuts::transfer_focus_uninterrupted());
+    assert_eq!(key(VK_F17, true), 1);
+    assert_eq!(key(VK_F17, true), 1);
+    assert_eq!(key(VK_F17, false), 1);
+    assert!(matches!(next_command(), Some((MOVE_DESKTOP_NEXT, ticket, 0)) if ticket != 0));
+    assert_eq!(next_command(), None);
+    assert!(shortcuts::transfer_focus_uninterrupted());
+
+    assert_eq!(key(VK_F15, true), 0);
+    assert!(!shortcuts::transfer_focus_uninterrupted());
+    assert_eq!(key(VK_F15, false), 0);
+    assert_eq!(key(VK_F17, true), 1);
+    assert_eq!(key(VK_F17, false), 1);
+    assert_eq!(
+        next_command(),
+        None,
+        "ordinary input ends the follow gesture"
+    );
 
     let wheel = |message, delta, mods| shortcuts::test_wheel_event(message, delta, mods, owner);
     assert!(!wheel(WM_MOUSEWHEEL, 120, 0));

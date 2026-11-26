@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::layout::Id;
 use crate::native::desktops::{DesktopId, occupancy, shell::DesktopShell};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +248,34 @@ pub(super) const EVENT_BATCH_MS: u32 = 40;
 const CONFIRM_MS: u32 = 60;
 const RETRY_MS: u32 = 350;
 
+pub(super) struct WindowTransfer {
+    pub(super) from: DesktopId,
+    pub(super) to: DesktopId,
+    pub(super) followed: bool,
+}
+
+impl WindowTransfer {
+    fn perform(
+        from: DesktopId,
+        to: DesktopId,
+        move_window: impl FnOnce() -> bool,
+        current: impl FnOnce() -> Option<DesktopId>,
+        uninterrupted: impl Fn() -> bool,
+        switch: impl FnOnce(DesktopId) -> bool,
+    ) -> Option<Self> {
+        if from == to || !uninterrupted() || !move_window() {
+            return None;
+        }
+        // A committed move is final even if the user interrupts the follow,
+        // Explorer changes desktops itself, or the switch RPC fails.
+        let followed = match current() {
+            Some(selected) if uninterrupted() => selected == to || (selected == from && switch(to)),
+            _ => false,
+        };
+        Some(Self { from, to, followed })
+    }
+}
+
 pub(super) struct Workspaces {
     pub(super) supported: bool,
     shell: Option<DesktopShell>,
@@ -318,13 +347,11 @@ impl Workspaces {
         }
     }
 
-    pub(super) fn navigate(&mut self, next: bool) -> Option<(DesktopId, DesktopId)> {
+    fn relative_target(&mut self, current: DesktopId, next: bool) -> Option<DesktopId> {
         let shell = self.shell.as_ref()?;
-        let current = shell.current()?;
         let order = shell.list()?;
-        let switch_to = |id| shell.switch(id).then_some((current, id));
         if !next {
-            return switch_to(neighbor(&order, current, false)?);
+            return neighbor(&order, current, false);
         }
         let tail = from_current(&order, current)?;
         if tail.len() > 1 {
@@ -332,7 +359,7 @@ impl Workspaces {
             if shell.current()? != current || shell.list()? != order {
                 return None;
             }
-            return switch_to(target);
+            return Some(target);
         }
         let inventory = Inventory::for_order(shell, current, order)?;
         if !inventory.occupied.contains(&current) {
@@ -349,9 +376,42 @@ impl Workspaces {
         self.policy.retry_at = None;
         self.policy.failures = 0;
         if self.policy.apply(shell, change) {
-            return switch_to(self.policy.spare?);
+            return self.policy.spare;
         }
         None
+    }
+
+    pub(super) fn navigate(&mut self, next: bool) -> Option<(DesktopId, DesktopId)> {
+        let current = self.current_desktop()?;
+        let target = self.relative_target(current, next)?;
+        let shell = self.shell.as_ref()?;
+        (shell.current()? == current && shell.switch(target)).then_some((current, target))
+    }
+
+    pub(super) fn transfer(
+        &mut self,
+        window: Id,
+        next: bool,
+        valid: impl Fn(DesktopId) -> bool,
+        uninterrupted: impl Fn() -> bool,
+    ) -> Option<WindowTransfer> {
+        let from = self.current_desktop()?;
+        if !uninterrupted() || !valid(from) {
+            return None;
+        }
+        let to = self.relative_target(from, next)?;
+        let shell = self.shell.as_ref()?;
+        if neighbor(&shell.list()?, from, next) != Some(to) {
+            return None;
+        }
+        WindowTransfer::perform(
+            from,
+            to,
+            || shell.move_window(window, from, to, || valid(from) && uninterrupted()),
+            || shell.current(),
+            &uninterrupted,
+            |target| shell.switch(target),
+        )
     }
 
     pub(super) fn navigate_to(&self, number: usize) -> Option<(DesktopId, DesktopId)> {
@@ -561,6 +621,85 @@ mod tests {
         assert_eq!(neighbor(&order, DesktopId(3), true), None);
         assert_eq!(neighbor(&order, DesktopId(7), false), None);
         assert_eq!(neighbor(&order, DesktopId(404), true), None);
+    }
+
+    #[test]
+    fn only_a_committed_window_move_can_switch_desktops() {
+        let from = DesktopId(42);
+        let to = DesktopId(17);
+        let no_query = || panic!("no follow after a rejected move");
+        let no_switch = |_| panic!("no switch after a rejected move");
+        let no_move = || panic!("invalid or interrupted request was moved");
+        assert!(
+            WindowTransfer::perform(from, from, no_move, no_query, || true, no_switch).is_none()
+        );
+        assert!(
+            WindowTransfer::perform(from, to, no_move, no_query, || false, no_switch).is_none()
+        );
+        assert!(
+            WindowTransfer::perform(from, to, || false, no_query, || true, no_switch).is_none()
+        );
+    }
+
+    #[test]
+    fn follow_uses_the_moved_window_destination_and_preserves_partial_success() {
+        let from = DesktopId(42);
+        let to = DesktopId(17);
+        let other = DesktopId(99);
+        for (current, switch_accepted, expected_switch, expected_follow) in [
+            (Some(from), true, true, true),
+            (Some(from), false, true, false),
+            (Some(to), false, false, true),
+            (Some(other), true, false, false),
+            (None, true, false, false),
+        ] {
+            let mut moves = 0;
+            let mut switches = Vec::new();
+            let result = WindowTransfer::perform(
+                from,
+                to,
+                || {
+                    moves += 1;
+                    true
+                },
+                || current,
+                || true,
+                |target| {
+                    switches.push(target);
+                    switch_accepted
+                },
+            )
+            .unwrap();
+            assert_eq!(moves, 1);
+            assert_eq!(switches, expected_switch.then_some(to).as_slice());
+            assert_eq!(
+                (result.from, result.to, result.followed),
+                (from, to, expected_follow)
+            );
+        }
+    }
+
+    #[test]
+    fn user_input_during_the_shell_move_cancels_follow_only() {
+        use std::cell::Cell;
+        let from = DesktopId(42);
+        let to = DesktopId(17);
+        for current in [from, to] {
+            let interrupted = Cell::new(false);
+            let moved = WindowTransfer::perform(
+                from,
+                to,
+                || {
+                    interrupted.set(true);
+                    true
+                },
+                || Some(current),
+                || !interrupted.get(),
+                |_| panic!("interrupted move attempted a switch"),
+            )
+            .unwrap();
+            assert!(!moved.followed);
+        }
     }
 
     #[test]

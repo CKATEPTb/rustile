@@ -22,6 +22,7 @@ enum Group {
     QuickReverse,
     Window,
     Desktop,
+    DesktopMove,
 }
 
 macro_rules! shortcuts {
@@ -31,7 +32,7 @@ macro_rules! shortcuts {
         pub(crate) enum Shortcut { $( $name, )+ }
 
         impl Shortcut {
-            pub const ALL: [Self; 46] = [$( Self::$name, )+];
+            pub const ALL: [Self; 50] = [$( Self::$name, )+];
 
             fn spec(self) -> (&'static str, Group, u16) {
                 match self { $( Self::$name => ($label, Group::$group, $key), )+ }
@@ -87,6 +88,10 @@ shortcuts! {
     Desktop8,  "Рабочий стол 8",  Desktop, VK_8;
     Desktop9,  "Рабочий стол 9",  Desktop, VK_9;
     Desktop10, "Рабочий стол 10", Desktop, VK_0;
+    MovePreviousDesktop,    "На предыдущий стол",        DesktopMove, VK_LEFT;
+    MoveNextDesktop,        "На следующий стол",         DesktopMove, VK_RIGHT;
+    MovePreviousDesktopAlt, "На предыдущий стол (доп.)", DesktopMove, VK_UP;
+    MoveNextDesktopAlt,     "На следующий стол (доп.)",  DesktopMove, VK_DOWN;
 }
 
 impl Shortcut {
@@ -102,8 +107,8 @@ impl Shortcut {
         matches!(self.spec().1, Group::Grow | Group::Shrink | Group::Finish)
     }
 
-    pub fn is_global(self) -> bool {
-        self == Self::ToggleMosaic || self.spec().1 == Group::Desktop
+    pub fn works_in_both_modes(self) -> bool {
+        self == Self::ToggleMosaic || matches!(self.spec().1, Group::Desktop | Group::DesktopMove)
     }
 
     pub fn default_chord(self) -> Chord {
@@ -111,7 +116,9 @@ impl Shortcut {
     }
 
     fn shares_context(self, other: Self) -> bool {
-        self.is_global() || other.is_global() || self.is_resize() == other.is_resize()
+        self.works_in_both_modes()
+            || other.works_in_both_modes()
+            || self.is_resize() == other.is_resize()
     }
 
     fn inherited(self, settings: &Settings) -> Chord {
@@ -124,6 +131,7 @@ impl Shortcut {
             Group::Shrink => MOD_SHIFT,
             Group::Quick => MOD_WIN | MOD_ALT,
             Group::QuickReverse => MOD_WIN | MOD_ALT | MOD_SHIFT,
+            Group::DesktopMove => MOD_WIN | MOD_CONTROL | MOD_SHIFT,
             Group::Desktop if matches!(key, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN) => {
                 MOD_WIN | MOD_CONTROL
             }
@@ -385,7 +393,11 @@ impl From<StoredOverrides> for Overrides {
         for action in Shortcut::ALL {
             if !matches!(
                 action.spec().1,
-                Group::Quick | Group::QuickReverse | Group::Window | Group::Desktop
+                Group::Quick
+                    | Group::QuickReverse
+                    | Group::Window
+                    | Group::Desktop
+                    | Group::DesktopMove
             ) || overrides.0[action.index()].is_some()
             {
                 continue;
@@ -423,7 +435,7 @@ impl Settings {
         let owner = |resize| {
             let context = Shortcut::ALL
                 .into_iter()
-                .filter(|other| other.is_global() || other.is_resize() == resize);
+                .filter(|other| other.works_in_both_modes() || other.is_resize() == resize);
             // Explicit bindings win over the variants that keep the resize opener held.
             context
                 .clone()
@@ -435,7 +447,7 @@ impl Settings {
                 })
                 .filter(|&other| action != other)
         };
-        if !action.is_global() {
+        if !action.works_in_both_modes() {
             return owner(action.is_resize()).map(BindingOwners::One);
         }
         match (owner(false), owner(true)) {

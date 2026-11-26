@@ -12,9 +12,11 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows_sys::core::w;
 
-use super::{DesktopId, object_name, shell_window};
+use super::{DesktopId, Service, object_name, shell_window};
+use crate::layout::Id;
 
 const IMMERSIVE_SHELL: GUID = GUID::from_u128(0xc2f03a33_21f5_47fa_b4bb_156362a2f239);
 const DESKTOP_SERVICE: GUID = GUID::from_u128(0xc5e0cdca_7b6e_41b2_9fc4_d93975cc467b);
@@ -153,8 +155,8 @@ unsafe impl Interface for ShellManager {
 struct ManagerVtable {
     base: IUnknown_Vtbl,
     get_count: usize,
-    move_view: usize,
-    can_move_view: usize,
+    move_view: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
+    can_move_view: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
     current: Out<ShellDesktop>,
     list: Out<IObjectArray>,
     adjacent: usize,
@@ -350,6 +352,44 @@ impl DesktopShell {
         .is_some()
     }
 
+    pub(crate) fn move_window(
+        &self,
+        id: Id,
+        from: DesktopId,
+        to: DesktopId,
+        validate: impl FnOnce() -> bool,
+    ) -> bool {
+        let hwnd = id as HWND;
+        if from == to || hwnd.is_null() || unsafe { GetForegroundWindow() } != hwnd {
+            return false;
+        }
+        self.with_manager(|manager| {
+            // Keep the exact view and destination alive throughout the RPCs.
+            let view = ApplicationView::lookup(hwnd)?;
+            let destination = manager.find(to)?;
+            let table = manager.vtable();
+            let mut movable = 0;
+            let check =
+                unsafe { (table.can_move_view)(manager.as_raw(), view.as_raw(), &mut movable) };
+            check.ok().ok()?;
+            if movable == 0 || manager.current()? != from {
+                return Some(false);
+            }
+            // The public API returns a special GUID for app and window pins.
+            // A pinned HWND or a window already moved by Explorer has no match.
+            if Service::connect()?.desktop_id(hwnd).ok()? != from
+                || !validate()
+                || unsafe { GetForegroundWindow() } != hwnd
+            {
+                return Some(false);
+            }
+            let moved =
+                unsafe { (table.move_view)(manager.as_raw(), view.as_raw(), destination.as_raw()) };
+            Some(moved.0 == 0)
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn remove(&self, id: DesktopId, fallback: DesktopId) -> bool {
         if id == fallback {
             return false;
@@ -387,6 +427,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn move_view_slots_match_the_supported_shell_manager() {
+        let slot = size_of::<usize>();
+        assert_eq!(std::mem::offset_of!(ManagerVtable, move_view), 4 * slot);
+        assert_eq!(std::mem::offset_of!(ManagerVtable, can_move_view), 5 * slot);
+        assert_eq!(std::mem::offset_of!(ManagerVtable, current), 6 * slot);
+    }
+
     fn move_for_test(shell: &DesktopShell, id: DesktopId, index: u32) -> bool {
         shell
             .with_manager(|manager| manager.move_desktop(&manager.find(id)?, index))
@@ -409,6 +457,35 @@ mod tests {
         let ids = shell.list().expect("ordered desktop IDs");
         assert!(ids.contains(&shell.current().expect("current desktop ID")));
         super::super::occupancy::occupied(&ids).expect("complete occupancy inventory");
+    }
+
+    #[test]
+    #[ignore = "read-only probe; needs a movable foreground window and a second desktop"]
+    fn desktop_shell_foreground_transfer_preflight() {
+        let shell = DesktopShell::connect().expect("supported interactive Explorer");
+        let source = shell.current().expect("current desktop");
+        let destination = shell
+            .list()
+            .expect("ordered desktop IDs")
+            .into_iter()
+            .find(|id| *id != source)
+            .expect("another existing desktop");
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut validated = false;
+        assert!(
+            !shell.move_window(foreground as Id, source, destination, || {
+                validated = true;
+                false
+            })
+        );
+        assert!(
+            validated,
+            "foreground transfer preflight did not reach validation"
+        );
+        assert_eq!(
+            Service::connect().unwrap().desktop_id(foreground).unwrap(),
+            source
+        );
     }
 
     #[test]

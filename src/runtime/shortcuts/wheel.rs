@@ -104,6 +104,14 @@ pub(super) fn handle(delta: i16, modifiers: impl FnOnce() -> u32, mask: impl FnO
 pub(super) unsafe extern "system" fn on_mouse(code: i32, message: usize, data: isize) -> isize {
     // Ordinary pointer movement takes the fast path without even reading the
     // mouse structure. The high word of mouseData is a signed wheel delta.
+    if code == HC_ACTION as i32
+        && matches!(
+            message as u32,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+    {
+        end_transfer_focus_watch();
+    }
     if code == HC_ACTION as i32 && message as u32 == WM_MOUSEWHEEL {
         let delta = (unsafe { (*(data as *const MSLLHOOKSTRUCT)).mouseData } >> 16) as i16;
         if handle(delta, modifiers, mark_modifier_used) {

@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::io;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -14,11 +15,29 @@ mod wheel;
 
 use super::{
     CANCEL, CLOSE_WINDOW, CONFIRM, DESKTOP_FIRST, DESKTOP_NEXT, DESKTOP_PREVIOUS, DESKTOP_TENTH,
-    DesktopDestination, EXPAND, FOCUS, KEY_COMMAND, MOVE, QUICK_RESIZE, QUICK_REVERSE, SHRINK,
-    START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
+    DesktopDestination, EXPAND, FOCUS, KEY_COMMAND, MOVE, MOVE_DESKTOP_NEXT, MOVE_DESKTOP_PREVIOUS,
+    QUICK_RESIZE, QUICK_REVERSE, SHRINK, START_RESIZE, TOGGLE_MAXIMIZE, TOGGLE_MOSAIC,
 };
 use crate::manager::{Mode, ShortcutTarget};
 use crate::settings::{Chord, Settings, Shortcut};
+
+static TRANSFER_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn watch_transfer_focus() {
+    TRANSFER_FOCUS_WATCH.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn transfer_focus_uninterrupted() -> bool {
+    TRANSFER_FOCUS_WATCH.load(Ordering::Relaxed)
+}
+
+pub(super) fn end_transfer_focus_watch() {
+    TRANSFER_FOCUS_WATCH.store(false, Ordering::Relaxed);
+}
+
+fn is_desktop_move(id: i32) -> bool {
+    matches!(id, MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT)
+}
 
 // The table is rebuilt only on a settings change. The hook inspects virtual
 // key codes and current modifiers; it never translates or records typed text.
@@ -34,7 +53,7 @@ impl KeyRoutes {
         if !action.is_resize() {
             self.normal[mods as usize] = id;
         }
-        if action.is_resize() || action.is_global() {
+        if action.is_resize() || action.works_in_both_modes() {
             self.resize[mods as usize] = id;
         }
     }
@@ -68,9 +87,12 @@ impl KeyRoutes {
         let target = if id == TOGGLE_MOSAIC || DesktopDestination::from_command(id).is_some() {
             Some(0) // Global commands need no foreground window.
         } else {
+            // Explorer can clear the foreground during the switch. The manager
+            // still has to validate the window from the pending transfer.
+            let has_window = active != 0 || (is_desktop_move(id) && transfer_focus_uninterrupted());
             // Own a configured normal chord even when its action is unavailable
             // in resize mode. The manager validates the sampled HWND on delivery.
-            (active != 0 && (!resizing || resize != 0)).then_some(active)
+            (has_window && (!resizing || resize != 0)).then_some(active)
         };
         Some(BoundCommand {
             id,
@@ -150,6 +172,8 @@ fn command_id(action: Shortcut) -> u8 {
         Desktop8 => DESKTOP_FIRST + 7,
         Desktop9 => DESKTOP_FIRST + 8,
         Desktop10 => DESKTOP_TENTH,
+        MovePreviousDesktop | MovePreviousDesktopAlt => MOVE_DESKTOP_PREVIOUS,
+        MoveNextDesktop | MoveNextDesktopAlt => MOVE_DESKTOP_NEXT,
         GrowLeft => EXPAND,
         GrowRight => EXPAND + 1,
         GrowUp => EXPAND + 2,
@@ -300,7 +324,9 @@ impl Pending {
     fn transition(self, command: i32, focus_epoch: usize) -> Option<Self> {
         let mode = match command {
             START_RESIZE => Mode::Resize,
-            CONFIRM | CANCEL | TOGGLE_MOSAIC => Mode::Normal,
+            CONFIRM | CANCEL | TOGGLE_MOSAIC | MOVE_DESKTOP_PREVIOUS | MOVE_DESKTOP_NEXT => {
+                Mode::Normal
+            }
             _ => return None,
         };
         // Low eight bits of WPARAM carry the command. Ticket zero denotes a
@@ -406,37 +432,43 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
         let vk = unsafe { (*(data as *const KBDLLHOOKSTRUCT)).vkCode };
-        if matches!(message as u32, WM_KEYUP | WM_SYSKEYUP)
-            && matches!(
-                vk as u16,
-                VK_LWIN
-                    | VK_RWIN
-                    | VK_SHIFT
-                    | VK_LSHIFT
-                    | VK_RSHIFT
-                    | VK_CONTROL
-                    | VK_LCONTROL
-                    | VK_RCONTROL
-                    | VK_MENU
-                    | VK_LMENU
-                    | VK_RMENU
-            )
-        {
+        let modifier = matches!(
+            vk as u16,
+            VK_LWIN
+                | VK_RWIN
+                | VK_SHIFT
+                | VK_LSHIFT
+                | VK_RSHIFT
+                | VK_CONTROL
+                | VK_LCONTROL
+                | VK_RCONTROL
+                | VK_MENU
+                | VK_LMENU
+                | VK_RMENU
+        );
+        if matches!(message as u32, WM_KEYUP | WM_SYSKEYUP) && modifier {
             wheel::reset();
         }
         if let Ok(vk) = u8::try_from(vk)
-            && Chord::supports_key(u16::from(vk))
+            && !modifier
+            && vk != 0xff
         {
             let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let slot = usize::from(vk);
             let previous = HELD.with(|held| held[slot].get());
-            let mut press = previous;
             let pending = PENDING.get();
-            let binding = if down && previous != Press::Passed {
+            let binding = if down && previous != Press::Passed && Chord::supports_key(vk.into()) {
                 bound_command(slot, pending)
             } else {
                 None
             };
+            if down
+                && transfer_focus_uninterrupted()
+                && !binding.is_some_and(|b| is_desktop_move(b.id))
+            {
+                end_transfer_focus_watch();
+            }
+            let mut press = previous;
             let action = press.route(down, binding);
             HELD.with(|held| held[slot].set(press));
             if action != Action::Pass {
@@ -563,6 +595,7 @@ impl Drop for Hook {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        end_transfer_focus_watch();
         update(None, Mode::Normal, 0);
         ROUTING.lock().unwrap_or_else(|e| e.into_inner()).keys = Routes::EMPTY;
     }
@@ -660,6 +693,72 @@ mod tests {
     }
 
     #[test]
+    fn desktop_move_targets_the_foreground_in_both_modes_and_leaves_neighboring_chords_alone() {
+        let mods = MOD_WIN | MOD_CONTROL | MOD_SHIFT;
+        let mut keyboard = Keyboard::new();
+        let routes = Routes::new(keyboard.settings);
+        for mode in [Mode::Normal, Mode::Resize] {
+            keyboard.state.mode = mode;
+            for (slot, (key, transfer, navigate)) in [
+                (VK_LEFT, MOVE_DESKTOP_PREVIOUS, DESKTOP_PREVIOUS),
+                (VK_RIGHT, MOVE_DESKTOP_NEXT, DESKTOP_NEXT),
+                (VK_UP, MOVE_DESKTOP_PREVIOUS, DESKTOP_PREVIOUS),
+                (VK_DOWN, MOVE_DESKTOP_NEXT, DESKTOP_NEXT),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let binding = |mods, active| {
+                    routes.0[usize::from(key)]?
+                        .binding(keyboard.state, Pending::NEW, mods, || active)
+                        .map(|b| (b.id, b.target))
+                };
+                for active in [100, 999, 0] {
+                    assert_eq!(
+                        binding(mods, active),
+                        Some((transfer, (active != 0).then_some(active)))
+                    );
+                    assert_eq!(
+                        binding(MOD_WIN | MOD_CONTROL, active),
+                        Some((navigate, Some(0)))
+                    );
+                }
+                if mode == Mode::Normal {
+                    assert_eq!(
+                        binding(WIN_SHIFT, 100),
+                        Some((MOVE + slot as i32, Some(100)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_move_ends_queued_resize_and_requires_a_new_press_for_each_step() {
+        let mut keyboard = Keyboard::new();
+        let mods = MOD_WIN | MOD_CONTROL | MOD_SHIFT;
+        assert_eq!(
+            keyboard.key(VK_RETURN, true, MOD_WIN),
+            Action::Command(START_RESIZE)
+        );
+        let opener = keyboard.pending.ticket;
+        assert_eq!(
+            keyboard.key(VK_RIGHT, true, mods),
+            Action::Command(MOVE_DESKTOP_NEXT)
+        );
+        keyboard.state.handled = opener;
+        keyboard.state.mode = Mode::Resize;
+        assert_eq!(keyboard.key(VK_UP, true, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_UP, false, 0), Action::Pass);
+        assert_eq!(keyboard.key(VK_RIGHT, true, mods), Action::Consume);
+        assert_eq!(keyboard.key(VK_RIGHT, false, mods), Action::Consume);
+        assert_eq!(
+            keyboard.key(VK_RIGHT, true, mods),
+            Action::Command(MOVE_DESKTOP_NEXT)
+        );
+    }
+
+    #[test]
     fn top_row_digits_select_desktop_numbers_even_without_a_tile() {
         let mut keyboard = Keyboard::new();
         keyboard.state.target = None;
@@ -681,20 +780,25 @@ mod tests {
 
     #[test]
     fn remapping_one_desktop_shortcut_preserves_its_alternative_in_all_modes() {
-        let mods = MOD_CONTROL | MOD_WIN;
-        let mut keyboard = Keyboard::new();
-        keyboard.assign(Shortcut::NextDesktop, MOD_ALT, VK_F8);
-        let routes = Routes::new(keyboard.settings);
-        for mode in [Mode::Normal, Mode::Resize] {
-            keyboard.state.mode = mode;
-            let command = |key: u16, mods| {
-                routes.0[key as usize]?
-                    .binding(keyboard.state, Pending::NEW, mods, || 999)
-                    .map(|b| (b.id, b.target))
-            };
-            assert_eq!(command(VK_RIGHT, mods), None);
-            assert_eq!(command(VK_F8, MOD_ALT), Some((DESKTOP_NEXT, Some(0))));
-            assert_eq!(command(VK_DOWN, mods), Some((DESKTOP_NEXT, Some(0))));
+        for (action, id, target) in [
+            (Shortcut::NextDesktop, DESKTOP_NEXT, 0),
+            (Shortcut::MoveNextDesktop, MOVE_DESKTOP_NEXT, 100),
+        ] {
+            let mods = action.default_chord().mods;
+            let mut keyboard = Keyboard::new();
+            keyboard.assign(action, MOD_ALT, VK_F8);
+            let routes = Routes::new(keyboard.settings);
+            for mode in [Mode::Normal, Mode::Resize] {
+                keyboard.state.mode = mode;
+                let command = |key: u16, mods| {
+                    routes.0[key as usize]?
+                        .binding(keyboard.state, Pending::NEW, mods, || 100)
+                        .map(|b| (b.id, b.target))
+                };
+                assert_eq!(command(VK_RIGHT, mods), None);
+                assert_eq!(command(VK_F8, MOD_ALT), Some((id, Some(target))));
+                assert_eq!(command(VK_DOWN, mods), Some((id, Some(target))));
+            }
         }
     }
 
@@ -1021,7 +1125,7 @@ mod tests {
             assert_eq!(keyboard.key(VK_RIGHT, false, MOD_WIN), Action::Pass);
         }
         assert_eq!(
-            keyboard.key(VK_LEFT, true, MOD_CONTROL | WIN_SHIFT),
+            keyboard.key(VK_LEFT, true, MOD_ALT | MOD_CONTROL | WIN_SHIFT),
             Action::Pass
         );
         assert_eq!(keyboard.key(VK_LEFT, false, 0), Action::Pass);

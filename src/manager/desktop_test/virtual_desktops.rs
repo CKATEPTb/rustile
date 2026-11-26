@@ -247,6 +247,100 @@ fn focus_on_return(manager: &mut Manager, desktop: DesktopId, tiles: [Id; 2], fl
     set_visible(remembered, true);
 }
 
+pub(super) fn transfer_and_follow(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
+    use crate::native::TransferIdentity;
+    use std::cell::Cell;
+
+    let [moving, source_peer, anchor, other, floating, _] = windows;
+    let homes = [(moving, A), (source_peer, A), (anchor, B), (other, B)];
+    select_desktop(manager, &homes, B, None);
+    manager.reconcile_desktop();
+    manager.event(EVENT_SYSTEM_FOREGROUND, anchor);
+    settle(manager, 2);
+    let destination_frames = [anchor, other].map(frame);
+    select_desktop(manager, &homes, A, None);
+    manager.reconcile_desktop();
+    settle(manager, 2);
+    assert!(manager.transferable_on(moving, A));
+    assert!(!manager.transferable_on(moving, B));
+    assert!(!manager.transferable_on(floating, A));
+
+    let obsolete = TransferIdentity::capture(moving).unwrap();
+    let identity = TransferIdentity::capture(moving).unwrap();
+    assert!(!obsolete.matches());
+    drop(obsolete);
+    assert!(identity.matches());
+    let transferred = [(moving, B), (source_peer, A), (anchor, B), (other, B)];
+    select_desktop(manager, &transferred, A, None);
+    manager.transferred_window(moving, B);
+    settle(manager, 1);
+    assert_eq!(frame(source_peer), manager.area.unwrap());
+    assert_eq!([anchor, other].map(frame), destination_frames);
+
+    select_desktop(manager, &transferred, B, None);
+    manager.event(EVENT_SYSTEM_FOREGROUND, other);
+    manager.reconcile_desktop();
+    settle(manager, 3);
+    assert_eq!(frame(other), destination_frames[1]);
+    assert_eq!(
+        super::join_frames(frame(moving), frame(anchor)),
+        Some(destination_frames[0])
+    );
+    assert!(manager.windows[&moving].original.matches(moving));
+    assert!(identity.matches());
+
+    let foreground = Cell::new(other);
+    assert!(manager.restore_transferred_focus_with(
+        moving,
+        B,
+        || foreground.get(),
+        |previous| {
+            assert_eq!(previous, other);
+            foreground.set(moving);
+            true
+        }
+    ));
+    assert_eq!(foreground.get(), moving);
+    assert!(manager.restore_transferred_focus_with(
+        moving,
+        B,
+        || floating,
+        |_| panic!("floating focus stolen")
+    ));
+    assert!(!manager.restore_transferred_focus_with(
+        moving,
+        A,
+        || 0,
+        |_| panic!("activated on wrong desktop")
+    ));
+    assert!(manager.restore_transferred_focus(&identity, B, || false));
+    drop(identity);
+    assert!(manager.windows[&moving].original.matches(moving));
+
+    // A workspace command also works while tiling is paused; resume computes
+    // the destination layout from the new membership without recapturing it.
+    let settings = manager.settings;
+    let mut paused = settings;
+    paused.enabled = false;
+    manager.apply_settings(paused).unwrap();
+    let before = windows.map(frame);
+    assert!(manager.transferable_on(moving, B));
+    select_desktop(manager, &homes, B, None);
+    manager.transferred_window(moving, A);
+    select_desktop(manager, &homes, A, None);
+    manager.reconcile_desktop();
+    assert_eq!(windows.map(frame), before);
+    manager.apply_settings(settings).unwrap();
+    settle(manager, 2);
+    assert_eq!(
+        super::join_frames(frame(moving), frame(source_peer)),
+        manager.area
+    );
+    manager
+        .desktops
+        .set_memberships(windows.map(|id| (id, DesktopMembership::Current(B))));
+}
+
 pub(super) fn round_trip(manager: &mut Manager, windows: [Id; 6], _area: Rect) {
     let mut a = [windows[0], windows[1]];
     let b = [windows[2], windows[3]];

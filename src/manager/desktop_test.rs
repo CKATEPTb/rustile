@@ -1027,6 +1027,10 @@ fn window_controls() {
         .set_memberships(windows.map(|id| (id, DesktopMembership::Current(DesktopId(1)))));
     manager.reconcile_desktop();
     settle(&manager, 2);
+    assert!(
+        manager.transferable_on(active, DesktopId(1)),
+        "an already maximized window can move desktops"
+    );
     dispatch(&mut manager, active, TOGGLE_MAXIMIZE);
     until(
         "window already maximized at startup can return to the mosaic",
@@ -1142,6 +1146,7 @@ fn move_windows() {
     run(move_right_in_a_tall_pair);
     run(share_upper_tile_in_six_windows);
     run(virtual_desktops::round_trip);
+    run(virtual_desktops::transfer_and_follow);
     run(panel_reservations);
     run(|m, w, a| move_left_in_three_columns(m, w, a, true));
     run(|m, w, a| move_left_in_three_columns(m, w, a, false));

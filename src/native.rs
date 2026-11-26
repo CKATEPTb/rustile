@@ -156,14 +156,9 @@ pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
             return Transient;
         }
     }
-    let thread = unsafe { GetWindowThreadProcessId(hwnd, null_mut()) };
-    let mut gui = GUITHREADINFO {
-        cbSize: size_of::<GUITHREADINFO>() as u32,
-        ..Default::default()
-    };
-    if thread == 0 || unsafe { GetGUIThreadInfo(thread, &mut gui) } == 0 {
+    let Some(gui) = window_gui_state(hwnd) else {
         return Transient;
-    }
+    };
     if shell_input_in_use(&gui, taskbar)
         || (wallpaper
             && !gui.hwndFocus.is_null()
@@ -172,6 +167,19 @@ pub(crate) fn desktop_foreground(id: Id) -> DesktopForeground {
         return Preserve;
     }
     Vacant
+}
+
+fn window_gui_state(hwnd: HWND) -> Option<GUITHREADINFO> {
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, null_mut()) };
+    let mut gui = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    (thread != 0 && unsafe { GetGUIThreadInfo(thread, &mut gui) } != 0).then_some(gui)
+}
+
+pub(crate) fn app_input_idle(id: Id) -> bool {
+    window_gui_state(id as HWND).is_some_and(|gui| !shell_input_in_use(&gui, false))
 }
 
 fn shell_input_in_use(gui: &GUITHREADINFO, taskbar: bool) -> bool {
@@ -550,18 +558,84 @@ pub fn eligible(id: Id) -> bool {
 
 fn marker_name() -> *const u16 {
     static NAME: OnceLock<Vec<u16>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        format!("Rustile.WindowIdentity.{}\0", std::process::id())
-            .encode_utf16()
-            .collect()
-    })
-    .as_ptr()
+    process_marker_name(&NAME, "WindowIdentity")
+}
+
+fn process_marker_name(storage: &'static OnceLock<Vec<u16>>, purpose: &str) -> *const u16 {
+    storage
+        .get_or_init(|| {
+            format!("Rustile.{purpose}.{}\0", std::process::id())
+                .encode_utf16()
+                .collect()
+        })
+        .as_ptr()
+}
+
+// Properties die with the HWND, even when its process recreates a window with
+// the same numeric handle. A transfer has a separate lifetime from a tile.
+struct WindowMarker {
+    id: Id,
+    owner: u32,
+    name: *const u16,
+    value: usize,
+}
+
+impl WindowMarker {
+    fn attach(id: Id, name: *const u16) -> Option<Self> {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let owner = pid(id);
+        let value = NEXT.fetch_add(1, Ordering::Relaxed);
+        if owner == 0 || value == 0 || unsafe { SetPropW(id as HWND, name, value as _) } == 0 {
+            return None;
+        }
+        let marker = Self {
+            id,
+            owner,
+            name,
+            value,
+        };
+        marker.matches().then_some(marker)
+    }
+
+    fn matches(&self) -> bool {
+        pid(self.id) == self.owner
+            && unsafe { GetPropW(self.id as HWND, self.name) as usize == self.value }
+    }
+}
+
+impl Drop for WindowMarker {
+    fn drop(&mut self) {
+        if self.matches() {
+            unsafe { RemovePropW(self.id as HWND, self.name) };
+        }
+    }
+}
+
+pub(crate) struct TransferIdentity(WindowMarker);
+
+impl TransferIdentity {
+    pub(crate) fn capture(id: Id) -> Option<Self> {
+        static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+        if !window_enabled(id)
+            || !matches!(tile_state(id), TileState::Eligible | TileState::Maximized)
+        {
+            return None;
+        }
+        WindowMarker::attach(id, process_marker_name(&NAME, "TransferIdentity")).map(Self)
+    }
+
+    pub(crate) fn id(&self) -> Id {
+        self.0.id
+    }
+
+    pub(crate) fn matches(&self) -> bool {
+        self.0.matches()
+    }
 }
 
 pub struct Original {
     id: Id,
-    owner: u32,
-    marker: usize,
+    marker: WindowMarker,
     outer: Rect,
     insets: FrameInsets,
 }
@@ -640,9 +714,7 @@ impl Original {
     }
 
     pub fn matches(&self, id: Id) -> bool {
-        id == self.id
-            && pid(id) == self.owner
-            && unsafe { GetPropW(id as HWND, marker_name()) as usize == self.marker }
+        id == self.id && self.marker.matches()
     }
 
     // Sample at admission or after a user move. During a burst of async
@@ -748,31 +820,14 @@ impl Original {
     }
 }
 
-impl Drop for Original {
-    fn drop(&mut self) {
-        if self.matches(self.id) {
-            unsafe { RemovePropW(self.id as HWND, marker_name()) };
-        }
-    }
-}
-
 pub fn capture(id: Id) -> Option<Original> {
-    static NEXT_MARKER: AtomicUsize = AtomicUsize::new(1);
     if !eligible(id) {
         return None;
     }
-    let owner = pid(id);
     let outer = outer_bounds(id as HWND)?;
-    let marker = NEXT_MARKER.fetch_add(1, Ordering::Relaxed);
-    // A window property dies with its HWND, even if the numerical handle is
-    // subsequently reused by a second window of the same process.
-    if marker == 0 || unsafe { SetPropW(id as HWND, marker_name(), marker as _) } == 0 {
-        return None;
-    }
     let original = Original {
         id,
-        owner,
-        marker,
+        marker: WindowMarker::attach(id, marker_name())?,
         outer,
         insets: FrameInsets::measure(id as HWND, outer).unwrap_or_default(),
     };
@@ -844,14 +899,13 @@ pub fn focus(id: Id) -> bool {
         && (foreground() == id || unsafe { SetForegroundWindow(id as HWND) } != 0)
 }
 
-pub(crate) fn focus_desktop_tile(id: Id, previous: Id, current_tile: impl Fn() -> bool) -> bool {
+pub(crate) fn focus_after_desktop_change(
+    id: Id,
+    previous: Id,
+    may_activate: impl Fn() -> bool,
+) -> bool {
     let hwnd = id as HWND;
-    let can_activate = || {
-        current_tile()
-            && window_enabled(id)
-            && desktop_foreground(previous) == DesktopForeground::Vacant
-            && foreground() == previous
-    };
+    let can_activate = || may_activate() && window_enabled(id) && foreground() == previous;
     // Explorer can activate its own application view during a desktop change.
     // Recheck after RPC: input or desktop membership may already have changed.
     if let Some(view) = desktops::shell::ApplicationView::lookup(hwnd) {

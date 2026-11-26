@@ -144,7 +144,7 @@ impl ShortcutWindow {
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
                     right: self.p(760),
-                    bottom: self.p(824),
+                    bottom: self.p(936),
                     ..Default::default()
                 };
                 AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());

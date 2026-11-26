@@ -124,6 +124,9 @@ pub struct Manager {
     current: Option<DesktopId>,
     workspace: Workspace,
     parked: HashMap<DesktopId, Workspace>,
+    // A Shell-selected foreground during the switch must not change which
+    // destination tile the transferred window was meant to split.
+    transfer_anchor: Option<(Id, DesktopId, Id)>,
     windows: HashMap<Id, TrackedWindow>,
     expanded: HashSet<Id>,
     pending_app_cloaks: HashSet<Id>,
@@ -150,6 +153,7 @@ impl Manager {
             current: None,
             workspace: Workspace::new(native::spacing_px(settings.gap)),
             parked: HashMap::new(),
+            transfer_anchor: None,
             windows: HashMap::new(),
             expanded: HashSet::new(),
             pending_app_cloaks: HashSet::new(),
@@ -230,6 +234,12 @@ impl Manager {
     }
 
     fn forget(&mut self, id: Id) {
+        if self
+            .transfer_anchor
+            .is_some_and(|(target, _, anchor)| target == id || anchor == id)
+        {
+            self.transfer_anchor = None;
+        }
         self.pending_app_cloaks.remove(&id);
         if self.drag_target() == Some(id) {
             self.dragging = None;
@@ -250,6 +260,12 @@ impl Manager {
         if old == desktop {
             return false;
         }
+        if self
+            .transfer_anchor
+            .is_some_and(|(target, home, anchor)| (target == id || anchor == id) && desktop != home)
+        {
+            self.transfer_anchor = None;
+        }
         self.detach(id, old);
         let window = self.windows.get_mut(&id).unwrap();
         window.desktop = desktop;
@@ -257,6 +273,46 @@ impl Manager {
         window.before_maximize = None;
         self.remove_empty_desktop(old);
         self.current == Some(old)
+    }
+
+    fn transferable_on(&self, id: Id, desktop: DesktopId) -> bool {
+        id != 0
+            && native::window_enabled(id)
+            && self.windows.get(&id).is_none_or(|w| w.original.matches(id))
+            && matches!(
+                native::tile_state(id),
+                TileState::Eligible | TileState::Maximized
+            )
+            && self.desktops.membership(id) == DesktopMembership::Current(desktop)
+    }
+
+    pub(crate) fn transfer_target_is_valid(&self, id: Id, source: DesktopId) -> bool {
+        native::foreground() == id && self.transferable_on(id, source) && native::foreground() == id
+    }
+
+    /// Called only after Explorer has confirmed the move. Keep the original
+    /// HWND capture, and let normal admission place it when its desktop appears.
+    pub(crate) fn transferred_window(&mut self, id: Id, destination: DesktopId) {
+        if self
+            .windows
+            .get(&id)
+            .is_some_and(|w| !w.original.matches(id))
+        {
+            self.forget(id);
+            return;
+        }
+        let workspace = if self.current == Some(destination) {
+            Some(&self.workspace)
+        } else {
+            self.parked.get(&destination)
+        };
+        self.transfer_anchor = workspace
+            .and_then(|w| w.focus_history.last().copied())
+            .filter(|&anchor| anchor != id && self.settings.enabled && !self.expanded.contains(&id))
+            .map(|anchor| (id, destination, anchor));
+        if self.migrate(id, destination) && self.settings.enabled {
+            self.apply();
+        }
     }
 
     pub fn sync(&mut self) {
@@ -533,6 +589,7 @@ impl Manager {
         }
         if !updated.enabled {
             self.dragging = None;
+            self.transfer_anchor = None;
             self.outline.hide();
         } else if resuming || system_changed {
             self.sync();
@@ -553,6 +610,13 @@ impl Manager {
     }
 
     fn admit_new(&mut self, id: Id) -> bool {
+        if let Some((_, _, anchor)) = self
+            .transfer_anchor
+            .take_if(|(target, home, _)| *target == id && Some(*home) == self.current)
+            && self.can_act_on(anchor)
+        {
+            return self.admit(id, Some(anchor));
+        }
         if let Some(window) = self.windows.get_mut(&id)
             && let Some(mut saved) = window.before_maximize.take()
             && let Some(area) = self.area
@@ -990,8 +1054,67 @@ impl Manager {
     /// the event loop to check again as Explorer finishes activating the desktop.
     pub(crate) fn restore_desktop_focus(&self, desktop: DesktopId) -> bool {
         self.restore_desktop_focus_with(desktop, native::foreground, |id, previous| {
-            native::focus_desktop_tile(id, previous, || self.can_act_on(id))
+            native::focus_after_desktop_change(id, previous, || {
+                self.can_act_on(id)
+                    && native::desktop_foreground(previous) == native::DesktopForeground::Vacant
+            })
         })
+    }
+
+    pub(crate) fn restore_transferred_focus(
+        &self,
+        identity: &native::TransferIdentity,
+        desktop: DesktopId,
+        uninterrupted: impl Fn() -> bool,
+    ) -> bool {
+        if !uninterrupted() || !identity.matches() {
+            return true;
+        }
+        let id = identity.id();
+        self.restore_transferred_focus_with(id, desktop, native::foreground, |previous| {
+            native::focus_after_desktop_change(id, previous, || {
+                self.transferable_on(id, desktop)
+                    && self.transfer_foreground_can_yield(previous, desktop)
+                    && identity.matches()
+                    && uninterrupted()
+            })
+        })
+    }
+
+    fn transfer_foreground_can_yield(&self, previous: Id, desktop: DesktopId) -> bool {
+        match native::desktop_foreground(previous) {
+            native::DesktopForeground::Vacant => true,
+            native::DesktopForeground::Transient => false,
+            native::DesktopForeground::Preserve => {
+                self.transferable_on(previous, desktop) && native::app_input_idle(previous)
+            }
+        }
+    }
+
+    fn restore_transferred_focus_with(
+        &self,
+        id: Id,
+        desktop: DesktopId,
+        foreground: impl Fn() -> Id,
+        activate: impl FnOnce(Id) -> bool,
+    ) -> bool {
+        if !self.transferable_on(id, desktop) {
+            return false;
+        }
+        let previous = foreground();
+        if previous == id {
+            return true;
+        }
+        if !self.transfer_foreground_can_yield(previous, desktop) {
+            // Wait for an outgoing window or the desktop-switch animation.
+            // A dialog or menu on the destination may retain legitimate input.
+            return native::desktop_foreground(previous) == native::DesktopForeground::Preserve
+                && !matches!(
+                    self.desktops.membership(previous),
+                    DesktopMembership::Other(_)
+                );
+        }
+        foreground() == previous && activate(previous) && foreground() == id
     }
 
     fn restore_desktop_focus_with(
@@ -1137,6 +1260,7 @@ impl Manager {
         }
         self.workspace = Workspace::new(native::spacing_px(self.settings.gap));
         self.parked.clear();
+        self.transfer_anchor = None;
         self.expanded.clear();
         self.pending_app_cloaks.clear();
         self.current = None;

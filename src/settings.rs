@@ -450,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn desktop_move_preserves_existing_normal_and_resize_bindings() {
+        use Shortcut::{FocusLeft, GrowLeft, MovePreviousDesktop, MovePreviousDesktopAlt};
+
+        let profile = "shortcuts.focus_left = { mods = 14, key = 37 }\nshortcuts.grow_left = { mods = 14, key = 37 }";
+        let settings = toml::from_str::<Settings>(profile)
+            .unwrap()
+            .validated()
+            .unwrap();
+        let chord = MovePreviousDesktop.default_chord();
+        assert_eq!(settings.binding(MovePreviousDesktop), None);
+        assert_eq!(settings.binding(FocusLeft), Some(chord));
+        assert_eq!(settings.binding(GrowLeft), Some(chord));
+        let owners = BindingOwners::Both(FocusLeft, GrowLeft);
+        assert_eq!(settings.conflict(MovePreviousDesktop, chord), Some(owners));
+        let moved = settings
+            .changed(Command::ReassignShortcut(
+                MovePreviousDesktop,
+                chord,
+                owners,
+            ))
+            .unwrap();
+        assert_eq!(moved.binding(FocusLeft), None);
+        assert_eq!(moved.binding(GrowLeft), None);
+        assert_eq!(moved.binding(MovePreviousDesktop), Some(chord));
+        assert_eq!(
+            moved.binding(MovePreviousDesktopAlt),
+            Some(MovePreviousDesktopAlt.default_chord())
+        );
+        let saved = toml::to_string(&moved).unwrap();
+        assert_eq!(
+            toml::from_str::<Settings>(&saved)
+                .unwrap()
+                .validated()
+                .unwrap(),
+            moved
+        );
+    }
+
+    #[test]
     fn desktop_number_preserves_a_saved_digit_and_wheel_assignments_roundtrip() {
         use Shortcut::{Desktop1, NextDesktopWheel, PreviousDesktopWheel};
         let saved = "shortcuts.focus_left = { mods = 8, key = 49 }";
