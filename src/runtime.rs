@@ -11,7 +11,7 @@ use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::Console::{
@@ -272,22 +272,33 @@ impl Preferences<'_> {
 }
 
 #[derive(Default)]
-struct MessageTimer(usize);
+struct MessageTimer {
+    id: usize,
+    deadline: Option<Instant>,
+}
 
 impl MessageTimer {
     fn schedule(&mut self, delay_ms: u32) -> bool {
-        let timer = unsafe { SetTimer(null_mut(), self.0, delay_ms, None) };
+        let timer = unsafe { SetTimer(null_mut(), self.id, delay_ms, None) };
         if timer != 0 {
-            self.0 = timer;
+            self.id = timer;
+            self.deadline = Some(Instant::now() + Duration::from_millis(delay_ms.into()));
         }
         timer != 0
     }
 
+    fn schedule_within(&mut self, delay_ms: u32) {
+        let deadline = Instant::now() + Duration::from_millis(delay_ms.into());
+        if self.deadline.is_none_or(|armed| deadline < armed) {
+            self.schedule(delay_ms);
+        }
+    }
+
     fn matches(&self, message: &MSG) -> bool {
-        self.0 != 0
+        self.id != 0
             && message.message == WM_TIMER
             && message.hwnd.is_null()
-            && message.wParam == self.0
+            && message.wParam == self.id
     }
 
     fn take(&mut self, message: &MSG) -> bool {
@@ -299,8 +310,9 @@ impl MessageTimer {
     }
 
     fn cancel(&mut self) {
-        if self.0 != 0 {
-            unsafe { KillTimer(null_mut(), std::mem::take(&mut self.0)) };
+        if self.id != 0 {
+            unsafe { KillTimer(null_mut(), std::mem::take(&mut self.id)) };
+            self.deadline = None;
         }
     }
 }
@@ -329,7 +341,7 @@ fn pump(
     shortcuts::set_desktop_navigation(workspaces.available());
     if workspaces.supported {
         desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
-        inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+        inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
     }
     let mut retries = 0;
     if manager.take_desktop_retry() {
@@ -364,17 +376,20 @@ fn pump(
         }
         let mut settling = desktops_changed;
         for (event, id) in events.drain(..) {
-            inventory_changed |= matches!(
-                event,
+            // Child controls and focus changes don't change which desktops have
+            // windows. A destroyed HWND can no longer be checked for a parent.
+            inventory_changed |= match event {
+                EVENT_OBJECT_DESTROY | EVENT_SYSTEM_DESKTOPSWITCH => true,
                 EVENT_OBJECT_CREATE
-                    | EVENT_OBJECT_DESTROY
-                    | EVENT_OBJECT_SHOW
-                    | EVENT_OBJECT_HIDE
-                    | EVENT_OBJECT_CLOAKED
-                    | EVENT_OBJECT_UNCLOAKED
-                    | EVENT_SYSTEM_FOREGROUND
-                    | EVENT_SYSTEM_DESKTOPSWITCH
-            );
+                | EVENT_OBJECT_SHOW
+                | EVENT_OBJECT_HIDE
+                | EVENT_OBJECT_CLOAKED
+                | EVENT_OBJECT_UNCLOAKED => {
+                    (unsafe { GetAncestor(id as HWND, GA_ROOT) }) == id as HWND
+                }
+                EVENT_SYSTEM_FOREGROUND => desktop_watch.is_none(),
+                _ => false,
+            };
             settling |= matches!(
                 event,
                 EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED | EVENT_SYSTEM_DESKTOPSWITCH
@@ -389,7 +404,7 @@ fn pump(
         let unresolved = manager.take_desktop_retry();
         let timer_due = timer_fired && !refitted;
         let reconcile = if settling
-            || ((unresolved || work_area_changed) && desktop_timer.0 == 0 && !timer_due)
+            || ((unresolved || work_area_changed) && desktop_timer.id == 0 && !timer_due)
         {
             retries = 2;
             !desktop_timer.schedule(DESKTOP_SETTLE_MS)
@@ -418,8 +433,8 @@ fn pump(
             if workspaces.supported && desktop_watch.is_none() {
                 desktop_watch = desktop_watch::DesktopWatch::start(thread_id, DESKTOP_LIST_CHANGED);
             }
-        } else if needs_scan && inventory_timer.0 == 0 {
-            inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+        } else if needs_scan {
+            inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
         }
         if drag_timer.matches(&message) {
             manager.refresh_drop_preview(false);
@@ -442,7 +457,7 @@ fn pump(
                     manager.cancel_mouse_move();
                     desktop_timer.schedule(DESKTOP_SETTLE_MS);
                 }
-                inventory_timer.schedule(dynamic_desktops::SETTLE_MS);
+                inventory_timer.schedule_within(dynamic_desktops::EVENT_BATCH_MS);
                 refresh(manager, ticket);
             } else {
                 if target != 0 && target == crate::native::foreground() {
@@ -510,7 +525,7 @@ fn pump(
         }
         if !manager.tracking_drag_cursor() {
             drag_timer.cancel();
-        } else if drag_timer.0 == 0 {
+        } else if drag_timer.id == 0 {
             drag_timer.schedule(32);
         }
     }

@@ -19,6 +19,10 @@ use super::{DesktopId, object_name, shell_window};
 const IMMERSIVE_SHELL: GUID = GUID::from_u128(0xc2f03a33_21f5_47fa_b4bb_156362a2f239);
 const DESKTOP_SERVICE: GUID = GUID::from_u128(0xc5e0cdca_7b6e_41b2_9fc4_d93975cc467b);
 
+fn shell_provider() -> Option<IServiceProvider> {
+    unsafe { CoCreateInstance(&IMMERSIVE_SHELL, None, CLSCTX_LOCAL_SERVER).ok() }
+}
+
 // Explorer's private ABI for 26100.2605+ and 26200, as defined by
 // VirtualDesktopAccessor (winvd 0.0.49, src/interfaces.rs). Leave unused
 // vtable slots in order. Never dispatch this layout on an unverified build.
@@ -32,6 +36,76 @@ unsafe impl Interface for ShellDesktop {
 }
 
 type Out<T> = unsafe extern "system" fn(*mut c_void, *mut Option<T>) -> HRESULT;
+
+// IApplicationViewCollection and IApplicationView from the same gated Shell
+// ABI. Only consult them when the public desktop ID of a packaged HWND is null.
+#[repr(transparent)]
+#[derive(Clone)]
+pub(super) struct ApplicationViews(IUnknown);
+
+unsafe impl Interface for ApplicationViews {
+    type Vtable = ViewsVtable;
+    const IID: GUID = GUID::from_u128(0x1841c6d7_4f9d_42c0_af41_8747538f10e5);
+}
+
+#[repr(C)]
+pub(super) struct ViewsVtable {
+    base: IUnknown_Vtbl,
+    enumerate_views: [usize; 3],
+    for_window:
+        unsafe extern "system" fn(*mut c_void, HWND, *mut Option<ApplicationView>) -> HRESULT,
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+struct ApplicationView(IUnknown);
+
+unsafe impl Interface for ApplicationView {
+    type Vtable = ViewVtable;
+    const IID: GUID = GUID::from_u128(0x372e1d3b_38d3_42e4_a15b_8ab2b178f513);
+}
+
+#[repr(C)]
+struct ViewVtable {
+    base: IUnknown_Vtbl,
+    inspectable_through_get_monitor: [usize; 8],
+    visibility: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+    set_cloak_through_set_activation_timestamp: [usize; 13],
+    desktop_id: unsafe extern "system" fn(*mut c_void, *mut GUID) -> HRESULT,
+    set_desktop_id: usize,
+    show_in_switchers: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+}
+
+impl ApplicationViews {
+    pub(super) fn connect() -> Option<Self> {
+        // Occupancy queries on unsupported Windows builds must not use this ABI.
+        if !DesktopShell::supported() {
+            return None;
+        }
+        unsafe { shell_provider()?.QueryService(&Self::IID).ok() }
+    }
+
+    pub(super) fn is_hidden_unassigned_view(&self, hwnd: HWND) -> bool {
+        let mut view = None;
+        if unsafe { (self.vtable().for_window)(self.as_raw(), hwnd, &mut view) }.0 != 0 {
+            return false;
+        }
+        let Some(view) = view else { return false };
+        let mut visible = 1;
+        let mut switchable = 1;
+        let mut id = GUID::zeroed();
+        let table = view.vtable();
+        let this = view.as_raw();
+        unsafe {
+            (table.visibility)(this, &mut visible).0 == 0
+                && visible == 0
+                && (table.show_in_switchers)(this, &mut switchable).0 == 0
+                && switchable == 0
+                && (table.desktop_id)(this, &mut id).0 == 0
+                && id.to_u128() == 0
+        }
+    }
+}
 
 #[repr(C)]
 struct DesktopVtable {
@@ -78,11 +152,7 @@ struct ManagerVtable {
 
 impl ShellManager {
     fn connect() -> Option<Self> {
-        unsafe {
-            let provider: IServiceProvider =
-                CoCreateInstance(&IMMERSIVE_SHELL, None, CLSCTX_LOCAL_SERVER).ok()?;
-            provider.QueryService(&DESKTOP_SERVICE).ok()
-        }
+        unsafe { shell_provider()?.QueryService(&DESKTOP_SERVICE).ok() }
     }
 
     fn object<T>(&self, method: Out<T>) -> Option<T> {

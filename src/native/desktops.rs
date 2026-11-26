@@ -111,7 +111,7 @@ impl Service {
         let this = self.interface.as_ptr().cast();
         let mut guid = GUID::default();
         let result = unsafe { (self.vtable().desktop_id)(this, hwnd, &mut guid) };
-        if result < 0 {
+        if result != 0 {
             return Err(result);
         }
         Ok(DesktopId(

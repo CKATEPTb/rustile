@@ -1,14 +1,17 @@
+use std::cell::OnceCell;
 use std::collections::HashSet;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+use windows_sys::Win32::Graphics::Dwm::{DWM_CLOAKED_SHELL, DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW, GetWindowLongW,
-    IsWindow, IsWindowVisible, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_MINIMIZE,
+    IsIconic, IsWindow, IsWindowVisible, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_MINIMIZE,
 };
 
+use super::shell::ApplicationViews;
 use super::{DesktopId, Service, shell_window};
 use crate::layout::Id;
 use crate::native::{Cloak, append_window, cloak_state, pid};
@@ -21,6 +24,33 @@ const PINNED_APP: DesktopId = DesktopId(0xbb64d5b7_4de3_4ab2_a87c_db7601aea7dc);
 /// Snapshot all monitors and virtual desktops independently of tiling eligibility.
 /// The caller owns the COM apartment. None means that emptiness is unproven.
 pub(crate) fn occupied(desktops: &[DesktopId]) -> Option<HashSet<DesktopId>> {
+    scan(desktops, |windows| windows.collect::<Result<_, _>>().ok())
+}
+
+/// A known window suffices for navigation; proving emptiness requires every observation.
+pub(crate) fn any_occupied(desktops: &[DesktopId], candidates: &[DesktopId]) -> Option<bool> {
+    scan(desktops, |windows| any_match(windows, candidates))
+}
+
+fn any_match(
+    windows: impl Iterator<Item = Result<DesktopId, ()>>,
+    candidates: &[DesktopId],
+) -> Option<bool> {
+    let mut complete = true;
+    for desktop in windows {
+        match desktop {
+            Ok(id) if candidates.contains(&id) => return Some(true),
+            Ok(_) => {}
+            Err(()) => complete = false,
+        }
+    }
+    complete.then_some(false)
+}
+
+fn scan<T>(
+    desktops: &[DesktopId],
+    inspect: impl FnOnce(&mut dyn Iterator<Item = Result<DesktopId, ()>>) -> Option<T>,
+) -> Option<T> {
     let service = Service::connect()?;
     if service.shell.is_null() {
         return None;
@@ -31,37 +61,94 @@ pub(crate) fn occupied(desktops: &[DesktopId]) -> Option<HashSet<DesktopId>> {
     {
         return None;
     }
-    let mut occupied = HashSet::new();
-    for id in windows {
-        let hwnd = id as HWND;
-        if !task_window(hwnd)? {
-            continue;
-        }
-        let mut desktop = service.desktop_id(hwnd).ok().filter(|d| d.0 != 0);
-        if desktop.is_none() {
-            // A modal window may belong to the shell view of a hidden owner.
-            let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
-            if !owner.is_null() && owner != hwnd {
-                desktop = service.desktop_id(owner).ok();
-            }
-        }
-        if unsafe { IsWindow(hwnd) } != 0 {
-            record(&mut occupied, desktops, desktop?)?;
-        }
-    }
-    (shell_window() == service.shell).then_some(occupied)
+    let views = OnceCell::new();
+    let mut observations = windows
+        .into_iter()
+        .filter_map(|id| window_desktop(id as HWND, &service, &views, desktops).transpose());
+    let result = inspect(&mut observations)?;
+    (shell_window() == service.shell).then_some(result)
 }
 
-fn record(occupied: &mut HashSet<DesktopId>, desktops: &[DesktopId], id: DesktopId) -> Option<()> {
+fn window_desktop(
+    hwnd: HWND,
+    service: &Service,
+    views: &OnceCell<Option<ApplicationViews>>,
+    desktops: &[DesktopId],
+) -> Result<Option<DesktopId>, ()> {
+    if !task_window(hwnd).ok_or(())? {
+        return Ok(None);
+    }
+    let mut desktop = service.desktop_id(hwnd).ok();
+    if desktop.is_none_or(|d| d.0 == 0) {
+        // A modal window may belong to the shell view of a hidden owner.
+        let owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+        if !owner.is_null() && owner != hwnd {
+            desktop = match service.desktop_id(owner) {
+                Ok(id) if id.0 != 0 => Some(id),
+                Ok(_) => desktop,
+                Err(_) => None,
+            };
+        }
+    }
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return Ok(None);
+    }
+    assigned_desktop(desktops, desktop.ok_or(())?, || {
+        shell_cloaked_packaged_window(hwnd)
+            && views
+                .get_or_init(ApplicationViews::connect)
+                .as_ref()
+                .is_some_and(|views| views.is_hidden_unassigned_view(hwnd))
+    })
+}
+
+fn class_name(hwnd: HWND) -> Option<String> {
+    let mut name = [0u16; 256];
+    let length = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) };
+    (length > 0).then(|| String::from_utf16_lossy(&name[..length as usize]))
+}
+
+fn shell_cloaked_packaged_window(hwnd: HWND) -> bool {
+    // A suspended packaged app can retain its CoreWindow and ApplicationFrame
+    // after the last task has closed. A failed ID lookup, a minimized window,
+    // or a real task on another desktop must still protect its workspace.
+    let Some(class) = class_name(hwnd) else {
+        return false;
+    };
+    let mut cloak = 0u32;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as u32,
+            (&raw mut cloak).cast(),
+            size_of_val(&cloak) as u32,
+        )
+    };
+    hr == 0 && parked_frame_candidate(&class, unsafe { IsIconic(hwnd) } != 0, cloak)
+}
+
+fn parked_frame_candidate(class: &str, minimized: bool, cloak: u32) -> bool {
+    !minimized
+        && cloak == DWM_CLOAKED_SHELL
+        && matches!(
+            class,
+            "Windows.UI.Core.CoreWindow" | "ApplicationFrameWindow"
+        )
+}
+
+fn assigned_desktop(
+    desktops: &[DesktopId],
+    id: DesktopId,
+    parked: impl FnOnce() -> bool,
+) -> Result<Option<DesktopId>, ()> {
     if matches!(id, PINNED_APP | PINNED_WINDOW) {
-        return Some(());
+        return Ok(None);
+    }
+    if id.0 == 0 {
+        return parked().then_some(None).ok_or(());
     }
     // A GUID outside this snapshot can indicate a concurrent desktop change.
-    if id.0 == 0 || !desktops.contains(&id) {
-        return None;
-    }
-    occupied.insert(id);
-    Some(())
+    desktops.contains(&id).then_some(Some(id)).ok_or(())
 }
 
 fn task_window(hwnd: HWND) -> Option<bool> {
@@ -75,12 +162,9 @@ fn task_window(hwnd: HWND) -> Option<bool> {
     if style == 0 {
         return (unsafe { IsWindow(hwnd) } == 0).then_some(false);
     }
-    let mut class = [0u16; 256];
-    let length = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-    if length <= 0 {
+    let Some(class) = class_name(hwnd) else {
         return (unsafe { IsWindow(hwnd) } == 0).then_some(false);
-    }
-    let class = String::from_utf16_lossy(&class[..length as usize]);
+    };
     if !task_style(style, extended, &class)
         || (style & WS_MINIMIZE == 0 && cloak_state(hwnd as Id) == Cloak::Application)
     {
@@ -182,15 +266,44 @@ mod tests {
     #[test]
     fn pinned_windows_are_global_and_unknown_ids_invalidate_the_snapshot() {
         let desktops = [DesktopId(1), DesktopId(2)];
-        let mut occupied = HashSet::new();
         for id in [PINNED_WINDOW, PINNED_APP] {
-            assert_eq!(record(&mut occupied, &desktops, id), Some(()));
+            assert_eq!(assigned_desktop(&desktops, id, || unreachable!()), Ok(None));
         }
-        assert!(occupied.is_empty());
-        for id in [DesktopId(0), DesktopId(3)] {
-            assert_eq!(record(&mut occupied, &desktops, id), None);
+        assert_eq!(
+            assigned_desktop(&desktops, DesktopId(3), || unreachable!()),
+            Err(())
+        );
+        assert_eq!(
+            assigned_desktop(&desktops, desktops[1], || unreachable!()),
+            Ok(Some(desktops[1]))
+        );
+        assert_eq!(assigned_desktop(&desktops, DesktopId(0), || false), Err(()));
+        assert_eq!(assigned_desktop(&desktops, DesktopId(0), || true), Ok(None));
+    }
+
+    #[test]
+    fn positive_navigation_evidence_survives_an_unrelated_unresolved_view() {
+        let target = DesktopId(1);
+        let other = DesktopId(2);
+        assert_eq!(
+            any_match([Err(()), Ok(target)].into_iter(), &[target]),
+            Some(true)
+        );
+        assert_eq!(any_match([Err(()), Ok(other)].into_iter(), &[target]), None);
+        assert_eq!(any_match([Ok(other)].into_iter(), &[target]), Some(false));
+    }
+
+    #[test]
+    fn only_shell_cloaked_unminimized_packaged_frames_need_the_extra_view_check() {
+        for class in ["Windows.UI.Core.CoreWindow", "ApplicationFrameWindow"] {
+            assert!(parked_frame_candidate(class, false, DWM_CLOAKED_SHELL));
+            assert!(!parked_frame_candidate(class, true, DWM_CLOAKED_SHELL));
+            assert!(!parked_frame_candidate(class, false, 0));
         }
-        assert_eq!(record(&mut occupied, &desktops, desktops[1]), Some(()));
-        assert_eq!(occupied, HashSet::from([desktops[1]]));
+        assert!(!parked_frame_candidate(
+            "CabinetWClass",
+            false,
+            DWM_CLOAKED_SHELL
+        ));
     }
 }

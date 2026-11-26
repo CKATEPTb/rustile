@@ -11,6 +11,11 @@ struct Inventory {
 }
 
 impl Inventory {
+    fn current_is_empty_tail(&self) -> bool {
+        from_current(&self.order, self.current)
+            .is_some_and(|tail| tail.iter().all(|id| !self.occupied.contains(id)))
+    }
+
     fn empty_spare(&self, preferred: Option<DesktopId>) -> Option<DesktopId> {
         let empty = |id: &DesktopId| !self.occupied.contains(id);
         preferred
@@ -21,6 +26,10 @@ impl Inventory {
     fn read(shell: &DesktopShell) -> Option<Self> {
         let current = shell.current()?;
         let order = shell.list()?;
+        Self::for_order(shell, current, order)
+    }
+
+    fn for_order(shell: &DesktopShell, current: DesktopId, order: Vec<DesktopId>) -> Option<Self> {
         if !order.contains(&current) {
             return None;
         }
@@ -106,6 +115,7 @@ impl Policy {
         let empty = |id: &DesktopId| !inventory.occupied.contains(id);
         let current = inventory.current;
         let occupied = !empty(&current);
+        let empty_tail = inventory.current_is_empty_tail();
         if occupied || self.awaiting_departure != Some(current) {
             self.awaiting_departure = None;
         }
@@ -113,27 +123,44 @@ impl Policy {
             self.awaiting_departure = Some(current);
         }
         self.last_current = Some((current, occupied));
-        self.spare = if !occupied && self.awaiting_departure.is_none() {
-            // Task View can create and select a second empty desktop. Keep the
-            // one the user selected and retire the old spare in the background.
+        self.spare = if empty_tail || (!occupied && self.awaiting_departure.is_none()) {
             Some(current)
-        } else {
-            inventory.empty_spare(self.spare)
-        };
-        // Establish the trailing spare first, even if an active, recently
-        // emptied desktop must remain in place until the user leaves it.
-        let change = Change::position_spare(&inventory.order, self.spare).or_else(|| {
-            let spare = self.spare?;
+        } else if self.awaiting_departure == Some(current) && self.spare == Some(current) {
+            // A window may open farther right while tail removal is pending.
+            // Keep the vacated current slot in place if another spare exists.
             inventory
                 .order
                 .iter()
+                .rev()
                 .copied()
-                .find(|&id| id != inventory.current && id != spare && empty(&id))
-                .map(|desktop| Change::Remove {
-                    desktop,
-                    fallback: spare,
-                })
-        });
+                .find(|&id| id != current && empty(&id))
+                .or(Some(current))
+        } else {
+            inventory.empty_spare(self.spare)
+        };
+        let change = if empty_tail
+            && let Some(&last) = inventory.order.last().filter(|&&id| id != current)
+        {
+            // The current desktop already occupies the correct slot. Trim
+            // the unused tail without moving it or waiting for departure.
+            Some(Change::Remove {
+                desktop: last,
+                fallback: current,
+            })
+        } else {
+            Change::position_spare(&inventory.order, self.spare).or_else(|| {
+                let spare = self.spare?;
+                inventory
+                    .order
+                    .iter()
+                    .copied()
+                    .find(|&id| id != current && id != spare && empty(&id))
+                    .map(|desktop| Change::Remove {
+                        desktop,
+                        fallback: spare,
+                    })
+            })
+        };
         let Some(change) = change else {
             self.pending = None;
             self.issued = None;
@@ -185,7 +212,24 @@ fn neighbor(order: &[DesktopId], current: DesktopId, next: bool) -> Option<Deskt
         .copied()
 }
 
-pub(super) const SETTLE_MS: u32 = 350;
+fn from_current(order: &[DesktopId], current: DesktopId) -> Option<&[DesktopId]> {
+    let index = order.iter().position(|&id| id == current)?;
+    Some(&order[index..])
+}
+
+fn forward_neighbor(
+    tail: &[DesktopId],
+    occupied: impl FnOnce(&[DesktopId]) -> Option<bool>,
+) -> Option<DesktopId> {
+    let next = *tail.get(1)?;
+    // Explorer can list the redundant spare briefly after the last close.
+    // A live window here or further right is evidence that Next is valid.
+    (occupied(tail)?).then_some(next)
+}
+
+pub(super) const EVENT_BATCH_MS: u32 = 40;
+const CONFIRM_MS: u32 = 60;
+const RETRY_MS: u32 = 350;
 
 pub(super) struct Workspaces {
     pub(super) supported: bool,
@@ -238,18 +282,18 @@ impl Workspaces {
                 return Some(5000);
             }
             self.incomplete = self.incomplete.saturating_add(1);
-            return (self.incomplete <= 3).then(|| SETTLE_MS * u32::from(self.incomplete));
+            return (self.incomplete <= 3).then(|| RETRY_MS * u32::from(self.incomplete));
         };
         self.incomplete = 0;
         match self.policy.observe(inventory) {
             Decision::Idle => None,
-            Decision::Verify => Some(SETTLE_MS),
+            Decision::Verify => Some(CONFIRM_MS),
             Decision::RetryAfter(delay) => Some(delay),
             Decision::Apply(change) => {
                 self.policy.apply(shell, change);
                 // Even after an RPC error, the Shell may have committed the change.
                 // Observe the result before considering another mutation.
-                Some(SETTLE_MS)
+                Some(CONFIRM_MS)
             }
         }
     }
@@ -261,34 +305,40 @@ impl Workspaces {
         let Some((current, order)) = shell.current().zip(shell.list()) else {
             return false;
         };
-        if let Some(target) = neighbor(&order, current, next) {
-            return shell.switch(target);
+        if !next {
+            return neighbor(&order, current, false).is_some_and(|id| shell.switch(id));
         }
-        // Next at the occupied right edge can arrive before Explorer's change
-        // notification settles. Put the spare there before switching to it.
-        if next
-            && order.last() == Some(&current)
-            && let Some(inventory) = Inventory::read(shell)
-            && inventory.order == order
-            && inventory.current == current
-            && inventory.occupied.contains(&current)
-            && let Some(change) =
-                Change::position_spare(&order, inventory.empty_spare(self.policy.spare))
-        {
-            let proposal = (inventory, change);
-            if self.policy.issued.as_ref() != Some(&proposal) {
-                self.policy.issued = Some(proposal);
-                self.policy.pending = None;
-                self.policy.retry_at = None;
-                self.policy.failures = 0;
-                if self.policy.apply(shell, change)
-                    && let Some(spare) = self.policy.spare
-                {
-                    return shell.switch(spare);
-                }
-            }
+        let Some(tail) = from_current(&order, current) else {
+            return false;
+        };
+        if tail.len() > 1 {
+            let target = forward_neighbor(tail, |ids| occupancy::any_occupied(&order, ids));
+            return target.is_some_and(|id| {
+                shell.current() == Some(current)
+                    && shell.list().as_ref() == Some(&order)
+                    && shell.switch(id)
+            });
         }
-        false
+        let Some(inventory) = Inventory::for_order(shell, current, order) else {
+            return false;
+        };
+        if !inventory.occupied.contains(&current) {
+            return false;
+        }
+        let Some(change) =
+            Change::position_spare(&inventory.order, inventory.empty_spare(self.policy.spare))
+        else {
+            return false;
+        };
+        let proposal = (inventory, change);
+        if self.policy.issued.as_ref() == Some(&proposal) {
+            return false;
+        }
+        self.policy.issued = Some(proposal);
+        self.policy.pending = None;
+        self.policy.retry_at = None;
+        self.policy.failures = 0;
+        self.policy.apply(shell, change) && self.policy.spare.is_some_and(|id| shell.switch(id))
     }
 }
 
@@ -322,28 +372,60 @@ mod tests {
     }
 
     #[test]
-    fn last_window_closed_waits_until_departure_and_keeps_the_existing_spare() {
+    fn closing_the_last_window_on_four_retires_five_and_keeps_four_selected() {
         let mut policy = Policy::default();
+        let order = [1, 2, 3, 4, 5];
+        let reopened = inventory(&order, 4, &[1, 2, 3, 4]);
+        let closed = inventory(&order, 4, &[1, 2, 3]);
+        assert_eq!(policy.observe(reopened.clone()), Decision::Idle);
+        assert_eq!(policy.observe(closed.clone()), Decision::Verify);
+        assert_eq!(policy.observe(reopened), Decision::Idle);
+        assert_eq!(policy.observe(closed.clone()), Decision::Verify);
         assert_eq!(
-            policy.observe(inventory(&[1, 2, 3], 2, &[1, 2])),
-            Decision::Idle
+            policy.observe(closed),
+            Decision::Apply(Change::Remove {
+                desktop: DesktopId(5),
+                fallback: DesktopId(4),
+            })
         );
         assert_eq!(
-            policy.observe(inventory(&[1, 2, 3], 2, &[1])),
+            policy.observe(inventory(&[1, 2, 3, 4], 4, &[1, 2, 3])),
             Decision::Idle
         );
-        for destination in [1, 3] {
-            let left = inventory(&[1, 2, 3], destination, &[1]);
-            assert_eq!(policy.observe(left.clone()), Decision::Verify);
+    }
+
+    #[test]
+    fn startup_and_multiple_empty_successors_trim_from_the_end() {
+        let mut policy = Policy::default();
+        for last in (5..=7).rev() {
+            let order: Vec<_> = (1..=last).collect();
+            let state = inventory(&order, 4, &[1, 2, 3]);
+            assert_eq!(policy.observe(state.clone()), Decision::Verify);
             assert_eq!(
-                policy.observe(left),
+                policy.observe(state),
                 Decision::Apply(Change::Remove {
-                    desktop: DesktopId(2),
-                    fallback: DesktopId(3),
+                    desktop: DesktopId(last),
+                    fallback: DesktopId(4),
                 })
             );
         }
-        assert_eq!(policy.observe(inventory(&[1, 3], 3, &[1])), Decision::Idle);
+        assert_eq!(
+            policy.observe(inventory(&[1, 2, 3, 4], 4, &[1, 2, 3])),
+            Decision::Idle
+        );
+    }
+
+    #[test]
+    fn a_successor_gaining_a_window_cancels_tail_cleanup_and_preserves_the_current_slot() {
+        let mut policy = Policy::default();
+        let order = [1, 2, 3, 4, 5, 6];
+        let used = inventory(&order, 4, &[1, 2, 3, 4, 5]);
+        assert_eq!(policy.observe(used), Decision::Idle);
+        let tail = inventory(&order, 4, &[1, 2, 3]);
+        assert_eq!(policy.observe(tail), Decision::Verify);
+        let fifth_reopened = inventory(&order, 4, &[1, 2, 3, 5]);
+        assert_eq!(policy.observe(fifth_reopened), Decision::Idle);
+        assert_eq!(policy.spare, Some(DesktopId(6)));
     }
 
     #[test]
@@ -361,12 +443,6 @@ mod tests {
         assert_eq!(policy.observe(returned.clone()), Decision::Verify);
         assert_eq!(
             policy.observe(returned),
-            Decision::Apply(Change::MoveToEnd(DesktopId(2)))
-        );
-        let reordered = inventory(&[1, 3, 2], 2, &[1]);
-        assert_eq!(policy.observe(reordered.clone()), Decision::Verify);
-        assert_eq!(
-            policy.observe(reordered),
             Decision::Apply(Change::Remove {
                 desktop: DesktopId(3),
                 fallback: DesktopId(2),
@@ -408,29 +484,29 @@ mod tests {
     fn the_spare_stays_last_while_the_vacated_current_waits_for_departure() {
         let mut policy = Policy::default();
         assert_eq!(
-            policy.observe(inventory(&[1, 2, 3], 2, &[1, 2])),
+            policy.observe(inventory(&[1, 2, 3, 4], 2, &[1, 2, 3])),
             Decision::Idle
         );
-        let closed_and_reordered = inventory(&[3, 1, 2], 2, &[1]);
+        let closed_and_reordered = inventory(&[4, 1, 2, 3], 2, &[1, 3]);
         assert_eq!(
             policy.observe(closed_and_reordered.clone()),
             Decision::Verify
         );
         assert_eq!(
             policy.observe(closed_and_reordered),
-            Decision::Apply(Change::MoveToEnd(DesktopId(3)))
+            Decision::Apply(Change::MoveToEnd(DesktopId(4)))
         );
         assert_eq!(
-            policy.observe(inventory(&[1, 2, 3], 2, &[1])),
+            policy.observe(inventory(&[1, 2, 3, 4], 2, &[1, 3])),
             Decision::Idle
         );
-        let left = inventory(&[1, 2, 3], 1, &[1]);
+        let left = inventory(&[1, 2, 3, 4], 3, &[1, 3]);
         assert_eq!(policy.observe(left.clone()), Decision::Verify);
         assert_eq!(
             policy.observe(left),
             Decision::Apply(Change::Remove {
                 desktop: DesktopId(2),
-                fallback: DesktopId(3)
+                fallback: DesktopId(4)
             })
         );
     }
@@ -459,6 +535,28 @@ mod tests {
         assert_eq!(neighbor(&order, DesktopId(3), true), None);
         assert_eq!(neighbor(&order, DesktopId(7), false), None);
         assert_eq!(neighbor(&order, DesktopId(404), true), None);
+    }
+
+    #[test]
+    fn next_on_four_checks_live_windows_before_the_shell_removes_five() {
+        let state = inventory(&[1, 2, 3, 4, 5], 4, &[1, 2, 3]);
+        let tail = from_current(&state.order, state.current).unwrap();
+        let forward = |occupied: &HashSet<DesktopId>| {
+            forward_neighbor(tail, |ids| Some(ids.iter().any(|id| occupied.contains(id))))
+        };
+        assert_eq!(forward(&state.occupied), None);
+        assert_eq!(forward_neighbor(tail, |_| None), None);
+        assert_eq!(
+            neighbor(&state.order, state.current, false),
+            Some(DesktopId(3))
+        );
+        // A minimized window still occupies its desktop. Reopening an app on
+        // either side of this boundary must also make Next work immediately.
+        for reopened in [DesktopId(4), DesktopId(5)] {
+            let mut occupied = state.occupied.clone();
+            occupied.insert(reopened);
+            assert_eq!(forward(&occupied), Some(DesktopId(5)));
+        }
     }
 
     #[test]
