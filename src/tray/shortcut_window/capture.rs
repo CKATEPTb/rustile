@@ -37,16 +37,19 @@ impl Capture {
         let module = unsafe { GetModuleHandleW(null()) };
         let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) };
         if keyboard.is_null() {
-            return Err(format!(
-                "Не удалось начать ввод сочетания. {}",
-                io::Error::last_os_error()
+            return Err(render(
+                Msg::UiCaptureError,
+                &[("error", &io::Error::last_os_error().to_string())],
             ));
         }
         let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), module, 0) };
         if mouse.is_null() {
             let error = io::Error::last_os_error();
             unsafe { UnhookWindowsHookEx(keyboard) };
-            return Err(format!("Не удалось начать ввод сочетания. {error}"));
+            return Err(render(
+                Msg::UiCaptureError,
+                &[("error", &error.to_string())],
+            ));
         }
         let generation = TARGET.with(|target| {
             let generation = target.get().1.wrapping_add(1);
@@ -169,7 +172,7 @@ impl Keys {
         if let Some(chord) = self.chord {
             chord.label()
         } else if self.held.is_empty() {
-            "Нажмите клавишу".into()
+            tr(Msg::UiPressKey).into()
         } else {
             Chord::modifier_labels(self.modifiers())
                 .collect::<Vec<_>>()

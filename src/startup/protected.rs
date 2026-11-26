@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, render, tr};
 use std::{
     ffi::{OsString, c_void},
     fs::{self, File, OpenOptions},
@@ -32,20 +33,21 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 pub(super) fn exe_path(sid: &str) -> Result<PathBuf, String> {
-    let fields = sid
-        .strip_prefix("S-1-")
-        .ok_or("Неверный SID пользователя.")?;
+    let fields = sid.strip_prefix("S-1-").ok_or(tr(Msg::SystemBadSid))?;
     if sid.len() > 184
         || !fields
             .split('-')
             .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
     {
-        return Err("Неверный SID пользователя.".into());
+        return Err(tr(Msg::SystemBadSid).into());
     }
     let mut name = null_mut();
     let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, null_mut(), &mut name) };
     if hr < 0 {
-        return Err(format!("Не удалось найти Program Files ({hr:#x})."));
+        return Err(render(
+            Msg::SystemProgramFiles,
+            &[("detail", &format!("{hr:#x}"))],
+        ));
     }
     let dir = unsafe {
         let mut len = 0;
@@ -59,7 +61,7 @@ pub(super) fn exe_path(sid: &str) -> Result<PathBuf, String> {
     if !matches!(dir.components().next(), Some(std::path::Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_)))
         || !dir.is_absolute()
     {
-        return Err("Для автозапуска нужен локальный каталог Program Files.".into());
+        return Err(tr(Msg::SystemLocalFolder).into());
     }
     Ok(dir.join("Rustile").join(sid).join("rustile.exe"))
 }
@@ -93,10 +95,7 @@ fn attributes(sd: &Local) -> Security::SECURITY_ATTRIBUTES {
 }
 
 fn denied() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "объект не соответствует требованиям к защищённому каталогу Rustile",
-    )
+    io::Error::new(io::ErrorKind::PermissionDenied, tr(Msg::SystemUnsafeFolder))
 }
 
 // Inspect the object itself, not a junction's target. Owners can change an
@@ -191,7 +190,7 @@ fn is_running_image(source: &File) -> io::Result<bool> {
             s!("NtAreMappedFilesTheSame"),
         )
     }
-    .ok_or_else(|| io::Error::other("Windows не поддерживает проверку образа Rustile"))?;
+    .ok_or_else(|| io::Error::other(tr(Msg::SystemVerifyImage)))?;
     let compare: unsafe extern "system" fn(*const c_void, *const c_void) -> i32 =
         unsafe { std::mem::transmute(compare) };
     let map =
@@ -315,7 +314,7 @@ fn install_at(exe: &Path) -> io::Result<()> {
 
 pub(super) fn install(sid: &str) -> Result<(), String> {
     let exe = exe_path(sid)?;
-    install_at(&exe).map_err(|e| format!("Не удалось установить защищённую копию Rustile: {e}"))
+    install_at(&exe).map_err(|e| render(Msg::SystemInstallProtected, &[("detail", &e.to_string())]))
 }
 
 #[cfg(test)]

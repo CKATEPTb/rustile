@@ -7,6 +7,7 @@ mod shortcuts;
 #[cfg(test)]
 mod tests;
 
+use crate::i18n::{Msg, render};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
@@ -1069,7 +1070,10 @@ fn pump(
                             })
                     {
                         tray.set_startup(startup::Startup::read().ok());
-                        show_error(&format!("Не удалось начать настройку автозапуска: {error}"));
+                        show_error(&render(
+                            Msg::SystemStartSetup,
+                            &[("detail", &error.to_string())],
+                        ));
                     }
                     continue;
                 }
@@ -1225,7 +1229,7 @@ fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {
     manager.sync();
     refresh(&mut manager, 0);
     if let Some(warning) = load_warning {
-        show_error(&format!("Применены настройки по умолчанию.\n\n{warning}"));
+        show_error(&render(Msg::SystemDefaults, &[("detail", &warning)]));
     }
     if let Some(warning) = exclusion_warning {
         show_error(&warning);

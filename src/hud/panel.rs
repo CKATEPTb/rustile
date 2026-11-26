@@ -113,7 +113,7 @@ impl PanelLayout {
         let gap = p(4);
         let cap_pad = p(7);
         let icon = p(20);
-        let mut title = Label::new(Guide::TITLE, fonts.heading, colors.text);
+        let mut title = Label::new(Guide::title(), fonts.heading, colors.text);
         let mut width = p(328).max(2 * pad + icon + p(9) + title.measure(dc.0, work.w).cx);
         let mut rows = Vec::new();
         for (index, row) in guide.rows.iter().enumerate() {

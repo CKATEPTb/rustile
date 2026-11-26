@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use super::Chord;
+use crate::i18n::{Msg, render, tr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,17 +31,17 @@ impl SchemeKey {
         Self::Down,
     ];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Base => "Основная клавиша",
-            Self::Grab => "Захват окна",
-            Self::Desktop => "Рабочие столы",
-            Self::Resize => "Быстрое изменение размера",
-            Self::Left => "Влево",
-            Self::Right => "Вправо",
-            Self::Up => "Вверх",
-            Self::Down => "Вниз",
-        }
+    fn label(self) -> &'static str {
+        tr(match self {
+            Self::Base => Msg::BindRoleBase,
+            Self::Grab => Msg::BindRoleGrab,
+            Self::Desktop => Msg::BindRoleDesktop,
+            Self::Resize => Msg::BindRoleResize,
+            Self::Left => Msg::BindRoleLeft,
+            Self::Right => Msg::BindRoleRight,
+            Self::Up => Msg::BindRoleUp,
+            Self::Down => Msg::BindRoleDown,
+        })
     }
 
     const fn is_modifier(self) -> bool {
@@ -62,13 +63,13 @@ impl SchemeKey {
 
     fn validate(self, key: u16) -> Result<(), String> {
         if self == Self::Base && key == VK_SHIFT {
-            return Err("Для управления Rustile выберите Win, Ctrl или Alt. Shift нужен для обычного ввода заглавных букв.".into());
+            return Err(tr(Msg::BindBaseModifier).into());
         }
         if self.is_modifier() && modifier_bit(key) == 0 {
-            return Err("Для этой роли выберите Win, Shift, Ctrl или Alt.".into());
+            return Err(tr(Msg::BindModifierRole).into());
         }
         if !self.is_modifier() && (!Chord::supports_key(key) || key >= 0x100) {
-            return Err("Для направления выберите одну обычную клавишу клавиатуры.".into());
+            return Err(tr(Msg::BindDirectionKey).into());
         }
         Ok(())
     }
@@ -141,11 +142,13 @@ impl Scheme {
                 .iter()
                 .find(|&&other| self.0[other as usize] == key)
             {
-                return Err(format!(
-                    "{} назначена и на «{}», и на «{}».",
-                    Chord::key_label(key),
-                    other.label(),
-                    role.label()
+                let owners = render(
+                    Msg::BindOwnerBoth,
+                    &[("first", other.label()), ("second", role.label())],
+                );
+                return Err(render(
+                    Msg::BindAlreadyAssigned,
+                    &[("chord", &Chord::key_label(key)), ("owners", &owners)],
                 ));
             }
         }

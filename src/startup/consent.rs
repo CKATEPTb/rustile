@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, render, tr};
 use std::io;
 use std::os::windows::{
     ffi::OsStrExt,
@@ -33,7 +34,6 @@ use super::{protected, scheduler};
 const ENABLE: &str = "--install-admin-startup";
 const DISABLE: &str = "--remove-admin-startup";
 const ACCOUNT_MISMATCH: u8 = 2;
-const NEED_SAME_ADMIN: &str = "Для автозапуска с повышенными правами подтвердите запрос из своей учётной записи администратора.";
 
 fn token() -> io::Result<OwnedHandle> {
     let mut handle = null_mut();
@@ -145,8 +145,9 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
         )
     };
     if apartment < 0 {
-        return Err(format!(
-            "Не удалось подготовить запрос прав Windows ({apartment:#x})."
+        return Err(render(
+            Msg::SystemPrepareConsent,
+            &[("detail", &format!("{apartment:#x}"))],
         ));
     }
     let mut launch = SHELLEXECUTEINFOW {
@@ -164,11 +165,14 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
         return if err.raw_os_error() == Some(ERROR_CANCELLED as i32) {
             Ok(false)
         } else {
-            Err(format!("Не удалось запросить права администратора: {err}"))
+            Err(render(
+                Msg::SystemAdminRequest,
+                &[("detail", &err.to_string())],
+            ))
         };
     }
     if launch.hProcess.is_null() {
-        return Err("Windows не вернула процесс настройки автозапуска.".into());
+        return Err(tr(Msg::SystemNoProcess).into());
     }
     let child = unsafe { OwnedHandle::from_raw_handle(launch.hProcess) };
     let mut exit = 0;
@@ -179,9 +183,12 @@ pub(super) fn configure(enable: bool) -> Result<bool, String> {
     }
     match exit {
         0 => Ok(true),
-        n if n == u32::from(ACCOUNT_MISMATCH) => Err(NEED_SAME_ADMIN.into()),
+        n if n == u32::from(ACCOUNT_MISMATCH) => Err(tr(Msg::SystemSameAdmin).into()),
         // The helper displays the specific installation or scheduler error.
         1 => Ok(false),
-        _ => Err(format!("Настройка автозапуска прервалась (код {exit}).")),
+        _ => Err(render(
+            Msg::SystemSetupStopped,
+            &[("detail", &exit.to_string())],
+        )),
     }
 }

@@ -23,7 +23,7 @@ impl ShortcutWindow {
         let recording = self.recording(action);
         let chord = self.editor_chord(action, self.selected_slot.get());
         let category = if recording {
-            "Запись сочетания"
+            tr(Msg::UiRecording)
         } else {
             view::group_title(action)
         };
@@ -137,7 +137,7 @@ impl ShortcutWindow {
                 self.p(6),
                 self.p(if focused { 2 } else { 1 }),
             );
-            let label = "Сбросить всё";
+            let label = tr(Msg::UiResetAll);
             let gap = self.p(7);
             let icon_width = self.p(17);
             let label_width = text_width(dc, fonts.regular, label);

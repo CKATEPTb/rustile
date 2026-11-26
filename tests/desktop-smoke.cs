@@ -23,6 +23,22 @@ internal static class DesktopSmoke {
     enum FixtureMode { Normal, Borderless, Maximize, AppBounds, RestoreNormalStyle }
     const int ExtendedFrameBounds = 9, WindowCornerPreference = 33;
     static readonly int[] FixtureCorners = { 2, 3, 1 }; // round, small, square
+    static readonly string[] Languages = { "en", "ru", "de", "fr", "it", "es", "zh-Hans", "ja", "pt", "ko", "pl", "tr" };
+    static readonly Dictionary<string, string[]> Catalog = new Dictionary<string, string[]>();
+    static int languageIndex;
+    static string T(string key) { return Catalog[key][languageIndex]; }
+    static string AlternativesSeparator { get { return " " + T("HudOr") + " "; } }
+
+    static void LoadCatalog(string directory) {
+        foreach (string path in Directory.GetFiles(directory, "*.tsv")) {
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8)) {
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                var cells = line.Split('\t');
+                Require(cells.Length == Languages.Length + 1, "Missing translation for " + cells[0]);
+                Catalog.Add(cells[0], cells.Skip(1).Select(value => value.Replace("\\n", "\n")).ToArray());
+            }
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     struct Rect { public int Left, Top, Right, Bottom; }
@@ -715,14 +731,14 @@ internal static class DesktopSmoke {
         return result;
     }
     static string ControlText(IntPtr hwnd) {
-        var text = new StringBuilder(256);
+        var text = new StringBuilder(2048);
         UIntPtr result;
         if (SendMessageTimeout(hwnd, 0x000d, (UIntPtr)text.Capacity, text, 2, 1000, out result) == IntPtr.Zero)
             throw new Win32Exception();
         return text.ToString();
     }
     static IntPtr OpenShortcutEditor(Child manager, IntPtr tray, Rectangle area) {
-        TrayClick(tray, "Горячие клавиши");
+        TrayClick(tray, T("TrayShortcuts"));
         var editor = TrayWindow(manager, "Rustile.Shortcuts");
         Until("The editor should open and the tray flyout should close", () =>
             IsWindowVisible(editor) && !IsWindowVisible(tray));
@@ -743,7 +759,7 @@ internal static class DesktopSmoke {
     }
     static void VerifyExclusions(Child manager, IntPtr tray, Rectangle area, IntPtr[] pair, Rectangle[] original) {
         TrayOpen(tray, TrayKeyboard, area);
-        TrayClick(tray, "Исключения");
+        TrayClick(tray, T("TrayExclusions"));
         var editor = TrayWindow(manager, "Rustile.Exclusions");
         Until("Exclusions should replace the flyout", () => IsWindowVisible(editor) && !IsWindowVisible(tray));
         var title = ControlText(pair[0]);
@@ -770,7 +786,7 @@ internal static class DesktopSmoke {
         SendTrayMessage(editor, WmClose, IntPtr.Zero, IntPtr.Zero);
         Until("Closing the exclusions editor should dismiss it", () => !IsWindowVisible(editor));
         TrayOpen(tray, TrayContext, area);
-        TrayClick(tray, "Исключения");
+        TrayClick(tray, T("TrayExclusions"));
         editor = TrayWindow(manager, "Rustile.Exclusions");
         var list = EditorControl(editor, 601);
         UIntPtr count;
@@ -798,7 +814,7 @@ internal static class DesktopSmoke {
         Require(IsWindowVisible(row) && IsWindowEnabled(row), "The binding must be visible to begin recording");
         MouseClick(row, true);
         Until("Double-click should start recording directly in the selected binding", () =>
-            ControlText(row).Contains("Нажмите клавишу"));
+            ControlText(row).Contains(T("UiPressKey")));
     }
     static void CaptureKey(IntPtr row, Keys key, bool down, bool system = false) {
         uint message = down ? 0x0100u : 0x0101u; // WM_KEYDOWN / WM_KEYUP
@@ -843,7 +859,7 @@ internal static class DesktopSmoke {
         }
         Require(labels.Length > 0, "Missing binding for action " + action);
         return labels[0] + String.Concat(labels.Skip(1).Select(label =>
-            " или " + label.Substring(label.IndexOf(", ", StringComparison.Ordinal) + 2)));
+            AlternativesSeparator + label.Substring(label.IndexOf(", ", StringComparison.Ordinal) + 2)));
     }
     static string[] ShortcutLabels(IntPtr editor) {
         var labels = new string[ActionCount];
@@ -863,11 +879,11 @@ internal static class DesktopSmoke {
     static void VerifyAlternativeEdits(IntPtr editor, IntPtr left, string initial, string settingsFile) {
         var before = File.ReadAllText(settingsFile);
         var add = EditorControl(editor, 1304);
-        Require(IsWindowEnabled(add) && ControlText(add).Contains("Переместить влево"),
+        Require(IsWindowEnabled(add) && ControlText(add).Contains(T("BindMoveLeft")),
             "The add button should identify the action receiving another shortcut");
         MouseClick(add);
         var emptySlot = EditorControl(editor, 2004);
-        Require(ControlText(emptySlot).Contains("Нажмите клавишу") && !IsWindowVisible(EditorControl(editor, 2204)),
+        Require(ControlText(emptySlot).Contains(T("UiPressKey")) && !IsWindowVisible(EditorControl(editor, 2204)),
             "Adding a fresh combination should offer recording without a delete button");
         CaptureKey(left, Keys.Escape, true);
         CaptureKey(left, Keys.Escape, false);
@@ -878,7 +894,7 @@ internal static class DesktopSmoke {
         EnterChord(left, Keys.LWin, Keys.ShiftKey, Keys.J);
         Until("Move left should expose a second independently selectable shortcut", () =>
             File.ReadAllText(settingsFile) != before && IsWindowEnabled(add)
-            && ShortcutLabel(editor, 4) == initial + " или Win+Shift+J");
+            && ShortcutLabel(editor, 4) == initial + AlternativesSeparator + "Win+Shift+J");
         var second = EditorControl(editor, 2004);
         Require(ControlText(left) == initial && ControlText(second).EndsWith(", Win+Shift+J")
             && IsWindowVisible(second) && !Bounds(second).IntersectsWith(Bounds(left)),
@@ -893,19 +909,19 @@ internal static class DesktopSmoke {
         EnterChord(left, Keys.LWin, Keys.ShiftKey, Keys.H);
         Until("Editing the second shortcut should preserve the first", () =>
             File.ReadAllText(settingsFile) != secondSaved && IsWindowEnabled(add)
-            && ShortcutLabel(editor, 4) == initial + " или Win+Shift+H");
+            && ShortcutLabel(editor, 4) == initial + AlternativesSeparator + "Win+Shift+H");
         var replacementSaved = File.ReadAllText(settingsFile);
         MouseClick(add);
         EnterChord(left, Keys.LWin, Keys.ShiftKey, Keys.K);
         Until("A third shortcut should append to both existing choices", () =>
             File.ReadAllText(settingsFile) != replacementSaved && IsWindowEnabled(add)
-            && ShortcutLabel(editor, 4) == initial + " или Win+Shift+H или Win+Shift+K");
+            && ShortcutLabel(editor, 4) == initial + AlternativesSeparator + "Win+Shift+H" + AlternativesSeparator + "Win+Shift+K");
         BeginRecording(BindingControl(editor, 2004, "Win+Shift+H"));
         var trash = BindingControl(editor, 2204, "Win+Shift+H");
         Require(IsWindowVisible(trash) && IsWindowEnabled(trash), "Recording must reveal the selected binding's trash");
         MouseClick(trash);
         Until("Removing the middle shortcut should preserve both neighbors", () =>
-            ShortcutLabel(editor, 4) == initial + " или Win+Shift+K");
+            ShortcutLabel(editor, 4) == initial + AlternativesSeparator + "Win+Shift+K");
         MouseClick(EditorControl(editor, 1104));
         Until("The action reset should restore its complete factory list", () =>
             ControlText(left) == initial && File.ReadAllText(settingsFile) == before);
@@ -921,7 +937,7 @@ internal static class DesktopSmoke {
             int split = label.IndexOf(", ", StringComparison.Ordinal);
             if (split < 0) return false;
             string action = label.Substring(0, split + 2);
-            return label.Substring(split + 2).Split(new[] { " или " }, StringSplitOptions.None)
+            return label.Substring(split + 2).Split(new[] { AlternativesSeparator }, StringSplitOptions.None)
                 .Any(chord => selected == action + chord);
         }), "The fixed preview must describe the selected action and one of its current alternatives: " + selected);
     }
@@ -1084,7 +1100,7 @@ internal static class DesktopSmoke {
         var transfer = EditorControl(editor, 527);
         var upperHeadings = Enumerable.Range(520, 7).Select(id => GetDlgItem(view, id)).ToArray();
         var transferIds = ShortcutFamilies[3];
-        Require(ControlText(transfer) == "Перенос окна между столами", "The transfer section needs its own heading");
+        Require(ControlText(transfer) == T("UiGroupTransfer"), "The transfer section needs its own heading");
         Require((GetWindowLongW(view, -16) & 0x00200000 /* WS_VSCROLL */) == 0,
             "The shortcut editor should have no vertical scrollbar");
         Require(EditableRows.All(id => GetDlgItem(view, 1200 + id) == IntPtr.Zero && GetDlgItem(view, 2100 + id) == IntPtr.Zero),
@@ -1206,12 +1222,12 @@ internal static class DesktopSmoke {
             return true;
         }, IntPtr.Zero);
         string message = copy.ToString();
-        Require(new[] { "Выбрать окно слева", "Переместить влево", "Win+Left" }
+        Require(new[] { T("BindFocusLeft"), T("BindMoveLeft"), "Win+Left" }
             .All(label => message.IndexOf(label, StringComparison.OrdinalIgnoreCase) >= 0),
             "Conflict prompt must identify the chord and both actions: " + message);
         var cancel = EditorControl(dialog, 2 /* IDCANCEL */);
         var assign = EditorControl(dialog, 1 /* IDOK */);
-        Require(ControlText(cancel) == "Отмена" && ControlText(assign) == "Переназначить",
+        Require(ControlText(cancel) == T("UiCancel") && ControlText(assign) == T("UiReassign"),
             "The conflict dialog should offer cancel and reassign");
         int owner;
         int dialogThread = (int)GetWindowThreadProcessId(dialog, out owner);
@@ -1383,7 +1399,7 @@ internal static class DesktopSmoke {
         int cloaked;
         Require(DwmGetWindowAttribute(tray, 14 /* DWMWA_CLOAKED */, out cloaked, sizeof(int)) == 0
             && (cloaked & 1 /* DWM_CLOAKED_APP */) == 0, "Rustile left the tray popup cloaked");
-        TrayButton(tray, "Мозаика");
+        TrayButton(tray, T("TrayTiling"));
         Require(Screen.FromHandle(tray).WorkingArea.Contains(Bounds(tray)), "The tray popup extends outside its monitor's work area");
     }
     static void TrayChoose(IntPtr tray, int activation, Rectangle area, params string[] labels) {
@@ -1403,23 +1419,23 @@ internal static class DesktopSmoke {
     static void StartupSettings(string testBinary, string desktop, Rectangle area) {
         // Only this Rust test process redirects HKCU. Never send a startup
         // command to the production instance used by the other smoke tests.
-        const string startup = "Запускать при входе в Windows", admin = "От имени администратора";
+        string startup = T("TrayAutoStart"), admin = T("TrayAdmin");
         using (var manager = new Child(testBinary, "--exact runtime::tests::isolated_startup_tray --ignored", desktop)) {
             var tray = TrayWindow(manager);
             try {
                 TrayOpen(tray, TrayKeyboard, area);
                 var compact = Bounds(tray);
-                TrayButton(tray, startup + ", Выключено");
+                TrayButton(tray, startup + ", " + T("TrayOff"));
                 TrayKey(tray, startup, Keys.Down);
-                TrayFocus(tray, "Исключения");
-                TrayKey(tray, "Исключения", Keys.Down);
-                TrayFocus(tray, "Выйти из Rustile");
-                TrayKey(tray, "Выйти из Rustile", Keys.Up);
-                TrayKey(tray, "Исключения", Keys.Up);
+                TrayFocus(tray, T("TrayExclusions"));
+                TrayKey(tray, T("TrayExclusions"), Keys.Down);
+                TrayFocus(tray, T("TrayQuit"));
+                TrayKey(tray, T("TrayQuit"), Keys.Up);
+                TrayKey(tray, T("TrayExclusions"), Keys.Up);
                 TrayFocus(tray, startup);
                 TrayKey(tray, startup, Keys.Space);
-                TrayButton(tray, startup + ", Включено");
-                TrayButton(tray, admin + ", Выключено");
+                TrayButton(tray, startup + ", " + T("TrayOn"));
+                TrayButton(tray, admin + ", " + T("TrayOff"));
                 TrayFocus(tray, startup);
                 var expanded = Bounds(tray);
                 Require(expanded.Height > compact.Height && expanded.Bottom == compact.Bottom
@@ -1428,30 +1444,30 @@ internal static class DesktopSmoke {
                 TrayFocus(tray, admin);
                 // The isolated consent provider declines the first request.
                 TrayKey(tray, admin, Keys.Enter);
-                TrayButton(tray, admin + ", Настраивается…");
-                TrayButton(tray, admin + ", Выключено");
-                TrayButton(tray, startup + ", Включено");
+                TrayButton(tray, admin + ", " + T("TrayUpdating"));
+                TrayButton(tray, admin + ", " + T("TrayOff"));
+                TrayButton(tray, startup + ", " + T("TrayOn"));
                 TrayKey(tray, admin, Keys.Enter);
-                TrayButton(tray, admin + ", Включено");
+                TrayButton(tray, admin + ", " + T("TrayOn"));
                 TrayFocus(tray, admin);
                 TrayKey(tray, admin, Keys.Escape);
                 Until("Escape should close startup settings", () => !IsWindowVisible(tray));
                 TrayOpen(tray, TrayContext, area);
-                TrayButton(tray, admin + ", Включено");
+                TrayButton(tray, admin + ", " + T("TrayOn"));
                 TrayClick(tray, admin);
-                TrayButton(tray, admin + ", Выключено");
+                TrayButton(tray, admin + ", " + T("TrayOff"));
                 TrayClick(tray, admin);
-                TrayButton(tray, admin + ", Включено");
+                TrayButton(tray, admin + ", " + T("TrayOn"));
                 TrayClick(tray, startup);
-                TrayButton(tray, startup + ", Выключено");
+                TrayButton(tray, startup + ", " + T("TrayOff"));
                 Require(Bounds(tray) == compact, "Disabling startup left the administrator row in the menu");
                 TrayClick(tray, startup);
-                TrayButton(tray, admin + ", Выключено");
+                TrayButton(tray, admin + ", " + T("TrayOff"));
                 TrayClick(tray, startup);
-                TrayButton(tray, startup + ", Выключено");
+                TrayButton(tray, startup + ", " + T("TrayOff"));
                 TrayKey(tray, startup, Keys.Down);
-                TrayFocus(tray, "Исключения");
-                TrayClick(tray, "Выйти из Rustile");
+                TrayFocus(tray, T("TrayExclusions"));
+                TrayClick(tray, T("TrayQuit"));
                 Require(manager.Exited(5000) && manager.ExitCode == 0, "Isolated startup fixture did not exit cleanly");
             } finally {
                 if (!manager.Exited(0)) {
@@ -1471,10 +1487,10 @@ internal static class DesktopSmoke {
         var tray = TrayWindow(manager);
         VerifyExclusions(manager, tray, area, pair, originals);
         TrayOpen(tray, TrayKeyboard, area);
-        TrayFocus(tray, "Мозаика");
-        TrayKey(tray, "Мозаика", Keys.Down);
-        TrayFocus(tray, "Горячие клавиши");
-        TrayKey(tray, "Горячие клавиши", Keys.Escape);
+        TrayFocus(tray, T("TrayTiling"));
+        TrayKey(tray, T("TrayTiling"), Keys.Down);
+        TrayFocus(tray, T("TrayShortcuts"));
+        TrayKey(tray, T("TrayShortcuts"), Keys.Escape);
         Until("Escape should dismiss the first popup after a hidden launch", () => !IsWindowVisible(tray));
         // Exercise a busy message queue as well: sent shell notifications take
         // precedence over posted messages, and WM_PAINT normally comes last.
@@ -1494,49 +1510,49 @@ internal static class DesktopSmoke {
         Until("Losing activation to another application should close the popup", () => !IsWindowVisible(tray));
         TrayOpen(tray, TraySelect, area);
         Console.WriteLine("PASS  Left, right and mixed tray activations toggle the flyout and reopen after outside dismissal");
-        ClickArrow(tray, "Увеличить: Толщина обводки");
-        TrayButton(tray, "Толщина обводки, 2 px");
-        ClickArrow(tray, "Уменьшить: Толщина обводки");
-        TrayButton(tray, "Толщина обводки, 1 px");
-        TrayKey(tray, "Толщина обводки", Keys.Right);
-        TrayButton(tray, "Толщина обводки, 2 px");
-        TrayKey(tray, "Толщина обводки", Keys.Left);
-        TrayButton(tray, "Толщина обводки, 1 px");
+        ClickArrow(tray, T("TrayIncrease").Replace("{label}", T("TrayOutline")));
+        TrayButton(tray, T("TrayOutline") + ", 2 px");
+        ClickArrow(tray, T("TrayDecrease").Replace("{label}", T("TrayOutline")));
+        TrayButton(tray, T("TrayOutline") + ", 1 px");
+        TrayKey(tray, T("TrayOutline"), Keys.Right);
+        TrayButton(tray, T("TrayOutline") + ", 2 px");
+        TrayKey(tray, T("TrayOutline"), Keys.Left);
+        TrayButton(tray, T("TrayOutline") + ", 1 px");
 
-        EditNumber(tray, "Между окнами", "13", Keys.Enter);
-        var gapRow = TrayButton(tray, "Между окнами, 13 px");
+        EditNumber(tray, T("TrayGap"), "13", Keys.Enter);
+        var gapRow = TrayButton(tray, T("TrayGap") + ", 13 px");
         // Wheel input may be delivered to the focused row even when the
         // pointer is over a different setting. Use actual screen coordinates.
-        TrayKey(tray, "Между окнами", Keys.Up);
-        TrayFocus(tray, "Толщина обводки");
-        var elsewhere = TrayButton(tray, "Толщина обводки");
+        TrayKey(tray, T("TrayGap"), Keys.Up);
+        TrayFocus(tray, T("TrayOutline"));
+        var elsewhere = TrayButton(tray, T("TrayOutline"));
         Wheel(elsewhere, gapRow, 60);
         Wheel(elsewhere, gapRow, 60);
-        TrayButton(tray, "Между окнами, 14 px");
+        TrayButton(tray, T("TrayGap") + ", 14 px");
         Wheel(elsewhere, gapRow, 360);
-        TrayButton(tray, "Между окнами, 17 px");
+        TrayButton(tray, T("TrayGap") + ", 17 px");
         Wheel(elsewhere, gapRow, -120);
-        TrayButton(tray, "Между окнами, 16 px");
-        EditNumber(tray, "По краям экрана", "12", Keys.Enter);
-        TrayButton(tray, "По краям экрана, 12 px");
+        TrayButton(tray, T("TrayGap") + ", 16 px");
+        EditNumber(tray, T("TrayPadding"), "12", Keys.Enter);
+        TrayButton(tray, T("TrayPadding") + ", 12 px");
         Until("The selected tray spacing should reach the DWM frames", () => HasSpacing(pair, area));
-        EditNumber(tray, "Между окнами", "2", Keys.Escape);
-        TrayButton(tray, "Между окнами, 16 px");
-        var invalid = TypeNumber(tray, "Между окнами", "45");
+        EditNumber(tray, T("TrayGap"), "2", Keys.Escape);
+        TrayButton(tray, T("TrayGap") + ", 16 px");
+        var invalid = TypeNumber(tray, T("TrayGap"), "45");
         KeyDown(invalid, Keys.Enter);
         // After rejection the same edit is still active, with the draft selected.
         if (!PostMessage(invalid, 0x0102, (IntPtr)(int)'1', IntPtr.Zero)
             || !PostMessage(invalid, 0x0102, (IntPtr)(int)'5', IntPtr.Zero))
             throw new Win32Exception();
         KeyDown(invalid, Keys.Enter);
-        TrayButton(tray, "Между окнами, 15 px");
-        ClickArrow(tray, "Увеличить: Между окнами");
-        TrayButton(tray, "Между окнами, 16 px");
-        EditNumber(tray, "Толщина обводки", "4", Keys.Enter);
-        TrayButton(tray, "Толщина обводки, 4 px");
-        Require(!IsWindowEnabled(TrayButton(tray, "Увеличить: Толщина обводки")), "Maximum thickness should disable increase");
-        ClickArrow(tray, "Уменьшить: Толщина обводки");
-        TrayButton(tray, "Толщина обводки, 3 px");
+        TrayButton(tray, T("TrayGap") + ", 15 px");
+        ClickArrow(tray, T("TrayIncrease").Replace("{label}", T("TrayGap")));
+        TrayButton(tray, T("TrayGap") + ", 16 px");
+        EditNumber(tray, T("TrayOutline"), "4", Keys.Enter);
+        TrayButton(tray, T("TrayOutline") + ", 4 px");
+        Require(!IsWindowEnabled(TrayButton(tray, T("TrayIncrease").Replace("{label}", T("TrayOutline")))), "Maximum thickness should disable increase");
+        ClickArrow(tray, T("TrayDecrease").Replace("{label}", T("TrayOutline")));
+        TrayButton(tray, T("TrayOutline") + ", 3 px");
         var beforeEditor = pair.Select(VisibleFrame).ToArray();
         var editor = OpenShortcutEditor(manager, tray, area);
         Require(GetWindow(editor, 4 /* GW_OWNER */) == IntPtr.Zero, "Shortcut editor should be an independent window");
@@ -1600,7 +1616,7 @@ internal static class DesktopSmoke {
         BeginRecording(left);
         MouseClick(EditorControl(editor, 1404));
         Until("Deleting the last binding should leave an unassigned action editable", () =>
-            ControlText(left).EndsWith("Не назначено") && IsWindowEnabled(EditorControl(editor, 1304)));
+            ControlText(left).EndsWith(T("UiUnassigned")) && IsWindowEnabled(EditorControl(editor, 1304)));
         MouseClick(EditorControl(editor, 1104));
         Until("A reset should recover an empty action", () =>
             ControlText(left) == initial[4] && File.ReadAllText(file) == beforeCapture);
@@ -1679,12 +1695,12 @@ internal static class DesktopSmoke {
         EnterChord(focusLeft, Keys.ControlKey, Keys.F10);
         Until("Focus left should keep both of its shortcuts", () =>
             File.ReadAllText(file) != beforeDonorAdd && IsWindowEnabled(donorAdd)
-            && ShortcutLabel(editor, 0) == initial[0] + " или Ctrl+F10");
+            && ShortcutLabel(editor, 0) == initial[0] + AlternativesSeparator + "Ctrl+F10");
         MouseClick(EditorControl(editor, 1304));
         EnterChord(left, Keys.LWin, Keys.Left);
         ChooseConflict(manager, editor, ConflictChoice.TabEnter);
         Until("Reassignment should transfer only the conflicting chord and preserve both actions' other bindings", () =>
-            ControlText(focusLeft).EndsWith(", Ctrl+F10") && ShortcutLabel(editor, 4) == initial[4] + " или Win+Left");
+            ControlText(focusLeft).EndsWith(", Ctrl+F10") && ShortcutLabel(editor, 4) == initial[4] + AlternativesSeparator + "Win+Left");
         VerifyIdleHeader(editor);
         var oneOverride = File.ReadAllText(file);
         BeginRecording(right);
@@ -1707,7 +1723,7 @@ internal static class DesktopSmoke {
             "Could not apply manual editor bounds");
         var resized = Bounds(editor);
         TrayOpen(tray, TraySelect, area);
-        TrayClick(tray, "Горячие клавиши");
+        TrayClick(tray, T("TrayShortcuts"));
         Until("The tray should dismiss when returning to the already open editor", () => !IsWindowVisible(tray));
         Require(Bounds(editor) == resized && IsWindowVisible(editor), "Returning to an open editor discarded the manual size");
         Message(editor, WmClose);
@@ -1722,9 +1738,9 @@ internal static class DesktopSmoke {
         Console.WriteLine("PASS  Inline tray controls stay open through clicks, arrow keys, fractional wheel input, typed values and cancellation");
 
         var tiled = pair.Select(VisibleFrame).ToArray();
-        TrayChoose(tray, TrayContext, area, "Мозаика");
+        TrayChoose(tray, TrayContext, area, T("TrayTiling"));
         TrayOpen(tray, TraySelect, area);
-        TrayButton(tray, "Мозаика, Выключена");
+        TrayButton(tray, T("TrayTiling") + ", " + T("TrayTilingOff"));
         Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Pause moved a tiled window");
         var floating = tiled[0];
         floating.Offset(7, 5);
@@ -1733,16 +1749,16 @@ internal static class DesktopSmoke {
         // Exercise the shortcut hook's real message downstream of key matching.
         // A paused manager has no keyboard target, including on this private desktop.
         manager.Send(RustileShortcut, ToggleMosaic);
-        TrayButton(tray, "Мозаика, Включена");
+        TrayButton(tray, T("TrayTiling") + ", " + T("TrayTilingOn"));
         Require(File.ReadAllLines(file).Contains("enabled = true"), "Shortcut resume was not persisted");
         Until("Shortcut resume should return the moved fixture to its tile", () => pair.Select(VisibleFrame).SequenceEqual(tiled));
         manager.Send(RustileShortcut, ToggleMosaic);
-        TrayButton(tray, "Мозаика, Выключена");
+        TrayButton(tray, T("TrayTiling") + ", " + T("TrayTilingOff"));
         Require(File.ReadAllLines(file).Contains("enabled = false"), "Shortcut pause was not persisted");
         Require(pair.Select(VisibleFrame).SequenceEqual(tiled), "Shortcut pause changed existing window geometry");
-        TrayKey(tray, "По краям экрана", Keys.End);
-        TrayFocus(tray, "Выйти из Rustile");
-        TrayClick(tray, "Выйти из Rustile");
+        TrayKey(tray, T("TrayPadding"), Keys.End);
+        TrayFocus(tray, T("TrayQuit"));
+        TrayClick(tray, T("TrayQuit"));
         Require(manager.Exited(5000) && manager.ExitCode == 0, "Tray exit while paused failed");
         Until("Exit while paused should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
 
@@ -1750,8 +1766,8 @@ internal static class DesktopSmoke {
         children.Add(restarted);
         tray = TrayWindow(restarted);
         TrayOpen(tray, TrayContext, area);
-        TrayButton(tray, "Мозаика, Выключена");
-        TrayButton(tray, "Толщина обводки, 3 px");
+        TrayButton(tray, T("TrayTiling") + ", " + T("TrayTilingOff"));
+        TrayButton(tray, T("TrayOutline") + ", 3 px");
         Require(pair.Select(Bounds).SequenceEqual(originals), "Disabled startup tiled the windows");
         editor = OpenShortcutEditor(restarted, tray, area);
         var restored = ShortcutLabels(editor);
@@ -1779,10 +1795,10 @@ internal static class DesktopSmoke {
         Message(editor, WmClose);
         Until("The shortcut editor should close", () => !IsWindowVisible(editor));
         TrayOpen(tray, TraySelect, area);
-        TrayClick(tray, "Мозаика");
+        TrayClick(tray, T("TrayTiling"));
         Until("Resume should use the stored inner and outer gaps", () => HasSpacing(pair, area));
         TrayOpen(tray, TraySelect, area);
-        TrayClick(tray, "Выйти из Rustile");
+        TrayClick(tray, T("TrayQuit"));
         Require(restarted.Exited(5000) && restarted.ExitCode == 0, "Second tray exit failed");
         Until("Exit after resume should restore the original frames", () => pair.Select(Bounds).SequenceEqual(originals));
         var defaults = new Child(rustile, "", desktop, true);
@@ -1793,7 +1809,7 @@ internal static class DesktopSmoke {
         Require(ShortcutLabels(editor).SequenceEqual(initial), "Reset all did not survive restart");
         Message(editor, WmClose);
         Until("The final shortcut editor should close", () => !IsWindowVisible(editor));
-        TrayChoose(tray, TraySelect, area, "Выйти из Rustile");
+        TrayChoose(tray, TraySelect, area, T("TrayQuit"));
         Require(defaults.Exited(5000) && defaults.ExitCode == 0, "Tray exit after resetting shortcuts failed");
         Until("Exit after resetting shortcuts should restore fixture frames", () =>
             pair.Select(Bounds).SequenceEqual(originals));
@@ -2072,7 +2088,9 @@ internal static class DesktopSmoke {
         manager.Send(RustileShortcut, 1, active);
         Until("The modal hint should appear again", () => !noHint());
         var hint = ControlText(ManagerWindow(manager, "Rustile.ResizeHint", true));
-        Require(new[] { "Left или Up или Down или Right", "Shift+Left или Shift+Up или Shift+Down или Shift+Right", "Enter или Esc" }
+        Require(new[] { String.Join(AlternativesSeparator, "Left", "Up", "Down", "Right"),
+            String.Join(AlternativesSeparator, "Shift+Left", "Shift+Up", "Shift+Down", "Shift+Right"),
+            String.Join(AlternativesSeparator, "Enter", "Esc") }
             .All(hint.Contains), "The resize guide should announce all the English key names: " + hint);
         manager.Send(RustileShortcut, 30 + moved - 20, active);
         Until("The inverse modal command should update the same divider", () => extent(Bounds(active)) < extent(expanded[index]));
@@ -2082,7 +2100,48 @@ internal static class DesktopSmoke {
             () => noHint() && Bounds(active) == latest);
         return true;
     }
-    static void Run(string rustile, string managerTests) {
+    static void LocalizedWindows(string testBinary, string desktop, Rectangle area) {
+        Action<IntPtr, string> expectText = delegate(IntPtr control, string expected) {
+            string actual = ControlText(control);
+            Require(actual == expected, Languages[languageIndex] + ": expected '" + expected + "', got '" + actual + "'");
+        };
+        int systemLanguage = languageIndex;
+        string previous = Environment.GetEnvironmentVariable("RUSTILE_SMOKE_LANGUAGE");
+        try {
+            for (languageIndex = 0; languageIndex < Languages.Length; languageIndex++) {
+                string language = Languages[languageIndex];
+                Environment.SetEnvironmentVariable("RUSTILE_SMOKE_LANGUAGE", language);
+                using (var manager = new Child(testBinary, "--exact runtime::tests::isolated_localized_tray --ignored", desktop)) {
+                    var tray = TrayWindow(manager);
+                    TrayOpen(tray, TrayKeyboard, area);
+                    var editor = OpenShortcutEditor(manager, tray, area);
+                    expectText(editor, T("UiShortcutTitle"));
+                    expectText(EditorControl(editor, 520), T("UiGroupWindows"));
+                    expectText(EditorControl(editor, 505), T("UiResetAll"));
+                    expectText(EditorControl(editor, 1004), T("BindMoveLeft") + ", Win+Shift+Left");
+                    SendTrayMessage(editor, WmClose, IntPtr.Zero, IntPtr.Zero);
+                    Until("Shortcut editor should close", () => !IsWindowVisible(editor));
+                    TrayOpen(tray, TrayContext, area);
+                    TrayClick(tray, T("TrayExclusions"));
+                    var rules = TrayWindow(manager, "Rustile.Exclusions");
+                    expectText(rules, T("RuleWindowTitle"));
+                    expectText(EditorControl(rules, 615), T("RuleTitle"));
+                    expectText(EditorControl(rules, 608), T("RuleSave"));
+                    SendTrayMessage(rules, WmClose, IntPtr.Zero, IntPtr.Zero);
+                    Until("Exclusion editor should close", () => !IsWindowVisible(rules));
+                    TrayChoose(tray, TrayContext, area, T("TrayQuit"));
+                    Require(manager.Exited(5000) && manager.ExitCode == 0, "Localization test did not exit: " + language);
+                }
+                Console.WriteLine("PASS  Localized tray, shortcut editor and exclusion editor: " + language);
+            }
+        } finally {
+            languageIndex = systemLanguage;
+            Environment.SetEnvironmentVariable("RUSTILE_SMOKE_LANGUAGE", previous);
+        }
+    }
+
+    static void Run(string rustile, string managerTests, string locales) {
+        LoadCatalog(locales);
         var desktopName = "rustile-smoke-" + Guid.NewGuid().ToString("N");
         var originalDesktop = GetThreadDesktop(GetCurrentThreadId());
         // Never request DESKTOP_SWITCHDESKTOP permission.
@@ -2098,10 +2157,13 @@ internal static class DesktopSmoke {
             Directory.CreateDirectory(appData);
             Environment.SetEnvironmentVariable("LOCALAPPDATA", appData, EnvironmentVariableTarget.Process);
             Environment.SetEnvironmentVariable("RUSTILE_SMOKE_DESKTOP", desktopName);
-            using (var keys = new Child(managerTests, "--exact runtime::tests::isolated_shortcut_ownership --ignored", desktopName)) {
+            using (var keys = new Child(managerTests, "--exact runtime::tests::isolated_shortcut_ownership --ignored --nocapture", desktopName, false, true)) {
                 Require(keys.Exited(10000) && keys.ExitCode == 0, "Shortcut callback ownership test failed on the empty private desktop");
+                languageIndex = Array.FindIndex(Catalog["UiShortcutTitle"], title => keys.Output.Contains("RUSTILE_TEST_UI=" + title));
+                Require(languageIndex >= 0, "Smoke fixture could not identify the Windows display language: " + keys.Output);
             }
             Console.WriteLine("PASS  Shortcut callback consumes assigned presses, repeats and releases with no foreground or failed delivery; unassigned keys pass");
+            LocalizedWindows(managerTests, desktopName, Screen.PrimaryScreen.WorkingArea);
             var self = Process.GetCurrentProcess().MainModule.FileName;
             var windows = new IntPtr[3];
             var originals = new Rectangle[3];
@@ -2284,18 +2346,18 @@ internal static class DesktopSmoke {
                     else Application.Run(fixture);
                 }
             }
-            else if (args.Length == 2) {
+            else if (args.Length == 3) {
                 // A WinForms STA may already own an OLE window, which prevents
                 // switching its desktop. Start a clean worker before using USER.
                 Exception failure = null;
                 var worker = new Thread(delegate() {
-                    try { Run(args[0], args[1]); } catch (Exception error) { failure = error; }
+                    try { Run(args[0], args[1], args[2]); } catch (Exception error) { failure = error; }
                 });
                 worker.Start();
                 worker.Join();
                 if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
             }
-            else throw new ArgumentException("Expected paths to rustile.exe and its Rust test binary");
+            else throw new ArgumentException("Expected paths to rustile.exe, its Rust test binary and locales");
             return 0;
         } catch (Exception error) {
             Console.Error.WriteLine(error);

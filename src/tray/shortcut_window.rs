@@ -26,10 +26,12 @@ use super::{
     paint::{self, Colors, Fonts},
     scale,
 };
-use crate::settings::{Assignment, BindingConflicts, Chord, Command, Settings, Shortcut};
+use crate::{
+    i18n::{Msg, render, tr, wide as localized_wide},
+    settings::{Assignment, BindingConflicts, Chord, Command, Settings, Shortcut},
+};
 
 const CLASS: *const u16 = w!("Rustile.Shortcuts");
-const TITLE: *const u16 = w!("Горячие клавиши — Rustile");
 const STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
 const RESET_ALL: i32 = 505;
 const STATUS: i32 = 506;
@@ -90,6 +92,7 @@ pub(super) struct ShortcutWindow {
     hwnd: Cell<HWND>,
     owner: Cell<HWND>,
     dpi: Cell<u32>,
+    reset_button_width: Cell<i32>,
     settings: RefCell<Settings>,
     slots: RefCell<[Vec<Slot>; Shortcut::ALL.len()]>,
     row_metrics: RefCell<[Option<keycaps::RowMetrics>; Shortcut::ALL.len()]>,
@@ -118,6 +121,7 @@ impl Default for ShortcutWindow {
             hwnd: Cell::default(),
             owner: Cell::default(),
             dpi: Cell::new(96),
+            reset_button_width: Cell::new(0),
             settings: RefCell::default(),
             slots: RefCell::new(std::array::from_fn(|_| Vec::new())),
             row_metrics: RefCell::new(std::array::from_fn(|_| None)),
@@ -195,7 +199,7 @@ impl ShortcutWindow {
                 hwnd = CreateWindowExW(
                     WS_EX_CONTROLPARENT,
                     CLASS,
-                    TITLE,
+                    localized_wide(Msg::UiShortcutTitle),
                     STYLE,
                     area.left,
                     area.top,
@@ -207,9 +211,9 @@ impl ShortcutWindow {
                     (self as *const Self).cast(),
                 );
                 if hwnd.is_null() {
-                    return Err(format!(
-                        "Не удалось открыть горячие клавиши. {}",
-                        io::Error::last_os_error()
+                    return Err(render(
+                        Msg::UiOpenError,
+                        &[("error", &io::Error::last_os_error().to_string())],
                     ));
                 }
                 if let Err(e) = self.create_controls(hwnd) {
@@ -385,7 +389,7 @@ impl ShortcutWindow {
             .iter()
             .map(|chord| chord.label())
             .collect::<Vec<_>>();
-        legends.resize(count, "Не назначено".into());
+        legends.resize(count, tr(Msg::UiUnassigned).into());
         if recording && let Some(rec) = self.capture.borrow().as_ref() {
             legends[pos] = rec.keys.label();
         }
@@ -400,10 +404,13 @@ impl ShortcutWindow {
             {
                 caption(
                     slot.remove,
-                    &format!(
-                        "Удалить {} для «{}» — {category}",
-                        original.label(),
-                        action.label()
+                    &render(
+                        Msg::UiRemoveFromAction,
+                        &[
+                            ("shortcut", &original.label()),
+                            ("action", action.label()),
+                            ("category", category),
+                        ],
                     ),
                 );
             }
@@ -521,9 +528,7 @@ impl ShortcutWindow {
             Some(Event::Cancel) => self.end_capture(),
             Some(Event::Ambiguous) => {
                 self.end_capture();
-                self.result(Some(
-                    "Используйте одну основную клавишу вместе с модификаторами.",
-                ));
+                self.result(Some(tr(Msg::UiSingleKey)));
             }
             Some(Event::Complete(chord)) => {
                 let original = self.capture.borrow().as_ref().and_then(|rec| rec.original);

@@ -156,6 +156,14 @@ fn smoke_desktop() -> String {
 
 #[test]
 #[ignore = "driven by desktop-smoke on a private Win32 desktop"]
+fn isolated_localized_tray() {
+    smoke_desktop();
+    crate::i18n::set_test_process_language(&std::env::var("RUSTILE_SMOKE_LANGUAGE").unwrap());
+    run_with_args(&[], false).unwrap();
+}
+
+#[test]
+#[ignore = "driven by desktop-smoke on a private Win32 desktop"]
 fn isolated_shortcut_ownership() {
     use crate::manager::ShortcutTarget;
     use crate::settings::{Assignment, Chord, Shortcut};
@@ -166,6 +174,10 @@ fn isolated_shortcut_ownership() {
 
     smoke_desktop();
     assert!(unsafe { GetForegroundWindow() }.is_null());
+    println!(
+        "RUSTILE_TEST_UI={}",
+        crate::i18n::tr(crate::i18n::Msg::UiShortcutTitle)
+    );
     let mut settings = Settings::default();
     for (action, key) in [
         (Shortcut::FocusLeft, VK_F13),
@@ -335,6 +347,8 @@ fn isolated_shortcut_ownership() {
 #[ignore = "driven by desktop-smoke on a private Win32 desktop"]
 fn isolated_startup_tray() {
     let desktop = smoke_desktop();
+    // Read the user's display language before redirecting HKCU to the test hive.
+    crate::i18n::tr(crate::i18n::Msg::TrayAutoStart);
 
     // This test runs alone in a dedicated process. Even if it crashes, its
     // fake Run key is outside the paths Windows processes at logon.

@@ -126,12 +126,12 @@ impl State {
             unsafe {
                 let mut arrow = GetDlgItem(hwnd, id as i32);
                 if arrow.is_null() {
-                    let verb = if offset == 0 {
-                        "Уменьшить"
+                    let message = if offset == 0 {
+                        Msg::TrayDecrease
                     } else {
-                        "Увеличить"
+                        Msg::TrayIncrease
                     };
-                    let name = wide(&format!("{verb}: {}", m.label()));
+                    let name = wide(&render(message, &[("label", m.label())]));
                     arrow = CreateWindowExW(
                         0,
                         w!("BUTTON"),

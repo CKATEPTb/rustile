@@ -4,7 +4,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
-use super::{Modifier, OWNER_CHANGED, SchemeKey, Settings};
+use super::{Modifier, SchemeKey, Settings};
+use crate::i18n::{Msg, render, tr};
 
 // Wheel directions share the binding table with keyboard virtual keys,
 // which occupy 0x00..=0xff.
@@ -28,7 +29,7 @@ enum Group {
 }
 
 macro_rules! shortcuts {
-    ($( $name:ident, $label:literal, $group:ident, $key:ident; )+) => {
+    ($( $name:ident, $label:ident, $group:ident, $key:ident; )+) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
         #[serde(rename_all = "snake_case")]
         pub(crate) enum Shortcut { $( $name, )+ }
@@ -36,74 +37,74 @@ macro_rules! shortcuts {
         impl Shortcut {
             pub const ALL: [Self; 60] = [$( Self::$name, )+];
 
-            fn spec(self) -> (&'static str, Group, u16) {
-                match self { $( Self::$name => ($label, Group::$group, $key), )+ }
+            fn spec(self) -> (Msg, Group, u16) {
+                match self { $( Self::$name => (Msg::$label, Group::$group, $key), )+ }
             }
         }
     }
 }
 
 shortcuts! {
-    FocusLeft,             "Выбрать окно слева",             Focus, VK_LEFT;
-    FocusRight,            "Выбрать окно справа",            Focus, VK_RIGHT;
-    FocusUp,               "Выбрать окно сверху",            Focus, VK_UP;
-    FocusDown,             "Выбрать окно снизу",             Focus, VK_DOWN;
-    MoveLeft,              "Переместить влево",              Move, VK_LEFT;
-    MoveRight,             "Переместить вправо",             Move, VK_RIGHT;
-    MoveUp,                "Переместить вверх",              Move, VK_UP;
-    MoveDown,              "Переместить вниз",               Move, VK_DOWN;
-    StartResize,           "Начать изменение размера",       StartResize, VK_RETURN;
-    GrowLeft,              "Сдвинуть к левому краю",         Grow, VK_LEFT;
-    GrowRight,             "Сдвинуть к правому краю",        Grow, VK_RIGHT;
-    GrowUp,                "Сдвинуть к верхнему краю",       Grow, VK_UP;
-    GrowDown,              "Сдвинуть к нижнему краю",        Grow, VK_DOWN;
-    ShrinkLeft,            "Сдвинуть от левого края",        Shrink, VK_LEFT;
-    ShrinkRight,           "Сдвинуть от правого края",       Shrink, VK_RIGHT;
-    ShrinkUp,              "Сдвинуть от верхнего края",      Shrink, VK_UP;
-    ShrinkDown,            "Сдвинуть от нижнего края",       Shrink, VK_DOWN;
-    Confirm,               "Завершить изменение размера",    Finish, VK_RETURN;
-    Cancel,                "Завершить (второе сочетание)",   Finish, VK_ESCAPE;
-    QuickLeft,             "Сдвинуть к левому краю",         Quick, VK_LEFT;
-    QuickRight,            "Сдвинуть к правому краю",        Quick, VK_RIGHT;
-    QuickUp,               "Сдвинуть к верхнему краю",       Quick, VK_UP;
-    QuickDown,             "Сдвинуть к нижнему краю",        Quick, VK_DOWN;
-    QuickReverseLeft,      "Сдвинуть от левого края",        QuickReverse, VK_LEFT;
-    QuickReverseRight,     "Сдвинуть от правого края",       QuickReverse, VK_RIGHT;
-    QuickReverseUp,        "Сдвинуть от верхнего края",      QuickReverse, VK_UP;
-    QuickReverseDown,      "Сдвинуть от нижнего края",       QuickReverse, VK_DOWN;
-    CloseWindow,           "Закрыть окно",                   Window, VK_Q;
-    ToggleMaximize,        "Развернуть или восстановить",    Window, VK_F;
-    ToggleMosaic,          "Включить или выключить мозаику", Window, VK_Y;
-    PreviousDesktop,       "Предыдущий стол",                Desktop, VK_LEFT;
-    NextDesktop,           "Следующий стол",                 Desktop, VK_RIGHT;
-    PreviousDesktopAlt,    "Предыдущий стол (вариант 2)",    Desktop, VK_UP;
-    NextDesktopAlt,        "Следующий стол (вариант 2)",     Desktop, VK_DOWN;
-    PreviousDesktopWheel,  "Предыдущий стол (вариант 3)",    Desktop, WHEEL_UP;
-    NextDesktopWheel,      "Следующий стол (вариант 3)",     Desktop, WHEEL_DOWN;
-    Desktop1,              "Рабочий стол 1",                 Desktop, VK_1;
-    Desktop2,              "Рабочий стол 2",                 Desktop, VK_2;
-    Desktop3,              "Рабочий стол 3",                 Desktop, VK_3;
-    Desktop4,              "Рабочий стол 4",                 Desktop, VK_4;
-    Desktop5,              "Рабочий стол 5",                 Desktop, VK_5;
-    Desktop6,              "Рабочий стол 6",                 Desktop, VK_6;
-    Desktop7,              "Рабочий стол 7",                 Desktop, VK_7;
-    Desktop8,              "Рабочий стол 8",                 Desktop, VK_8;
-    Desktop9,              "Рабочий стол 9",                 Desktop, VK_9;
-    Desktop10,             "Рабочий стол 10",                Desktop, VK_0;
-    MovePreviousDesktop,   "На предыдущий стол",             DesktopMove, VK_LEFT;
-    MoveNextDesktop,       "На следующий стол",              DesktopMove, VK_RIGHT;
-    MovePreviousDesktopAlt,"На предыдущий стол (вариант 2)", DesktopMove, VK_UP;
-    MoveNextDesktopAlt,    "На следующий стол (вариант 2)",  DesktopMove, VK_DOWN;
-    MoveDesktop1,          "На рабочий стол 1",              DesktopMoveNumber, VK_1;
-    MoveDesktop2,          "На рабочий стол 2",              DesktopMoveNumber, VK_2;
-    MoveDesktop3,          "На рабочий стол 3",              DesktopMoveNumber, VK_3;
-    MoveDesktop4,          "На рабочий стол 4",              DesktopMoveNumber, VK_4;
-    MoveDesktop5,          "На рабочий стол 5",              DesktopMoveNumber, VK_5;
-    MoveDesktop6,          "На рабочий стол 6",              DesktopMoveNumber, VK_6;
-    MoveDesktop7,          "На рабочий стол 7",              DesktopMoveNumber, VK_7;
-    MoveDesktop8,          "На рабочий стол 8",              DesktopMoveNumber, VK_8;
-    MoveDesktop9,          "На рабочий стол 9",              DesktopMoveNumber, VK_9;
-    MoveDesktop10,         "На рабочий стол 10",             DesktopMoveNumber, VK_0;
+    FocusLeft,             BindFocusLeft,              Focus, VK_LEFT;
+    FocusRight,            BindFocusRight,             Focus, VK_RIGHT;
+    FocusUp,               BindFocusUp,                Focus, VK_UP;
+    FocusDown,             BindFocusDown,              Focus, VK_DOWN;
+    MoveLeft,              BindMoveLeft,               Move, VK_LEFT;
+    MoveRight,             BindMoveRight,              Move, VK_RIGHT;
+    MoveUp,                BindMoveUp,                 Move, VK_UP;
+    MoveDown,              BindMoveDown,               Move, VK_DOWN;
+    StartResize,           BindStartResize,            StartResize, VK_RETURN;
+    GrowLeft,              BindGrowLeft,               Grow, VK_LEFT;
+    GrowRight,             BindGrowRight,              Grow, VK_RIGHT;
+    GrowUp,                BindGrowUp,                 Grow, VK_UP;
+    GrowDown,              BindGrowDown,               Grow, VK_DOWN;
+    ShrinkLeft,            BindShrinkLeft,             Shrink, VK_LEFT;
+    ShrinkRight,           BindShrinkRight,            Shrink, VK_RIGHT;
+    ShrinkUp,              BindShrinkUp,               Shrink, VK_UP;
+    ShrinkDown,            BindShrinkDown,             Shrink, VK_DOWN;
+    Confirm,               BindConfirm,                Finish, VK_RETURN;
+    Cancel,                BindCancel,                 Finish, VK_ESCAPE;
+    QuickLeft,             BindGrowLeft,               Quick, VK_LEFT;
+    QuickRight,            BindGrowRight,              Quick, VK_RIGHT;
+    QuickUp,               BindGrowUp,                 Quick, VK_UP;
+    QuickDown,             BindGrowDown,               Quick, VK_DOWN;
+    QuickReverseLeft,      BindShrinkLeft,             QuickReverse, VK_LEFT;
+    QuickReverseRight,     BindShrinkRight,            QuickReverse, VK_RIGHT;
+    QuickReverseUp,        BindShrinkUp,               QuickReverse, VK_UP;
+    QuickReverseDown,      BindShrinkDown,             QuickReverse, VK_DOWN;
+    CloseWindow,           BindCloseWindow,            Window, VK_Q;
+    ToggleMaximize,        BindToggleMaximize,         Window, VK_F;
+    ToggleMosaic,          BindToggleMosaic,           Window, VK_Y;
+    PreviousDesktop,       BindPreviousDesktop,        Desktop, VK_LEFT;
+    NextDesktop,           BindNextDesktop,            Desktop, VK_RIGHT;
+    PreviousDesktopAlt,    BindPreviousDesktopAlt,     Desktop, VK_UP;
+    NextDesktopAlt,        BindNextDesktopAlt,         Desktop, VK_DOWN;
+    PreviousDesktopWheel,  BindPreviousDesktopWheel,   Desktop, WHEEL_UP;
+    NextDesktopWheel,      BindNextDesktopWheel,       Desktop, WHEEL_DOWN;
+    Desktop1,              BindDesktop1,               Desktop, VK_1;
+    Desktop2,              BindDesktop2,               Desktop, VK_2;
+    Desktop3,              BindDesktop3,               Desktop, VK_3;
+    Desktop4,              BindDesktop4,               Desktop, VK_4;
+    Desktop5,              BindDesktop5,               Desktop, VK_5;
+    Desktop6,              BindDesktop6,               Desktop, VK_6;
+    Desktop7,              BindDesktop7,               Desktop, VK_7;
+    Desktop8,              BindDesktop8,               Desktop, VK_8;
+    Desktop9,              BindDesktop9,               Desktop, VK_9;
+    Desktop10,             BindDesktop10,              Desktop, VK_0;
+    MovePreviousDesktop,   BindMovePreviousDesktop,    DesktopMove, VK_LEFT;
+    MoveNextDesktop,       BindMoveNextDesktop,        DesktopMove, VK_RIGHT;
+    MovePreviousDesktopAlt, BindMovePreviousDesktopAlt, DesktopMove, VK_UP;
+    MoveNextDesktopAlt,    BindMoveNextDesktopAlt,     DesktopMove, VK_DOWN;
+    MoveDesktop1,          BindMoveDesktop1,           DesktopMoveNumber, VK_1;
+    MoveDesktop2,          BindMoveDesktop2,           DesktopMoveNumber, VK_2;
+    MoveDesktop3,          BindMoveDesktop3,           DesktopMoveNumber, VK_3;
+    MoveDesktop4,          BindMoveDesktop4,           DesktopMoveNumber, VK_4;
+    MoveDesktop5,          BindMoveDesktop5,           DesktopMoveNumber, VK_5;
+    MoveDesktop6,          BindMoveDesktop6,           DesktopMoveNumber, VK_6;
+    MoveDesktop7,          BindMoveDesktop7,           DesktopMoveNumber, VK_7;
+    MoveDesktop8,          BindMoveDesktop8,           DesktopMoveNumber, VK_8;
+    MoveDesktop9,          BindMoveDesktop9,           DesktopMoveNumber, VK_9;
+    MoveDesktop10,         BindMoveDesktop10,          DesktopMoveNumber, VK_0;
 }
 
 impl Shortcut {
@@ -145,7 +146,7 @@ impl Shortcut {
     }
 
     pub fn label(self) -> &'static str {
-        self.spec().0
+        tr(self.spec().0)
     }
 
     pub const fn index(self) -> usize {
@@ -228,8 +229,11 @@ impl BindingOwners {
 
     pub(crate) fn labels(self) -> String {
         match self {
-            Self::One(a) => format!("«{}»", a.label()),
-            Self::Both(a, b) => format!("«{}» и «{}»", a.label(), b.label()),
+            Self::One(a) => render(Msg::BindOwnerOne, &[("first", a.label())]),
+            Self::Both(a, b) => render(
+                Msg::BindOwnerBoth,
+                &[("first", a.label()), ("second", b.label())],
+            ),
         }
     }
 }
@@ -405,14 +409,14 @@ impl Chord {
         if !Self::supports_key(self.key)
             || self.mods & !(MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN) != 0
         {
-            return Err("Сочетание содержит неподдерживаемую клавишу или модификатор.".into());
+            return Err(tr(Msg::BindUnsupported).into());
         }
         if !action.is_resize()
             && self.mods & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0
             && !(VK_F1..=VK_F24).contains(&self.key)
             && !(VK_BROWSER_BACK..=VK_LAUNCH_APP2).contains(&self.key)
         {
-            return Err("Добавьте Win, Ctrl или Alt либо выберите функциональную или мультимедийную клавишу.".into());
+            return Err(tr(Msg::BindModifierRequired).into());
         }
         let reserved = match self.key {
             VK_X | VK_L => self.mods == MOD_WIN,
@@ -421,9 +425,9 @@ impl Chord {
             _ => false,
         };
         if reserved {
-            return Err(format!(
-                "Сочетание {} зарезервировано Windows.",
-                self.label()
+            return Err(render(
+                Msg::BindWindowsReserved,
+                &[("chord", &self.label())],
             ));
         }
         Ok(())
@@ -703,25 +707,25 @@ impl Settings {
     pub fn conflicts(&self, assignment: Assignment) -> Result<BindingConflicts, String> {
         let action = assignment.action();
         if !action.is_editable() {
-            return Err("Это системное сочетание Rustile.".into());
+            return Err(tr(Msg::BindSystemShortcut).into());
         }
         let current = self.bindings(action);
         if let Assignment::Edit(_, old, _) = assignment
             && !current.contains(&old)
         {
-            return Err(OWNER_CHANGED.into());
+            return Err(tr(Msg::BindOwnerChanged).into());
         }
         let mut result = BindingConflicts::default();
         for chord in assignment.requested() {
             chord.validate(action)?;
             if (action.is_resize() || action.reserves_both_modes()) && chord.fixed_exit() {
-                return Err("Enter и Esc завершают изменение размера.".into());
+                return Err(tr(Msg::BindResizeExit).into());
             }
             if current.contains(&chord) {
                 match assignment {
                     Assignment::Reset(_) => continue,
                     Assignment::Edit(_, old, _) if old == chord => continue,
-                    _ => return Err("Это сочетание уже назначено этому действию.".into()),
+                    _ => return Err(tr(Msg::BindSameAction).into()),
                 }
             }
             if let Some(owners) = self.conflict(action, chord) {
@@ -746,13 +750,12 @@ impl Settings {
             if conflicts.is_empty()
                 && let Some((chord, owners)) = actual.iter().next()
             {
-                return Err(format!(
-                    "{} уже назначено на {}.",
-                    chord.label(),
-                    owners.labels()
+                return Err(render(
+                    Msg::BindAlreadyAssigned,
+                    &[("chord", &chord.label()), ("owners", &owners.labels())],
                 ));
             }
-            return Err(OWNER_CHANGED.into());
+            return Err(tr(Msg::BindOwnerChanged).into());
         }
         for (chord, owners) in conflicts.iter() {
             for owner in owners.actions() {
@@ -771,7 +774,7 @@ impl Settings {
                 *chords
                     .iter_mut()
                     .find(|c| **c == old)
-                    .ok_or(OWNER_CHANGED)? = new;
+                    .ok_or_else(|| tr(Msg::BindOwnerChanged))? = new;
             }
             Assignment::Reset(_) => chords = action.factory_bindings(),
         }
@@ -781,10 +784,13 @@ impl Settings {
 
     pub(super) fn remove_chord(&mut self, action: Shortcut, old: Chord) -> Result<(), String> {
         if !action.is_editable() {
-            return Err("Это системное сочетание Rustile.".into());
+            return Err(tr(Msg::BindSystemShortcut).into());
         }
         let mut keys = self.bindings(action);
-        let index = keys.iter().position(|c| *c == old).ok_or(OWNER_CHANGED)?;
+        let index = keys
+            .iter()
+            .position(|c| *c == old)
+            .ok_or_else(|| tr(Msg::BindOwnerChanged))?;
         keys.remove(index);
         self.set_bindings(action, keys);
         Ok(())
@@ -827,7 +833,7 @@ impl Settings {
                 if stored.actions().any(|owner| {
                     !allowed.is_some_and(|(_, owners)| owners.actions().any(|a| a == owner))
                 }) {
-                    return Err(OWNER_CHANGED.into());
+                    return Err(tr(Msg::BindOwnerChanged).into());
                 }
             }
         }
@@ -901,11 +907,12 @@ impl Settings {
                     if (action.reserves_both_modes() || action.is_resize() == (mode == 1))
                         && let Some(other) = used.insert(chord, action)
                     {
-                        return Err(format!(
-                            "{} уже назначено на «{}» и «{}».",
-                            chord.label(),
-                            other.label(),
-                            action.label()
+                        return Err(render(
+                            Msg::BindAlreadyAssigned,
+                            &[
+                                ("chord", &chord.label()),
+                                ("owners", &BindingOwners::Both(other, action).labels()),
+                            ],
                         ));
                     }
                 }

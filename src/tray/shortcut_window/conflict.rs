@@ -24,9 +24,9 @@ impl ShortcutWindow {
             )
         };
         if dialog.is_null() {
-            return Err(format!(
-                "Не удалось открыть подтверждение. {}",
-                io::Error::last_os_error()
+            return Err(render(
+                Msg::UiConfirmError,
+                &[("error", &io::Error::last_os_error().to_string())],
             ));
         }
         self.transfer.set(Some(transfer));
@@ -40,16 +40,12 @@ impl ShortcutWindow {
             .join("\r\n");
         caption(child(dialog, CHORD), &legends);
         let message = if let [(_, owners)] = entries.as_slice() {
-            format!(
-                "Переназначить сочетание действию «{}»?\r\nТекущее назначение — {}.",
-                action.label(),
-                owners.labels()
+            render(
+                Msg::UiConfirmTransfer,
+                &[("action", action.label()), ("owners", &owners.labels())],
             )
         } else {
-            format!(
-                "Восстановить сочетания для «{}»? Они будут сняты с перечисленных действий.",
-                action.label()
-            )
+            render(Msg::UiConfirmRestore, &[("action", action.label())])
         };
         caption(child(dialog, BODY), &message);
         unsafe {
@@ -221,6 +217,9 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe {
         if msg == WM_INITDIALOG {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp);
+            SetWindowTextW(hwnd, localized_wide(Msg::UiConflictTitle));
+            SetWindowTextW(child(hwnd, IDOK), localized_wide(Msg::UiReassign));
+            SetWindowTextW(child(hwnd, IDCANCEL), localized_wide(Msg::UiCancel));
         }
         let Some(ui) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ShortcutWindow).as_ref()
         else {
@@ -319,11 +318,11 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 paint::text(
                     dc,
                     r,
-                    if accept {
-                        "Переназначить"
+                    tr(if accept {
+                        Msg::UiReassign
                     } else {
-                        "Отмена"
-                    },
+                        Msg::UiCancel
+                    }),
                     fonts.regular,
                     ink,
                     DT_CENTER,

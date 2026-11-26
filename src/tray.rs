@@ -26,6 +26,7 @@ use windows_sys::Win32::{
 };
 use windows_sys::core::w;
 
+use crate::i18n::{Msg, render, tr};
 use crate::settings::{Command, Settings, exclusions::ExclusionRule};
 use crate::startup::Startup;
 use exclusion_window::ExclusionWindow;
@@ -106,9 +107,9 @@ impl Tray {
                 ..Default::default()
             };
             if RegisterClassW(&class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
-                return Err(format!(
-                    "Регистрация меню Rustile: {}",
-                    io::Error::last_os_error()
+                return Err(render(
+                    Msg::TrayMenuRegister,
+                    &[("error", &io::Error::last_os_error().to_string())],
                 ));
             }
             let dpi = GetDpiForSystem().max(96);
@@ -117,7 +118,10 @@ impl Tray {
                 GetSystemMetricsForDpi(SM_CYSMICON, dpi),
             );
             if icon.is_null() {
-                return Err(format!("Значок Rustile: {}", io::Error::last_os_error()));
+                return Err(render(
+                    Msg::TrayIconLoad,
+                    &[("error", &io::Error::last_os_error().to_string())],
+                ));
             }
             let state = Box::new(State {
                 settings: RefCell::new(settings),
@@ -161,9 +165,9 @@ impl Tray {
                 (&raw const *state).cast(),
             );
             if hwnd.is_null() {
-                return Err(format!(
-                    "Создание меню Rustile: {}",
-                    io::Error::last_os_error()
+                return Err(render(
+                    Msg::TrayMenuCreate,
+                    &[("error", &io::Error::last_os_error().to_string())],
                 ));
             }
             state.register_icon(hwnd);
@@ -342,7 +346,7 @@ impl State {
         if self.startup_pending.get() {
             for row in &mut rows {
                 if matches!(row.action, Action::Apply(Command::SetStartup(_))) {
-                    row.detail = "Настраивается…".into();
+                    row.detail = tr(Msg::TrayUpdating).into();
                 }
             }
         }
@@ -360,9 +364,9 @@ impl State {
             ..Default::default()
         };
         let tip = if self.settings.borrow().enabled {
-            "Rustile — мозаика включена"
+            tr(Msg::TrayTipOn)
         } else {
-            "Rustile — мозаика выключена"
+            tr(Msg::TrayTipOff)
         };
         for (out, c) in data.szTip.iter_mut().zip(tip.encode_utf16()) {
             *out = c;
@@ -394,9 +398,7 @@ impl State {
             self.attempts.set(attempt);
             SetTimer(hwnd, RETRY, 1000 * u32::from(attempt).min(30), None);
             if attempt == 8 {
-                eprintln!(
-                    "Проводник Windows пока не принял значок Rustile. Установка будет повторена."
-                );
+                eprintln!("{}", tr(Msg::TrayShellRetry));
             }
         }
     }
@@ -545,7 +547,34 @@ impl State {
         }
         let work = monitor.rcWork;
         let p = |n| scale(n, self.dpi.get());
-        let width = p(340).min((work.right - work.left).max(1));
+        // Measure with the same font and DPI used for the owner-drawn rows.
+        // The stepper and switch reserve different amounts of space on the right.
+        let mut width = p(340);
+        if let Some(fonts) = self.fonts.borrow().as_ref() {
+            let dc = unsafe { GetDC(hwnd) };
+            if !dc.is_null() {
+                let measure = |font, value: &str| {
+                    paint::text(dc, RECT::default(), value, font, 0, DT_CALCRECT)
+                };
+                for row in self.entries.borrow().iter().skip(1) {
+                    let mut label = measure(fonts.regular, &row.label);
+                    let trailing = if let Action::Adjust(setting) = row.action {
+                        let range = render(Msg::TrayRange, &[("max", &setting.max().to_string())]);
+                        label = label.max(measure(fonts.regular, &range));
+                        p(118)
+                    } else if row.checked.is_some() {
+                        p(52)
+                    } else if !row.detail.is_empty() {
+                        measure(fonts.small, &row.detail) + p(24)
+                    } else {
+                        p(12)
+                    };
+                    width = width.max(p(50) + label + trailing + 2);
+                }
+                unsafe { ReleaseDC(hwnd, dc) };
+            }
+        }
+        let width = width.min((work.right - work.left).max(1));
         // Keep all choices reachable on a small high-DPI monitor.
         let ideal = self
             .entries
@@ -995,7 +1024,8 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             && state.inline.editing.get() == Some(i as usize)
                             && let Action::Adjust(measure) = row.action
                         {
-                            row.label = format!("Введите от 0 до {}", measure.max());
+                            row.label =
+                                render(Msg::TrayRange, &[("max", &measure.max().to_string())]);
                         }
                         painter.row(draw, &row, i == 0, hover, focus);
                     }

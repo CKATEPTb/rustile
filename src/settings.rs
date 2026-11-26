@@ -2,6 +2,7 @@ mod bindings;
 pub(crate) mod exclusions;
 mod scheme;
 
+use crate::i18n::{Msg, render, tr};
 use crate::profile_io;
 #[cfg(test)]
 pub(crate) use bindings::BindingOwners;
@@ -9,8 +10,6 @@ pub(crate) use bindings::{Assignment, BindingConflicts, Chord, Shortcut, WHEEL_D
 use bindings::{Overrides, StoredOverrides};
 use exclusions::ExclusionRule;
 use scheme::{Scheme, SchemeKey};
-
-const OWNER_CHANGED: &str = "Назначение уже изменилось. Запишите сочетание ещё раз.";
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -161,16 +160,21 @@ impl Settings {
 
     fn validated(&self) -> Result<Self, String> {
         if self.version != 1 {
-            return Err(format!("Неизвестная версия настроек: {}.", self.version));
+            return Err(render(
+                Msg::ConfigVersion,
+                &[("version", &self.version.to_string())],
+            ));
         }
         if self.gap > Self::MAX_SPACING
             || self.padding > Self::MAX_SPACING
             || self.outline > Self::MAX_OUTLINE
         {
-            return Err(format!(
-                "Размер отступов должен быть от 0 до {}, толщина обводки — от 0 до {}.",
-                Self::MAX_SPACING,
-                Self::MAX_OUTLINE
+            return Err(render(
+                Msg::ConfigRange,
+                &[
+                    ("spacing", &Self::MAX_SPACING.to_string()),
+                    ("outline", &Self::MAX_OUTLINE.to_string()),
+                ],
             ));
         }
         self.scheme.validate()?;
@@ -227,8 +231,7 @@ impl Settings {
     }
 
     pub fn path() -> Result<PathBuf, String> {
-        let local = std::env::var_os("LOCALAPPDATA")
-            .ok_or("Windows не указала расположение папки LOCALAPPDATA.")?;
+        let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| tr(Msg::ConfigLocalAppData))?;
         Ok(PathBuf::from(local).join("Rustile").join("settings.toml"))
     }
 
@@ -236,19 +239,31 @@ impl Settings {
         let text = match profile_io::with_user(|| fs::read_to_string(path)) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(format!("Не удалось прочитать {}: {e}", path.display())),
+            Err(e) => return Err(file_error(Msg::ConfigRead, path, &e)),
         };
-        let parsed: Self = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let parsed: Self =
+            toml::from_str(&text).map_err(|e| file_error(Msg::ConfigParse, path, &e))?;
         parsed.validated()
     }
 
     // Prepare the file before changing live geometry; validation or I/O failure
     // must leave the previous settings file intact.
     pub fn prepare(&self, path: &Path) -> Result<PendingSave, String> {
-        let content = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| file_error(Msg::ConfigWrite, path, &e))?;
         profile_io::with_user(|| PendingSave::new(path, content.as_bytes()))
-            .map_err(|e| format!("Не удалось записать {}: {e}", path.display()))
+            .map_err(|e| file_error(Msg::ConfigWrite, path, &e))
     }
+}
+
+fn file_error(msg: Msg, path: &Path, error: &dyn std::fmt::Display) -> String {
+    render(
+        msg,
+        &[
+            ("path", &path.to_string_lossy()),
+            ("error", &error.to_string()),
+        ],
+    )
 }
 
 pub(crate) struct PendingSave {
@@ -300,7 +315,7 @@ impl PendingSave {
             }
             Ok(())
         })
-        .map_err(|e| format!("Не удалось заменить {}: {e}", self.path.display()))
+        .map_err(|e| file_error(Msg::ConfigReplace, &self.path, &e))
     }
 }
 
@@ -313,6 +328,37 @@ impl Drop for PendingSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_language_changes_action_and_conflict_text_but_keeps_bindings_portable() {
+        use crate::i18n::{Language, with_language};
+
+        let action = Shortcut::MoveLeft;
+        let chord = action.default_chord();
+        let conflict = || {
+            Settings::default()
+                .changed(Command::Assign(Assignment::Add(Shortcut::FocusLeft, chord)))
+                .unwrap_err()
+        };
+        with_language(Language::De, || {
+            assert_eq!(action.label(), "Nach links verschieben");
+            assert_eq!(chord.label(), "Win+Shift+Left");
+            assert!(conflict().contains("„Nach links verschieben“"));
+        });
+        with_language(Language::Ja, || {
+            assert_eq!(action.label(), "左に移動");
+            assert_eq!(chord.label(), "Win+Shift+Left");
+            assert!(conflict().contains("「左に移動」"));
+            let changed = Settings::default()
+                .changed(Command::RemoveShortcut(action, chord))
+                .unwrap();
+            assert!(
+                toml::to_string_pretty(&changed)
+                    .unwrap()
+                    .contains("move_left")
+            );
+        });
+    }
 
     #[test]
     fn file_and_menu_share_validation_and_unset_fields_have_defaults() {

@@ -1,0 +1,217 @@
+use std::sync::OnceLock;
+use windows_sys::Win32::Globalization::{
+    GetUserDefaultUILanguage, GetUserPreferredUILanguages, LCIDToLocaleName, MUI_LANGUAGE_NAME,
+};
+
+include!(concat!(env!("OUT_DIR"), "/messages.rs"));
+
+// Column order in locales/*.tsv.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Language {
+    En,
+    Ru,
+    De,
+    Fr,
+    It,
+    Es,
+    ZhHans,
+    Ja,
+    Pt,
+    Ko,
+    Pl,
+    Tr,
+}
+
+impl Language {
+    fn from_tag(tag: &str) -> Option<Self> {
+        let tag = tag.to_ascii_lowercase();
+        let mut parts = tag.split('-');
+        Some(match parts.next()? {
+            "en" => Self::En,
+            "ru" => Self::Ru,
+            "de" => Self::De,
+            "fr" => Self::Fr,
+            "it" => Self::It,
+            "es" => Self::Es,
+            "ja" => Self::Ja,
+            "pt" => Self::Pt,
+            "ko" => Self::Ko,
+            "pl" => Self::Pl,
+            "tr" => Self::Tr,
+            "zh" => match parts.next() {
+                Some("hant" | "cht" | "tw" | "hk" | "mo") => return None,
+                Some("hans" | "chs" | "cn" | "sg" | "my") | None => Self::ZhHans,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+}
+
+fn preferred(buffer: &[u16]) -> Option<Language> {
+    buffer
+        .split(|&unit| unit == 0)
+        .take_while(|name| !name.is_empty())
+        .find_map(|name| Language::from_tag(&String::from_utf16_lossy(name)))
+}
+
+fn windows_language() -> Language {
+    let (mut count, mut size) = (0, 0);
+    if unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    } != 0
+        && size > 0
+    {
+        let mut names = vec![0; size as usize];
+        if unsafe {
+            GetUserPreferredUILanguages(
+                MUI_LANGUAGE_NAME,
+                &mut count,
+                names.as_mut_ptr(),
+                &mut size,
+            )
+        } != 0
+        {
+            return preferred(&names).unwrap_or(Language::En);
+        }
+    }
+    let mut name = [0; 85]; // LOCALE_NAME_MAX_LENGTH
+    let id = unsafe { GetUserDefaultUILanguage() };
+    let len = unsafe { LCIDToLocaleName(u32::from(id), name.as_mut_ptr(), name.len() as i32, 0) };
+    if len > 0
+        && let Some(language) = preferred(&name)
+    {
+        return language;
+    }
+    Language::En
+}
+
+static CURRENT: OnceLock<Language> = OnceLock::new();
+
+fn current() -> Language {
+    #[cfg(test)]
+    if let Some(language) = TEST_LANGUAGE.get() {
+        return language;
+    }
+    *CURRENT.get_or_init(windows_language)
+}
+
+pub(crate) fn tr(message: Msg) -> &'static str {
+    MESSAGES[message as usize][current() as usize]
+}
+
+type WideCatalog = Vec<OnceLock<Box<[u16]>>>;
+static WIDE: [OnceLock<WideCatalog>; 12] = [const { OnceLock::new() }; 12];
+
+// Some Win32 controls retain this pointer for their entire lifetime.
+pub(crate) fn wide(message: Msg) -> *const u16 {
+    let language = current() as usize;
+    let catalog =
+        WIDE[language].get_or_init(|| (0..MESSAGES.len()).map(|_| OnceLock::new()).collect());
+    catalog[message as usize]
+        .get_or_init(|| {
+            MESSAGES[message as usize][language]
+                .encode_utf16()
+                .chain([0])
+                .collect()
+        })
+        .as_ptr()
+}
+
+pub(crate) fn render(message: Msg, args: &[(&str, &str)]) -> String {
+    let mut template = tr(message);
+    let mut text = String::with_capacity(template.len());
+    while let Some((literal, tail)) = template.split_once('{') {
+        let (name, rest) = tail.split_once('}').expect("validated catalog placeholder");
+        let value = args
+            .iter()
+            .find(|(key, _)| *key == name)
+            .expect("missing translation argument")
+            .1;
+        text.push_str(literal);
+        text.push_str(value);
+        template = rest;
+    }
+    text.push_str(template);
+    text
+}
+
+#[cfg(test)]
+thread_local! { static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn set_test_process_language(tag: &str) {
+    CURRENT
+        .set(Language::from_tag(tag).expect("unsupported smoke-test language"))
+        .expect("the test process must choose its language before creating windows");
+}
+
+#[cfg(test)]
+pub(crate) fn with_language<T>(language: Language, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Language>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_LANGUAGE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_LANGUAGE.replace(Some(language)));
+    run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn matches_display_languages_in_windows_order() {
+        use Language::*;
+        for (tag, lang) in [
+            ("en-GB", En),
+            ("ru-RU", Ru),
+            ("de-CH", De),
+            ("fr-CA", Fr),
+            ("it-IT", It),
+            ("es-MX", Es),
+            ("zh-CN", ZhHans),
+            ("ZH-Hans-HK", ZhHans),
+            ("ja-JP", Ja),
+            ("pt-BR", Pt),
+            ("pt-PT", Pt),
+            ("ko-KR", Ko),
+            ("pl-PL", Pl),
+            ("tr-TR", Tr),
+        ] {
+            assert_eq!(Language::from_tag(tag), Some(lang));
+        }
+        let choose = |list: &str| preferred(&list.encode_utf16().collect::<Vec<_>>()).unwrap_or(En);
+        assert_eq!(choose("zh-Hant-CN\0zh-TW\0uk-UA\0fr-CA\0de-DE\0\0"), Fr);
+        assert_eq!(choose("zh-SG\0en-US\0\0"), ZhHans);
+        assert_eq!(choose("nl-NL\0\0"), En);
+        assert_eq!(choose("\0\0"), En);
+    }
+
+    #[test]
+    fn win32_text_is_stable_and_formatting_treats_arguments_as_data() {
+        let message = Msg::SystemDefaults;
+        let english = with_language(Language::En, || {
+            assert_eq!(
+                render(message, &[("detail", "{title}")]),
+                "Default settings applied.\n\n{title}"
+            );
+            wide(message)
+        });
+        with_language(Language::Ja, || assert_ne!(wide(message), english));
+        with_language(Language::En, || {
+            let expected: Vec<_> = tr(message).encode_utf16().chain([0]).collect();
+            assert_eq!(wide(message), english);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(english, expected.len()) },
+                expected
+            );
+        });
+    }
+}

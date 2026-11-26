@@ -23,7 +23,7 @@ impl ShortcutWindow {
             let title_width = *cache.section_widths[section].get_or_insert_with(|| {
                 self.p(20)
                     + self.p(7)
-                    + text_width(item.hDC, fonts.heading, view::GROUPS[section].title)
+                    + text_width(item.hDC, fonts.heading, tr(view::GROUPS[section].title))
                     + self.p(12)
             });
             // Only the flat divider to the right of the title changes width
@@ -223,7 +223,7 @@ impl ShortcutWindow {
         let r = item.rcItem;
         let colors = self.colors.get();
         let group = &view::GROUPS[section];
-        let title = group.title;
+        let title = tr(group.title);
         let glyph = RECT {
             right: r.left + self.p(20),
             ..r
@@ -253,9 +253,9 @@ impl ShortcutWindow {
 
 pub(super) fn placeholder(recording: bool) -> &'static str {
     if recording {
-        "Нажмите клавишу"
+        tr(Msg::UiPressKey)
     } else {
-        "Не назначено"
+        tr(Msg::UiUnassigned)
     }
 }
 

@@ -16,10 +16,10 @@ use windows_sys::{
 };
 
 use super::{Colors, Fonts, paint, scale};
+use crate::i18n::{Msg, tr, wide as wide_message};
 use crate::settings::exclusions::{ExclusionRule, MatchMode};
 
 const CLASS: *const u16 = w!("Rustile.Exclusions");
-const TITLE: *const u16 = w!("Исключения — Rustile");
 const STYLE: u32 = WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 const LIST: i32 = 601;
 const NEW: i32 = 602;
@@ -38,10 +38,10 @@ const PROCESS_LABEL: i32 = 614;
 const TITLE_LABEL: i32 = 615;
 const CLASS_LABEL: i32 = 616;
 const MODE_LABEL: i32 = 617;
-const MODES: [(MatchMode, &str); 3] = [
-    (MatchMode::Equals, "Точное совпадение"),
-    (MatchMode::Contains, "Содержит текст"),
-    (MatchMode::Regex, "Регулярное выражение"),
+const MODES: [(MatchMode, Msg); 3] = [
+    (MatchMode::Equals, Msg::RuleExact),
+    (MatchMode::Contains, Msg::RuleContains),
+    (MatchMode::Regex, Msg::RuleRegex),
 ];
 const FIELDS: [i32; 3] = [PROCESS, TITLE_FIELD, CLASS_FIELD];
 
@@ -260,7 +260,7 @@ impl Editor {
             let hwnd = CreateWindowExW(
                 WS_EX_CONTROLPARENT,
                 CLASS,
-                TITLE,
+                wide_message(Msg::RuleWindowTitle),
                 STYLE,
                 area.left + (area.right - area.left - width) / 2,
                 area.top + (area.bottom - area.top - height) / 2,
@@ -309,8 +309,8 @@ impl Editor {
             || unsafe {
                 MessageBoxW(
                     self.hwnd.get(),
-                    w!("Отменить изменения в этом правиле?"),
-                    TITLE,
+                    wide_message(Msg::RuleDiscard),
+                    wide_message(Msg::RuleWindowTitle),
                     MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION,
                 ) == IDYES
             }
@@ -337,9 +337,9 @@ impl Editor {
             set_text(self.child(id), value);
         }
         self.cues(
-            "Например, notepad.exe",
-            "Например, Параметры",
-            "Например, CabinetWClass",
+            tr(Msg::RuleExampleProcess),
+            tr(Msg::RuleExampleTitle),
+            tr(Msg::RuleExampleClass),
         );
         self.loading.set(false);
         self.status("");
@@ -393,7 +393,7 @@ impl Editor {
         if unsafe { PostMessageW(self.owner.get(), WM_NULL, 0, 0) } == 0 {
             self.queued.set(false);
             self.pending.take();
-            self.status("Не удалось отправить изменения. Попробуйте ещё раз.");
+            self.status(tr(Msg::RuleSendError));
             self.update_buttons();
         }
     }
@@ -429,13 +429,13 @@ impl Editor {
     fn pick_window(&self) {
         let candidates = crate::native::exclusion_candidates();
         if candidates.is_empty() {
-            self.status("На этом рабочем столе нет доступных окон.");
+            self.status(tr(Msg::RuleNoWindows));
             return;
         }
         unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
-                self.status("Не удалось открыть список окон.");
+                self.status(tr(Msg::RuleWindowListError));
                 return;
             }
             for (index, (process, title, class)) in candidates.iter().enumerate() {

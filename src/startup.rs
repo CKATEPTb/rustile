@@ -2,6 +2,7 @@ pub(crate) mod consent;
 mod protected;
 mod scheduler;
 
+use crate::i18n::{Msg, render, tr};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -24,9 +25,6 @@ const APPROVAL: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run");
 const NAME: PCWSTR = w!("Rustile");
 const COMMAND_LIMIT: usize = 260;
-const FOREIGN: &str = "Имя Rustile в автозагрузке Windows уже занято другой командой.";
-const DISABLED: &str =
-    "Включите Rustile в параметрах Windows в разделе «Приложения → Автозагрузка».";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Startup {
@@ -37,13 +35,17 @@ pub(crate) enum Startup {
 }
 
 fn current_exe() -> Result<PathBuf, String> {
-    std::env::current_exe().map_err(|err| format!("Не удалось определить путь к Rustile: {err}"))
+    std::env::current_exe()
+        .map_err(|err| render(Msg::SystemExePath, &[("detail", &err.to_string())]))
 }
 
 fn registry_error(status: u32) -> String {
-    format!(
-        "Автозагрузка Rustile: {}",
-        io::Error::from_raw_os_error(status as i32)
+    render(
+        Msg::SystemStartup,
+        &[(
+            "detail",
+            &io::Error::from_raw_os_error(status as i32).to_string(),
+        )],
     )
 }
 
@@ -67,7 +69,7 @@ fn command(entry: &Entry) -> Result<Vec<u16>, String> {
     }
     let mut wide: Vec<_> = text.encode_wide().collect();
     if wide.len() > COMMAND_LIMIT {
-        return Err("Путь к Rustile слишком длинный для автозагрузки Windows.".into());
+        return Err(tr(Msg::SystemLongPath).into());
     }
     wide.push(0);
     Ok(wide)
@@ -77,13 +79,15 @@ fn command(entry: &Entry) -> Result<Vec<u16>, String> {
 // elevate on every login. Both now represent ordinary startup.
 fn decode(value: &[u16], exe: &Path) -> Result<Entry, String> {
     if value.contains(&0) {
-        return Err(FOREIGN.into());
+        return Err(tr(Msg::SystemOccupied).into());
     }
-    let quoted = value.strip_prefix(&[b'"' as u16]).ok_or(FOREIGN)?;
+    let quoted = value
+        .strip_prefix(&[b'"' as u16])
+        .ok_or(tr(Msg::SystemOccupied))?;
     let end = quoted
         .iter()
         .position(|&c| c == b'"' as u16)
-        .ok_or(FOREIGN)?;
+        .ok_or(tr(Msg::SystemOccupied))?;
     let stored = PathBuf::from(OsString::from_wide(&quoted[..end]));
     if !stored.is_absolute()
         || stored
@@ -91,7 +95,7 @@ fn decode(value: &[u16], exe: &Path) -> Result<Entry, String> {
             .zip(exe.file_name())
             .is_none_or(|(a, b)| !a.eq_ignore_ascii_case(b))
     {
-        return Err(FOREIGN.into());
+        return Err(tr(Msg::SystemOccupied).into());
     }
     let suffix = OsString::from_wide(&quoted[end + 1..]);
     let flag = if suffix.is_empty() {
@@ -101,7 +105,7 @@ fn decode(value: &[u16], exe: &Path) -> Result<Entry, String> {
     } else if suffix == OsStr::new(&format!(" {STARTUP_FLAG}")) {
         STARTUP_FLAG
     } else {
-        return Err(FOREIGN.into());
+        return Err(tr(Msg::SystemOccupied).into());
     };
     Ok(Entry { path: stored, flag })
 }
@@ -127,7 +131,11 @@ fn registration(subkey: PCWSTR, exe: &Path) -> Result<Option<Entry>, String> {
         return Err(registry_error(status));
     }
     let value = &data[..bytes as usize / 2];
-    decode(value.strip_suffix(&[0]).ok_or(FOREIGN)?, exe).map(Some)
+    decode(
+        value.strip_suffix(&[0]).ok_or(tr(Msg::SystemOccupied))?,
+        exe,
+    )
+    .map(Some)
 }
 
 // Explorer can independently disable a Run entry in Task Manager. Only read
@@ -200,7 +208,7 @@ impl RunRegistration {
         // A second copy or Windows Settings can change the value during UAC.
         // Avoid deleting or rolling back another writer's choice.
         if registration(self.run, &self.exe)?.as_ref() != previous {
-            return Err("Автозагрузка уже изменилась. Откройте меню ещё раз.".into());
+            return Err(tr(Msg::SystemStartupChanged).into());
         }
         let data = next.map(command).transpose()?;
         crate::profile_io::with_user(|| {
@@ -224,7 +232,7 @@ impl RunRegistration {
                 Err(io::Error::from_raw_os_error(status as i32))
             }
         })
-        .map_err(|e| format!("Автозагрузка Rustile: {e}"))
+        .map_err(|e| render(Msg::SystemStartup, &[("detail", &e.to_string())]))
     }
 
     fn change(
@@ -248,9 +256,9 @@ impl RunRegistration {
             Startup::Elevated => {
                 // The administrator switch belongs to an enabled normal entry.
                 // A stale flyout must respect a subsequent Windows opt-out.
-                let old = owned.ok_or("Сначала включите запуск при входе в Windows.")?;
+                let old = owned.ok_or(tr(Msg::SystemEnableFirst))?;
                 if !windows_allows(self.approval)? {
-                    return Err(DISABLED.into());
+                    return Err(tr(Msg::SystemEnableStartup).into());
                 }
                 // Upgrade old bare Run commands before asking. Even if the
                 // process stops between task registration and cleanup, the
@@ -260,21 +268,21 @@ impl RunRegistration {
                     return self.read(installed()?);
                 }
                 if !installed()? {
-                    return Err("Windows не подтвердила создание задачи Rustile.".into());
+                    return Err(tr(Msg::SystemCreateTask).into());
                 }
                 self.replace(Some(&normal), None)?;
             }
             Startup::Normal => {
                 let allowed = windows_allows(self.approval)?;
                 if elevated && !allowed {
-                    return Err(DISABLED.into());
+                    return Err(tr(Msg::SystemEnableStartup).into());
                 }
                 // Prepare ordinary startup before removing a working task.
                 self.replace(entry, Some(&normal))?;
                 if !allowed {
                     // Leave the item visible in Windows Startup Apps for the
                     // user who explicitly tried to enable ordinary startup.
-                    return Err(DISABLED.into());
+                    return Err(tr(Msg::SystemEnableStartup).into());
                 }
                 if elevated {
                     let result = configure(false);
@@ -282,9 +290,7 @@ impl RunRegistration {
                         self.replace(Some(&normal), entry)?;
                         return match result {
                             Ok(false) => Ok(Startup::Elevated),
-                            Ok(true) => {
-                                Err("Windows не подтвердила удаление задачи Rustile.".into())
-                            }
+                            Ok(true) => Err(tr(Msg::SystemDeleteTask).into()),
                             Err(err) => Err(err),
                         };
                     }
@@ -296,7 +302,7 @@ impl RunRegistration {
                     return self.read(installed()?);
                 }
                 if elevated && installed()? {
-                    return Err("Windows не подтвердила удаление задачи Rustile.".into());
+                    return Err(tr(Msg::SystemDeleteTask).into());
                 }
                 if owned.is_some() {
                     self.replace(entry, None)?;
@@ -590,11 +596,14 @@ mod tests {
             },
             ERROR_SUCCESS
         );
-        assert_eq!(tasks.apply(&store, Startup::Normal).unwrap_err(), DISABLED);
+        assert_eq!(
+            tasks.apply(&store, Startup::Normal).unwrap_err(),
+            tr(Msg::SystemEnableStartup)
+        );
         assert_eq!(store.read(false).unwrap(), Startup::Off);
         assert_eq!(
             tasks.apply(&store, Startup::Elevated).unwrap_err(),
-            DISABLED
+            tr(Msg::SystemEnableStartup)
         );
         assert_eq!(tasks.calls.get(), 0);
         unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, approval.ptr(), NAME) };

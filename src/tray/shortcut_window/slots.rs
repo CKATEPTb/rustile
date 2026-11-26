@@ -115,8 +115,8 @@ impl ShortcutWindow {
                     after = hwnd;
                 }
             }
-            self.hint(view, row, w!("Дважды щёлкните, чтобы изменить сочетание"));
-            self.hint(view, remove, w!("Удалить сочетание"));
+            self.hint(view, row, localized_wide(Msg::UiEditHint));
+            self.hint(view, remove, localized_wide(Msg::UiRemoveShortcut));
             self.slots.borrow_mut()[index].push(Slot { row, remove });
         }
         let obsolete = {

@@ -1,5 +1,89 @@
+use std::collections::BTreeMap;
+use std::{env, fs, path::PathBuf};
+
+fn placeholders(text: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some((before, tail)) = rest.split_once('{') {
+        assert!(!before.contains('}'), "unmatched brace in {text}");
+        let (name, after) = tail.split_once('}').expect("unclosed placeholder");
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "invalid placeholder in {text}"
+        );
+        names.push(name);
+        rest = after;
+    }
+    assert!(!rest.contains('}'), "unmatched brace in {text}");
+    names.sort_unstable();
+    names
+}
+
+fn compile_messages() {
+    println!("cargo:rerun-if-changed=locales");
+    let mut catalog = BTreeMap::new();
+    for entry in fs::read_dir("locales").expect("read language catalogs") {
+        let file = entry.expect("catalog entry").path();
+        if file.extension().and_then(|s| s.to_str()) != Some("tsv") {
+            continue;
+        }
+        for (index, row) in fs::read_to_string(&file)
+            .expect("UTF-8 catalog")
+            .lines()
+            .enumerate()
+        {
+            if row.is_empty() || row.starts_with('#') {
+                continue;
+            }
+            let mut cells = row.split('\t');
+            let key = cells.next().unwrap();
+            let values: Vec<_> = cells.map(|s| s.replace("\\n", "\n")).collect();
+            assert_eq!(
+                values.len(),
+                12,
+                "{}:{}: {key} requires 12 translations",
+                file.display(),
+                index + 1
+            );
+            let arguments = placeholders(&values[0]);
+            for value in &values {
+                assert!(
+                    !value.trim().is_empty() && !value.contains('\0'),
+                    "{key}: invalid translation"
+                );
+                assert_eq!(
+                    placeholders(value),
+                    arguments,
+                    "{key}: placeholders in {value}"
+                );
+            }
+            assert!(
+                catalog.insert(key.to_owned(), values).is_none(),
+                "duplicate key {key}"
+            );
+        }
+    }
+    assert!(!catalog.is_empty(), "missing translations");
+    let mut code =
+        String::from("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) enum Msg {\n");
+    for key in catalog.keys() {
+        code.push_str(&format!("    {key},\n"));
+    }
+    code.push_str("}\nconst MESSAGES: &[[&str; 12]] = &[\n");
+    for values in catalog.values() {
+        code.push_str(&format!("    {values:?},\n"));
+    }
+    code.push_str("];\n");
+    fs::write(
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("messages.rs"),
+        code,
+    )
+    .unwrap();
+}
+
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        compile_messages();
         // Portable and installed copies only import system DLLs, including
         // during loader initialization before the consent helper reaches main.
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {

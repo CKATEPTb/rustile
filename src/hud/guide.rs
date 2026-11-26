@@ -1,4 +1,7 @@
-use crate::settings::{Chord, Settings, Shortcut};
+use crate::{
+    i18n::{Msg, tr},
+    settings::{Chord, Settings, Shortcut},
+};
 
 pub(super) struct Guide {
     pub(super) rows: Vec<HintRow>,
@@ -38,19 +41,18 @@ impl HintRow {
 }
 
 impl Guide {
-    pub(super) const TITLE: &'static str = "Изменение размера";
+    pub(super) fn title() -> &'static str {
+        tr(Msg::HudTitle)
+    }
 
     pub(super) fn new(settings: &Settings) -> Self {
         use Shortcut::*;
 
         let mut rows = Vec::new();
         for (label, actions) in [
+            (Msg::HudWithArrow, [GrowLeft, GrowUp, GrowDown, GrowRight]),
             (
-                "Сдвинуть границу по стрелке",
-                [GrowLeft, GrowUp, GrowDown, GrowRight],
-            ),
-            (
-                "Сдвинуть её против стрелки",
+                Msg::HudAgainstArrow,
                 [ShrinkLeft, ShrinkUp, ShrinkDown, ShrinkRight],
             ),
         ] {
@@ -59,7 +61,7 @@ impl Guide {
                 .all(|&action| settings.bindings(action) == [action.default_chord()])
             {
                 rows.push(HintRow {
-                    action: label.into(),
+                    action: tr(label).into(),
                     choices: actions.into_iter().map(Shortcut::default_chord).collect(),
                     compact_directions: true,
                 });
@@ -77,7 +79,7 @@ impl Guide {
             }
         }
         rows.push(HintRow {
-            action: "Выйти из режима".into(),
+            action: tr(Msg::HudExit).into(),
             choices: vec![Confirm.default_chord(), Cancel.default_chord()],
             compact_directions: false,
         });
@@ -85,12 +87,13 @@ impl Guide {
     }
 
     pub(super) fn accessible_text(&self) -> String {
-        let mut text = Self::TITLE.to_owned();
+        let mut text = Self::title().to_owned();
+        let or = format!(" {} ", tr(Msg::HudOr));
         for row in &self.rows {
             text.push_str("\r\n");
             text.push_str(&row.action);
             for (index, chord) in row.choices.iter().enumerate() {
-                text.push_str(if index == 0 { " — " } else { " или " });
+                text.push_str(if index == 0 { " — " } else { &or });
                 text.push_str(&chord.label());
             }
         }
@@ -101,6 +104,10 @@ impl Guide {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alternatives(keys: &[&str]) -> String {
+        keys.join(&format!(" {} ", tr(Msg::HudOr)))
+    }
 
     fn assert_caps(row: &HintRow, expected: &[(&str, &str)]) {
         let caps = row.keycaps();
@@ -131,8 +138,13 @@ mod tests {
         );
         assert_caps(&guide.rows[2], &[("", "Enter"), ("/", "Esc")]);
         let text = guide.accessible_text();
-        assert!(text.contains("Shift+Left или Shift+Up или Shift+Down или Shift+Right"));
-        assert!(text.contains("Enter или Esc"));
+        assert!(text.contains(&alternatives(&[
+            "Shift+Left",
+            "Shift+Up",
+            "Shift+Down",
+            "Shift+Right"
+        ])));
+        assert!(text.contains(&alternatives(&["Enter", "Esc"])));
     }
 
     #[test]
@@ -159,7 +171,11 @@ mod tests {
             row,
             &[("", "Shift"), ("+", "Left"), ("/", "Shift"), ("+", "J")],
         );
-        assert!(guide.accessible_text().contains("Shift+Left или Shift+J"));
+        assert!(
+            guide
+                .accessible_text()
+                .contains(&alternatives(&["Shift+Left", "Shift+J"]))
+        );
     }
 
     #[test]
@@ -180,7 +196,7 @@ mod tests {
         assert_caps(&guide.rows[3], &[("", "Shift"), ("+", "F6")]);
         assert_caps(guide.rows.last().unwrap(), &[("", "Enter"), ("/", "Esc")]);
         let text = guide.accessible_text();
-        assert!(text.contains("Enter или Esc"));
+        assert!(text.contains(&alternatives(&["Enter", "Esc"])));
         assert!(!text.contains(Shortcut::GrowUp.label()));
     }
 }

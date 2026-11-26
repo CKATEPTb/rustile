@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, render, tr};
 use std::cell::Cell;
 use std::io;
 use std::ptr::{null, null_mut};
@@ -639,7 +640,7 @@ impl Hook {
                     UnhookWindowsHookEx(hook);
                 }
             })
-            .map_err(|e| format!("Поток сочетаний клавиш: {e}"))?;
+            .map_err(|e| render(Msg::SystemShortcutThread, &[("detail", &e.to_string())]))?;
         match status.recv() {
             Ok(Ok(id)) => Ok(Self {
                 thread: Some(thread),
@@ -648,8 +649,11 @@ impl Hook {
             result => {
                 let _ = thread.join();
                 match result {
-                    Ok(Err(e)) => Err(format!("Обработка сочетаний клавиш и колёсика: {e}")),
-                    _ => Err("Поток сочетаний клавиш неожиданно завершился.".into()),
+                    Ok(Err(e)) => Err(render(
+                        Msg::SystemShortcutInput,
+                        &[("detail", &e.to_string())],
+                    )),
+                    _ => Err(tr(Msg::SystemShortcutsStopped).into()),
                 }
             }
         }

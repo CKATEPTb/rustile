@@ -40,7 +40,7 @@ impl Editor {
         };
         let label = |id, name| make(w!("STATIC"), id, name, SS_NOPREFIX);
         let button = |id, name| make(w!("BUTTON"), id, name, BS_OWNERDRAW as u32 | WS_TABSTOP);
-        label(LIST_LABEL, "Правила")?;
+        label(LIST_LABEL, tr(Msg::RuleList))?;
         make(
             w!("LISTBOX"),
             LIST,
@@ -52,15 +52,15 @@ impl Editor {
                 | LBS_HASSTRINGS as u32
                 | LBS_NOINTEGRALHEIGHT as u32,
         )?;
-        button(NEW, "Новое правило")?;
-        button(REMOVE, "Удалить")?;
-        label(FORM_LABEL, "Условия")?;
-        button(PICK, "Выбрать окно…")?;
-        label(HINT, "Должны совпасть все заполненные поля.")?;
+        button(NEW, tr(Msg::RuleNew))?;
+        button(REMOVE, tr(Msg::RuleDelete))?;
+        label(FORM_LABEL, tr(Msg::RuleConditions))?;
+        button(PICK, tr(Msg::RulePick))?;
+        label(HINT, tr(Msg::RuleHint))?;
         for (id, field, name) in [
-            (PROCESS_LABEL, PROCESS, "Имя процесса"),
-            (TITLE_LABEL, TITLE_FIELD, "Заголовок окна"),
-            (CLASS_LABEL, CLASS_FIELD, "Класс окна"),
+            (PROCESS_LABEL, PROCESS, tr(Msg::RuleProcess)),
+            (TITLE_LABEL, TITLE_FIELD, tr(Msg::RuleTitle)),
+            (CLASS_LABEL, CLASS_FIELD, tr(Msg::RuleClass)),
         ] {
             label(id, name)?;
             let hwnd = make(w!("EDIT"), field, "", ES_AUTOHSCROLL as u32 | WS_TABSTOP)?;
@@ -68,7 +68,7 @@ impl Editor {
             // checks its actual limit rather than truncating valid input here.
             unsafe { SendMessageW(hwnd, EM_SETLIMITTEXT, 2049, 0) };
         }
-        label(MODE_LABEL, "Сопоставление")?;
+        label(MODE_LABEL, tr(Msg::RuleMatch))?;
         let combo = make(
             w!("COMBOBOX"),
             MODE,
@@ -80,13 +80,13 @@ impl Editor {
                 | CBS_OWNERDRAWFIXED as u32,
         )?;
         for (_, name) in MODES {
-            unsafe { SendMessageW(combo, CB_ADDSTRING, 0, wide(name).as_ptr() as _) };
+            unsafe { SendMessageW(combo, CB_ADDSTRING, 0, wide_message(name) as _) };
         }
         // The closed system combo otherwise draws its own white arrow and
         // bevel on Windows' dark palette. Keep its list and input behavior.
         unsafe { SetWindowSubclass(combo, Some(mode_proc), 1, self as *const Self as usize) };
         label(STATUS, "")?;
-        button(SAVE, "Сохранить")?;
+        button(SAVE, tr(Msg::RuleSave))?;
         Ok(())
     }
 
@@ -161,6 +161,26 @@ impl Editor {
         let right = r.right - margin;
         let foot = r.bottom - self.p(54);
         let bottom = r.bottom - self.p(42);
+        let mut pick_w = self.p(138);
+        let mut remove_w = self.p(67);
+        let mut save_w = self.p(104);
+        if let Some(fonts) = self.fonts.borrow().as_ref() {
+            let hwnd = self.hwnd.get();
+            let dc = unsafe { GetDC(hwnd) };
+            if !dc.is_null() {
+                let button_width = |key| {
+                    paint::text(dc, RECT::default(), tr(key), fonts.regular, 0, DT_CALCRECT)
+                        + self.p(16)
+                };
+                let pair_space = split - margin * 2 - self.p(6);
+                remove_w = remove_w
+                    .max(button_width(Msg::RuleDelete))
+                    .min((pair_space - button_width(Msg::RuleNew)).max(pair_space / 3));
+                pick_w = pick_w.max(button_width(Msg::RulePick));
+                save_w = save_w.max(button_width(Msg::RuleSave));
+                unsafe { ReleaseDC(hwnd, dc) };
+            }
+        }
         let put = |id, x, y, w: i32, h: i32| unsafe {
             SetWindowPos(
                 self.child(id),
@@ -178,16 +198,10 @@ impl Editor {
             FORM_LABEL,
             form,
             label_y,
-            right - form - self.p(140),
+            right - form - pick_w - self.p(2),
             self.p(25),
         );
-        put(
-            PICK,
-            right - self.p(138),
-            self.p(12),
-            self.p(138),
-            self.p(30),
-        );
+        put(PICK, right - pick_w, self.p(12), pick_w, self.p(30));
         put(HINT, form, self.p(47), right - form, self.p(20));
         let fields_top = self.p(78);
         let stride = ((foot - fields_top - self.p(3)) / 4).min(self.p(60));
@@ -225,7 +239,6 @@ impl Editor {
             split - self.p(16),
             foot - list_top - self.p(8),
         );
-        let remove_w = self.p(67);
         let left_width = split - margin * 2;
         put(
             NEW,
@@ -245,10 +258,10 @@ impl Editor {
             STATUS,
             form,
             foot + self.p(4),
-            right - form - self.p(114),
+            right - form - save_w - self.p(10),
             r.bottom - foot - self.p(6),
         );
-        put(SAVE, right - self.p(104), bottom, self.p(104), self.p(31));
+        put(SAVE, right - save_w, bottom, save_w, self.p(31));
         unsafe { InvalidateRect(self.hwnd.get(), null(), 0) };
     }
 
@@ -296,7 +309,7 @@ impl Editor {
             paint::text(
                 dc,
                 empty,
-                "Пока нет правил",
+                tr(Msg::RuleEmpty),
                 fonts.regular,
                 c.secondary,
                 DT_CENTER,
@@ -378,7 +391,7 @@ impl Editor {
                 let mode = MODES.iter().find(|(mode, _)| *mode == rule.mode).unwrap().1;
                 let remaining = identifiers.collect::<Vec<_>>().join(" · ");
                 let detail = if remaining.is_empty() {
-                    mode
+                    tr(mode)
                 } else {
                     &remaining
                 };
@@ -424,7 +437,7 @@ impl Editor {
                 paint::text(
                     dc,
                     r,
-                    name,
+                    tr(*name),
                     f.regular,
                     if active { c.hover_text } else { c.text },
                     DT_LEFT | DT_END_ELLIPSIS,
@@ -487,7 +500,14 @@ impl Editor {
         };
         r.left += self.p(7);
         r.right = chevron.left;
-        paint::text(dc, r, name, f.regular, c.text, DT_LEFT | DT_END_ELLIPSIS);
+        paint::text(
+            dc,
+            r,
+            tr(*name),
+            f.regular,
+            c.text,
+            DT_LEFT | DT_END_ELLIPSIS,
+        );
         paint::text(dc, chevron, "\u{e70d}", f.symbol, c.secondary, DT_CENTER);
     }
 }

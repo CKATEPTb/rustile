@@ -18,7 +18,7 @@ try {
     Copy-Item -LiteralPath $binaryPath -Destination $portableExe
     & $compiler /nologo /codepage:65001 /target:exe "/out:$testExe" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll (Join-Path $PSScriptRoot 'desktop-smoke.cs')
     if ($LASTEXITCODE -ne 0) { throw 'Unable to build the isolated desktop fixture.' }
-    & $testExe $portableExe $managerTests
+    & $testExe $portableExe $managerTests (Join-Path $PSScriptRoot '../locales')
     if ($LASTEXITCODE -ne 0) { throw 'The isolated desktop smoke test failed.' }
 } finally {
     $localAppData = Join-Path $testDir 'local-appdata'

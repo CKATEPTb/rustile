@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, tr};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
@@ -621,15 +622,15 @@ impl Manager {
             .transpose()?;
         let rules_changed = exclusions.is_some();
         let proposed = if geometry {
-            let work = WorkArea::read()
-                .ok_or_else(|| "Windows не сообщила размер рабочей области.".to_owned())?;
+            let work = WorkArea::read().ok_or_else(|| tr(Msg::SystemWorkArea).to_owned())?;
             let area = work.tiles(updated.padding);
             // Validate the whole layout before changing the live model or any HWND.
             let gap = native::scaled_spacing(updated.gap, work.dpi);
             let refit = |layout: &Layout| {
-                layout.clone().with_spacing(area, gap).ok_or_else(|| {
-                    "С такими отступами окна не помещаются. Уменьшите отступ.".to_owned()
-                })
+                layout
+                    .clone()
+                    .with_spacing(area, gap)
+                    .ok_or_else(|| tr(Msg::SystemSpacing).to_owned())
             };
             let active = refit(&self.workspace.layout)?;
             let others: Result<Vec<_>, String> = self

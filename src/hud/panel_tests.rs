@@ -9,6 +9,29 @@ const WORK: Rect = Rect {
 };
 
 #[test]
+fn localized_resize_hints_reflow_on_a_narrow_screen() {
+    use crate::i18n::{Language, with_language};
+    let colors = Colors::current();
+    let narrow = Rect { w: 300, ..WORK };
+    for (language, heading) in [
+        (Language::De, "Fenstergröße ändern"),
+        (Language::Ja, "ウィンドウのサイズ変更"),
+        (Language::ZhHans, "调整窗口大小"),
+    ] {
+        with_language(language, || {
+            let guide = Guide::new(&Settings::default());
+            let accessible = guide.accessible_text();
+            assert!(accessible.starts_with(heading));
+            assert!(accessible.contains("Shift+Left"));
+            let wide_panel = Panel::render(&guide, 144, WORK, colors, false).unwrap();
+            let narrow_panel = Panel::render(&guide, 144, narrow, colors, false).unwrap();
+            assert_eq!(narrow_panel.width, narrow.w);
+            assert!(narrow_panel.height > wide_panel.height && narrow_panel.height < narrow.h);
+        });
+    }
+}
+
+#[test]
 fn hint_has_clear_corners_crisp_ink_and_respects_transparency_settings() {
     let guide = Guide::new(&Settings::default());
     for dpi in [96, 144] {

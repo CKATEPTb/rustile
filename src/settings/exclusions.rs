@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, render, tr};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -37,8 +38,9 @@ impl CompiledRule {
     fn new(rule: &ExclusionRule) -> Result<Self, String> {
         let compile = |value: &str, field: &str| -> Result<Option<Regex>, String> {
             if value.chars().count() > MAX_FIELD_CHARS {
-                return Err(format!(
-                    "Поле «{field}» превышает {MAX_FIELD_CHARS} символа."
+                return Err(render(
+                    Msg::RuleTooLong,
+                    &[("field", field), ("limit", &MAX_FIELD_CHARS.to_string())],
                 ));
             }
             if value.trim().is_empty() {
@@ -58,19 +60,22 @@ impl CompiledRule {
                 .map_err(|error| {
                     let details = error.to_string();
                     let reason = details.lines().last().unwrap_or(&details);
-                    format!(
-                        "Проверьте поле «{field}». {}",
-                        reason.trim_start_matches("error: ")
+                    render(
+                        Msg::RuleInvalid,
+                        &[
+                            ("field", field),
+                            ("reason", reason.trim_start_matches("error: ")),
+                        ],
                     )
                 })
         };
         let compiled = Self {
-            process: compile(&rule.process, "Процесс")?,
-            title: compile(&rule.title, "Заголовок")?,
-            class: compile(&rule.class, "Класс окна")?,
+            process: compile(&rule.process, tr(Msg::RuleProcess))?,
+            title: compile(&rule.title, tr(Msg::RuleTitle))?,
+            class: compile(&rule.class, tr(Msg::RuleClass))?,
         };
         if compiled.process.is_none() && compiled.title.is_none() && compiled.class.is_none() {
-            return Err("Заполните процесс, заголовок или класс окна.".into());
+            return Err(tr(Msg::RuleRequired).into());
         }
         Ok(compiled)
     }
@@ -87,6 +92,17 @@ impl CompiledRule {
             && matches(&self.class, class)
             && matches(&self.title, title)
     }
+}
+
+fn rule_limit() -> String {
+    render(Msg::RuleLimit, &[("limit", &MAX_RULES.to_string())])
+}
+
+fn rule_error(index: usize, reason: &str) -> String {
+    render(
+        Msg::RuleAtIndex,
+        &[("number", &(index + 1).to_string()), ("reason", reason)],
+    )
 }
 
 #[derive(Debug, Default)]
@@ -123,9 +139,8 @@ impl ExclusionMatcher {
         if previous.is_empty() {
             return Self::compile(next);
         }
-        let limit = || format!("Можно задать до {MAX_RULES} правил исключений.");
         if next.len() > MAX_RULES && next.len() >= previous.len() {
-            return Err(limit());
+            return Err(rule_limit());
         }
         let mut matcher = Self::default();
         let mut old_counts = None;
@@ -133,9 +148,9 @@ impl ExclusionMatcher {
             let error = if index >= MAX_RULES {
                 // A user can shrink an oversized hand-edited profile in steps.
                 // Entries past the limit stay inactive until they fit.
-                limit()
+                rule_limit()
             } else if let Err(reason) = matcher.add(rule) {
-                format!("Правило {}. {reason}", index + 1)
+                rule_error(index, &reason)
             } else {
                 continue;
             };
@@ -160,11 +175,10 @@ impl ExclusionMatcher {
     /// and the original text available for correction in the editor.
     pub fn from_saved(rules: &[ExclusionRule]) -> (Self, Option<String>) {
         let mut matcher = Self::default();
-        let mut warning = (rules.len() > MAX_RULES)
-            .then(|| format!("Можно задать до {MAX_RULES} правил исключений."));
+        let mut warning = (rules.len() > MAX_RULES).then(rule_limit);
         for (index, rule) in rules.iter().take(MAX_RULES).enumerate() {
             if let Err(reason) = matcher.add(rule) {
-                warning.get_or_insert_with(|| format!("Правило {}. {reason}", index + 1));
+                warning.get_or_insert_with(|| rule_error(index, &reason));
             }
         }
         (matcher, warning)
@@ -288,7 +302,8 @@ mod tests {
             .unwrap();
         let (matcher, warning) = ExclusionMatcher::from_saved(&profile.exclusions);
         assert!(matcher.matches("good.exe", "", ""));
-        assert!(warning.unwrap().contains("Правило 2"));
+        let invalid = CompiledRule::new(&profile.exclusions[1]).unwrap_err();
+        assert_eq!(warning.unwrap(), rule_error(1, &invalid));
         assert!(ExclusionMatcher::compile(&profile.exclusions).is_err());
         let reloaded: Settings =
             toml::from_str(&toml::to_string_pretty(&profile).unwrap()).unwrap();

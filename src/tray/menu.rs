@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, tr};
 use crate::settings::{Command, Settings};
 use crate::startup::Startup;
 
@@ -11,9 +12,9 @@ pub(super) enum Measure {
 impl Measure {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Outline => "Толщина обводки",
-            Self::Gap => "Между окнами",
-            Self::Padding => "По краям экрана",
+            Self::Outline => tr(Msg::TrayOutline),
+            Self::Gap => tr(Msg::TrayGap),
+            Self::Padding => tr(Msg::TrayPadding),
         }
     }
 
@@ -102,14 +103,15 @@ impl Row {
 pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
     let mut rows = vec![Row::new("Rustile", "", Action::None)];
     rows.push(
-        Row::new("Мозаика", "\u{e8a9}", Action::Apply(Command::Toggle)).switch(
-            s.enabled,
-            "Включена",
-            "Выключена",
-        ),
+        Row::new(
+            tr(Msg::TrayTiling),
+            "\u{e8a9}",
+            Action::Apply(Command::Toggle),
+        )
+        .switch(s.enabled, tr(Msg::TrayTilingOn), tr(Msg::TrayTilingOff)),
     );
     rows.push(Row::new(
-        "Горячие клавиши",
+        tr(Msg::TrayShortcuts),
         "\u{e765}",
         Action::EditShortcuts,
     ));
@@ -123,7 +125,7 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
         row.separator = measure == Measure::Outline;
         rows.push(row);
     }
-    let launch = "Запускать при входе в Windows";
+    let launch = tr(Msg::TrayAutoStart);
     if let Some(mode) = startup {
         let enabled = mode != Startup::Off;
         let action = |next| Action::Apply(Command::SetStartup(next));
@@ -134,7 +136,7 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
         };
         rows.push(
             Row::new(launch, "\u{e768}", action(next))
-                .switch(enabled, "Включено", "Выключено")
+                .switch(enabled, tr(Msg::TrayOn), tr(Msg::TrayOff))
                 .group(),
         );
         if enabled {
@@ -145,23 +147,23 @@ pub(super) fn rows(s: &Settings, startup: Option<Startup>) -> Vec<Row> {
                 Startup::Elevated
             };
             rows.push(
-                Row::new("От имени администратора", "\u{ea18}", action(next)).switch(
+                Row::new(tr(Msg::TrayAdmin), "\u{ea18}", action(next)).switch(
                     elevated,
-                    "Включено",
-                    "Выключено",
+                    tr(Msg::TrayOn),
+                    tr(Msg::TrayOff),
                 ),
             );
         }
     } else {
         rows.push(
             Row::new(launch, "\u{e768}", Action::None)
-                .value("Недоступно")
+                .value(tr(Msg::TrayUnavailable))
                 .group(),
         );
     }
-    rows.push(Row::new("Исключения", "\u{e71c}", Action::EditExclusions).group());
+    rows.push(Row::new(tr(Msg::TrayExclusions), "\u{e71c}", Action::EditExclusions).group());
     rows.push(Row::new(
-        "Выйти из Rustile",
+        tr(Msg::TrayQuit),
         "\u{e7e8}",
         Action::Apply(Command::Exit),
     ));
@@ -177,11 +179,11 @@ mod tests {
         let rows = rows(&Settings::default(), None);
         let launch = rows
             .iter()
-            .find(|row| row.label == "Запускать при входе в Windows")
+            .find(|row| row.label == tr(Msg::TrayAutoStart))
             .unwrap();
         assert!(!launch.enabled);
         assert_eq!(launch.checked, None);
-        assert_eq!(launch.detail, "Недоступно");
+        assert_eq!(launch.detail, tr(Msg::TrayUnavailable));
         assert!(
             rows.iter()
                 .all(|row| !matches!(row.action, Action::Apply(Command::SetStartup(_))))

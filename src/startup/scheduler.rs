@@ -1,3 +1,4 @@
+use crate::i18n::{Msg, render, tr};
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -24,10 +25,9 @@ use windows_sys::Win32::{
 use super::protected;
 
 const SOURCE: &str = "Rustile.Windows.Logon";
-const OCCUPIED: &str = "Имя задания Rustile в Планировщике Windows занято другим заданием.";
 
 fn failure(err: Error) -> String {
-    format!("Планировщик заданий Windows: {err}")
+    render(Msg::SystemScheduler, &[("detail", &err.to_string())])
 }
 
 struct Apartment(bool);
@@ -93,7 +93,7 @@ fn definition(service: &ITaskService, sid: &str, exe: &Path) -> ComResult<ITaskD
         let info = task.RegistrationInfo()?;
         info.SetAuthor(&BSTR::from("Rustile"))?;
         info.SetSource(&BSTR::from(SOURCE))?;
-        info.SetDescription(&BSTR::from("Запуск Rustile при входе в Windows."))?;
+        info.SetDescription(&BSTR::from(tr(Msg::SystemTaskDescription)))?;
         let principal = task.Principal()?;
         principal.SetUserId(&user)?;
         principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN)?;
@@ -263,7 +263,7 @@ impl Registration {
         let exe = protected::exe_path(sid)?;
         // The scheduler expands %variables% in Exec paths at logon.
         if exe.as_os_str().encode_wide().any(|c| c == b'%' as u16) {
-            return Err("Планировщик не поддерживает знак % в пути установки Rustile.".into());
+            return Err(tr(Msg::SystemPercentPath).into());
         }
         let task = scheduler.lookup(&name).map_err(failure)?;
         if let Some(current) = &task {
@@ -271,7 +271,7 @@ impl Registration {
             let sddl = unsafe { current.GetSecurityDescriptor(flags as i32) }.map_err(failure)?;
             let def = unsafe { current.Definition() }.map_err(failure)?;
             if !protected_acl(&sddl) || !matches_definition(&def, sid, &exe).map_err(failure)? {
-                return Err(OCCUPIED.into());
+                return Err(tr(Msg::SystemSchedulerOccupied).into());
             }
         }
         Ok(Self {

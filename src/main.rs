@@ -4,6 +4,8 @@ mod cli;
 mod cli_error;
 #[cfg(windows)]
 mod hud;
+#[cfg(windows)]
+mod i18n;
 #[cfg(any(windows, test))]
 mod layout;
 #[cfg(windows)]

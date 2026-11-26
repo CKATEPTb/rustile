@@ -36,7 +36,7 @@ impl Topic {
 
 pub(super) struct Group {
     topic: Topic,
-    pub(super) title: &'static str,
+    pub(super) title: Msg,
     pub(super) icon: &'static str,
     pub(super) actions: &'static [Shortcut],
 }
@@ -45,31 +45,31 @@ pub(super) struct Group {
 pub(super) const GROUPS: [Group; 8] = [
     Group {
         topic: Windows,
-        title: "Управление окнами",
+        title: Msg::UiGroupWindows,
         icon: "\u{e8a9}",
         actions: &[ToggleMosaic, Shortcut::CloseWindow, ToggleMaximize],
     },
     Group {
         topic: Windows,
-        title: "Переключение фокуса",
+        title: Msg::UiGroupFocus,
         icon: "\u{e81d}",
         actions: &[FocusLeft, FocusRight, FocusUp, FocusDown],
     },
     Group {
         topic: Windows,
-        title: "Перемещение окон",
+        title: Msg::UiGroupMove,
         icon: "\u{e7c2}",
         actions: &[MoveLeft, MoveRight, MoveUp, MoveDown],
     },
     Group {
         topic: Desktops,
-        title: "Смена рабочего стола",
+        title: Msg::UiGroupSwitchDesktop,
         icon: "\u{e7c4}",
         actions: &[PreviousDesktop, NextDesktop],
     },
     Group {
         topic: Desktops,
-        title: "Выбор стола по номеру",
+        title: Msg::UiGroupDesktopNumber,
         icon: "\u{ea37}",
         actions: &[
             Desktop1, Desktop2, Desktop3, Desktop4, Desktop5, Desktop6, Desktop7, Desktop8,
@@ -78,7 +78,7 @@ pub(super) const GROUPS: [Group; 8] = [
     },
     Group {
         topic: Resize,
-        title: "Режим изменения размера",
+        title: Msg::UiGroupResize,
         icon: "\u{e740}",
         actions: &[
             StartResize,
@@ -94,7 +94,7 @@ pub(super) const GROUPS: [Group; 8] = [
     },
     Group {
         topic: Resize,
-        title: "Изменение размера без входа в режим",
+        title: Msg::UiGroupQuickResize,
         icon: "\u{e945}",
         actions: &[
             QuickLeft,
@@ -109,7 +109,7 @@ pub(super) const GROUPS: [Group; 8] = [
     },
     Group {
         topic: Desktops,
-        title: "Перенос окна между столами",
+        title: Msg::UiGroupTransfer,
         icon: "\u{e8ab}",
         actions: &[
             MovePreviousDesktop,
@@ -132,14 +132,14 @@ pub(super) fn group_title(action: Shortcut) -> &'static str {
     GROUPS
         .iter()
         .find(|group| group.actions.contains(&action))
-        .map_or("", |group| group.title)
+        .map_or("", |group| tr(group.title))
 }
 
 impl ShortcutWindow {
     pub(super) fn create_controls(&self, hwnd: HWND) -> Result<(), String> {
         create(hwnd, w!("STATIC"), "", STATUS, 0, 0)?;
         create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW, 0)?;
-        let reset_all = button(hwnd, "Сбросить всё", RESET_ALL)?;
+        let reset_all = button(hwnd, tr(Msg::UiResetAll), RESET_ALL)?;
         let view = create(
             hwnd,
             w!("STATIC"),
@@ -173,14 +173,14 @@ impl ShortcutWindow {
             )
         };
         self.tooltip.set(tooltip);
-        self.hint(hwnd, reset_all, w!("Сбросить все сочетания"));
-        let prev = button(view, "Предыдущая страница", PAGE_PREV)?;
-        let next = button(view, "Следующая страница", PAGE_NEXT)?;
+        self.hint(hwnd, reset_all, localized_wide(Msg::UiResetAllHint));
+        let prev = button(view, tr(Msg::UiPreviousPage), PAGE_PREV)?;
+        let next = button(view, tr(Msg::UiNextPage), PAGE_NEXT)?;
         create(view, w!("STATIC"), "", PAGE_LABEL, SS_OWNERDRAW, 0)?;
-        self.hint(view, prev, w!("Предыдущая страница"));
-        self.hint(view, next, w!("Следующая страница"));
+        self.hint(view, prev, localized_wide(Msg::UiPreviousPage));
+        self.hint(view, next, localized_wide(Msg::UiNextPage));
         for (i, group) in GROUPS.iter().enumerate() {
-            let label = group.title;
+            let label = tr(group.title);
             create(
                 view,
                 w!("STATIC"),
@@ -199,18 +199,19 @@ impl ShortcutWindow {
                     0,
                 )?;
                 self.sync_slots(action, self.settings.borrow().bindings(action).len().max(1))?;
+                let args = [("action", action.label()), ("category", label)];
                 let add = button(
                     view,
-                    &format!("Добавить сочетание для «{}» — {label}", action.label()),
+                    &render(Msg::UiAddForAction, &args),
                     ADD_ROW + action.index() as i32,
                 )?;
                 let reset = button(
                     view,
-                    &format!("Сбросить сочетания для «{}» — {label}", action.label()),
+                    &render(Msg::UiResetForAction, &args),
                     RESET_ROW + action.index() as i32,
                 )?;
-                self.hint(view, add, w!("Добавить сочетание"));
-                self.hint(view, reset, w!("Восстановить сочетания действия"));
+                self.hint(view, add, localized_wide(Msg::UiAddShortcut));
+                self.hint(view, reset, localized_wide(Msg::UiRestoreAction));
             }
         }
         Ok(())
@@ -219,6 +220,10 @@ impl ShortcutWindow {
     pub(super) fn update_fonts(&self, hwnd: HWND) {
         let ui = Fonts::new(self.dpi.get());
         unsafe {
+            let dc = GetDC(hwnd);
+            let text_width = appearance::text_width(dc, ui.regular, tr(Msg::UiResetAll));
+            ReleaseDC(hwnd, dc);
+            self.reset_button_width.set(text_width + self.p(48));
             SendMessageW(child(hwnd, STATUS), WM_SETFONT, ui.regular as usize, 1);
             for i in 0..GROUPS.len() {
                 SendMessageW(
@@ -408,7 +413,11 @@ impl ShortcutWindow {
         let p = |n| self.p(n);
         let compact = width < p(620);
         let content = width - 2 * margin;
-        let reset_width = p(if compact { 34 } else { 133 });
+        let reset_width = if compact {
+            p(34)
+        } else {
+            self.reset_button_width.get()
+        };
         let header_height = self.header_height(width);
         let button_height = p(32);
         let reset_y = (header_height - button_height) / 2;
