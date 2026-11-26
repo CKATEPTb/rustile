@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
 use windows_sys::Win32::System::Threading::{
-    CREATE_MUTEX_INITIAL_OWNER, CREATE_NO_WINDOW, CreateMutexExW, CreateProcessW,
+    CREATE_MUTEX_INITIAL_OWNER, CreateMutexExW, CreateProcessW, DETACHED_PROCESS,
     GetCurrentThreadId, MUTEX_MODIFY_STATE, OpenMutexW, PROCESS_INFORMATION, ReleaseMutex,
     STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
@@ -72,7 +72,7 @@ pub(super) fn launch_background() -> Result<OwnedHandle, String> {
             null(),
             null(),
             0,
-            CREATE_NO_WINDOW,
+            DETACHED_PROCESS,
             null(),
             null(),
             &startup,

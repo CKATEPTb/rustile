@@ -140,7 +140,7 @@ fn window_command(
         };
     }
     if !mosaic {
-        return Err("Tiling is off. Run rustilectl enable to turn it on.".into());
+        return Err("Tiling is off. Run rustile enable to turn it on.".into());
     }
     if !manager.cli_tile_available(id) || !still_target() {
         return Err("The target window is unavailable or is not tiled on this desktop.".into());

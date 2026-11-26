@@ -3,54 +3,54 @@ use crate::settings::Modifier;
 
 const USAGE: &str = "Rustile window manager for Windows
 
-rustilectl enable | disable | toggle  Enable, disable, or toggle tiling
-rustilectl focus                      Print the focused window's title
-rustilectl focus DIR                  Focus the neighboring tile
-rustilectl move DIR                   Move the focused tile
-rustilectl resize EDGE DIR            Move the selected edge of the focused tile
-rustilectl close                      Close the focused window
-rustilectl maximize                   Maximize or restore the focused window
-rustilectl desktop                    Print the current desktop number
-rustilectl desktop next|previous|N    Switch desktops (numbered from 1)
-rustilectl transfer next|previous|N   Move the focused window and follow it
-rustilectl desktop list               List desktops in Windows order
-rustilectl window list                List windows on the current desktop
-rustilectl [start]                    Start Rustile or connect to the running manager
-rustilectl status                     Print the manager's status
-rustilectl quit                       Shut down the manager
-rustilectl --resize-shortcut win+enter|ctrl+alt+enter
-rustilectl --help | --version
+rustile enable | disable | toggle  Enable, disable, or toggle tiling
+rustile focus                      Print the focused window's title
+rustile focus DIR                  Focus the neighboring tile
+rustile move DIR                   Move the focused tile
+rustile resize EDGE DIR            Move the selected edge of the focused tile
+rustile close                      Close the focused window
+rustile maximize                   Maximize or restore the focused window
+rustile desktop                    Print the current desktop number
+rustile desktop next|previous|N    Switch desktops (numbered from 1)
+rustile transfer next|previous|N   Move the focused window and follow it
+rustile desktop list               List desktops in Windows order
+rustile window list                List windows on the current desktop
+rustile [start]                    Start Rustile or connect to the running manager
+rustile status                     Print the manager's status
+rustile quit                       Shut down the manager
+rustile --resize-shortcut win+enter|ctrl+alt+enter
+rustile --help | --version
 
 DIR is left, right, up, or down. For example, resize left right moves the left
-edge to the right. Run rustilectl help resize for all edge and direction pairs.";
+edge to the right. Run rustile help resize for all edge and direction pairs.";
 
-const FOCUS_HELP: &str = "rustilectl focus                     Print the focused window's title
-rustilectl focus left|right|up|down  Focus the next tiled window in that direction";
-const MOSAIC_HELP: &str = "rustilectl mosaic status           Print on or off
-rustilectl mosaic on|off|toggle    Enable, disable, or toggle tiling";
-const DESKTOP_HELP: &str = "rustilectl desktop                 Print the current desktop number
-rustilectl desktop list            List desktops in Windows order
-rustilectl desktop next|previous   Switch to the next or previous desktop
-rustilectl desktop N               Switch to desktop N (numbered from 1)
+const FOCUS_HELP: &str = "rustile focus                     Print the focused window's title
+rustile focus left|right|up|down  Focus the next tiled window in that direction";
+const MOSAIC_HELP: &str = "rustile mosaic status           Print on or off
+rustile mosaic on|off|toggle    Enable, disable, or toggle tiling";
+const DESKTOP_HELP: &str = "rustile desktop                 Print the current desktop number
+rustile desktop list            List desktops in Windows order
+rustile desktop next|previous   Switch to the next or previous desktop
+rustile desktop N               Switch to desktop N (numbered from 1)
 
 If N exceeds the desktop count, Rustile switches to the last desktop.";
-const TRANSFER_HELP: &str = "rustilectl transfer next|previous|N
+const TRANSFER_HELP: &str = "rustile transfer next|previous|N
 
 Move the focused window to the destination and follow it. Desktop numbers start
 at 1. Numbers above the desktop count select the last desktop.";
-const RESIZE_HELP: &str = "rustilectl resize left|right left|right
-rustilectl resize top|bottom up|down
+const RESIZE_HELP: &str = "rustile resize left|right left|right
+rustile resize top|bottom up|down
 
 Move the selected tile edge one step in the given direction. The edge names
 up and down also select the top and bottom edges. A screen boundary stays fixed.";
 const WINDOW_HELP: &str =
-    "rustilectl window current                   Print the focused window's title
-rustilectl window list                      List windows on the current desktop
-rustilectl window focus DIR                  Focus the neighboring window
-rustilectl window move DIR                   Move the focused tile
-rustilectl window resize DIR [--shrink]      Resize the tile by one step
-rustilectl window to-desktop next|prev|N     Move the focused window and follow it
-rustilectl window close|maximize             Close or maximize/restore the focused window
+    "rustile window current                   Print the focused window's title
+rustile window list                      List windows on the current desktop
+rustile window focus DIR                  Focus the neighboring window
+rustile window move DIR                   Move the focused tile
+rustile window resize DIR [--shrink]      Resize the tile by one step
+rustile window to-desktop next|prev|N     Move the focused window and follow it
+rustile window close|maximize             Close or maximize/restore the focused window
 
 DIR is left, right, up, or down. Use --shrink to move the same boundary in reverse.
 Window actions use the focused window by default. To target a specific window,
@@ -123,24 +123,22 @@ pub(crate) fn parse(args: &[String]) -> Result<Invocation, String> {
         ["--help" | "-h" | "help"] => Ok(Invocation::Print(USAGE)),
         ["help", group] | [group, "--help" | "-h"] => match *group {
             "focus" => Ok(Invocation::Print(FOCUS_HELP)),
-            "move" => Ok(Invocation::Print("rustilectl move left|right|up|down")),
+            "move" => Ok(Invocation::Print("rustile move left|right|up|down")),
             "resize" => Ok(Invocation::Print(RESIZE_HELP)),
             "transfer" => Ok(Invocation::Print(TRANSFER_HELP)),
-            "enable" => Ok(Invocation::Print("rustilectl enable   Enable tiling")),
-            "disable" => Ok(Invocation::Print("rustilectl disable  Disable tiling")),
-            "toggle" => Ok(Invocation::Print("rustilectl toggle   Toggle tiling")),
+            "enable" => Ok(Invocation::Print("rustile enable   Enable tiling")),
+            "disable" => Ok(Invocation::Print("rustile disable  Disable tiling")),
+            "toggle" => Ok(Invocation::Print("rustile toggle   Toggle tiling")),
             "close" => Ok(Invocation::Print(
-                "rustilectl close   Close the focused window",
+                "rustile close   Close the focused window",
             )),
             "maximize" => Ok(Invocation::Print(
-                "rustilectl maximize   Maximize or restore the focused window",
+                "rustile maximize   Maximize or restore the focused window",
             )),
             "mosaic" => Ok(Invocation::Print(MOSAIC_HELP)),
             "desktop" => Ok(Invocation::Print(DESKTOP_HELP)),
             "window" => Ok(Invocation::Print(WINDOW_HELP)),
-            _ => Err(format!(
-                "Unknown help topic '{group}'. See rustilectl --help."
-            )),
+            _ => Err(format!("Unknown help topic '{group}'. See rustile --help.")),
         },
         ["--resize-shortcut", chord] | ["start", "--resize-shortcut", chord] => {
             let modifier = if chord.eq_ignore_ascii_case("win+enter") {
@@ -177,7 +175,7 @@ fn parse_command(words: &[&str]) -> Result<Command, String> {
             "focus" | "move" | "resize" | "transfer" | "close" | "maximize",
             ..,
         ] => parse_window(words, false),
-        _ => Err("Unknown command or unexpected arguments. See rustilectl --help.".into()),
+        _ => Err("Unknown command or unexpected arguments. See rustile --help.".into()),
     }
 }
 
@@ -267,7 +265,7 @@ fn window_id(text: &str) -> Result<Id, String> {
         .filter(|&id| id != 0)
         .map(|id| id as Id)
         .ok_or_else(|| {
-            "Use a nonzero window handle in decimal or hexadecimal (e.g. 0x1234). See rustilectl window list."
+            "Use a nonzero window handle in decimal or hexadecimal (e.g. 0x1234). See rustile window list."
                 .into()
         })
 }

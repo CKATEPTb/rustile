@@ -290,37 +290,35 @@ internal static class DesktopSmoke {
     }
     static void VerifyCli(string rustile, string desktop, List<Child> children, IntPtr[] windows,
         Rectangle[] originals, Rectangle area) {
-        var client = Path.Combine(Path.GetDirectoryName(rustile), "rustilectl.exe");
-        Require(File.Exists(client), "Build rustilectl.exe alongside rustile.exe for CLI checks");
-        var help = Cli(client, "--help", desktop);
+        var help = Cli(rustile, "--help", desktop);
         Require(help.Contains("transfer") && help.Contains("resize") && help.Contains("focused window"), "Expected English CLI help without a manager");
-        Require(Cli(client, "focus sideways", desktop, false).Contains("Unknown direction"), "Invalid directions need an English error");
-        Require(Cli(client, "status", desktop, false).Contains("not running"), "A stopped manager needs an English error");
-        Cli(client, "desktop go 0", desktop, false);
+        Require(Cli(rustile, "--version", desktop).StartsWith("rustile "), "Version must be available without a manager");
+        Require(Cli(rustile, "focus sideways", desktop, false).Contains("Unknown direction"), "Invalid directions need an English error");
+        Cli(rustile, "desktop go 0", desktop, false);
+        Require(FindWindow("Rustile.Tray", "Rustile") == IntPtr.Zero, "Help, version, and invalid commands must not start a manager");
+        Cli(rustile, "quit", desktop);
+        Require(FindWindow("Rustile.Tray", "Rustile") == IntPtr.Zero, "Quitting an idle manager must leave it stopped");
 
         // Compete for ownership from a cold start. A second tray must never
         // install its hooks or displace the winner during the other launches.
         var candidates = new List<Child>();
         for (int i = 0; i < 4; i++) {
-            var process = new Child(rustile, "", desktop, true, true);
+            var process = new Child(rustile, "", desktop, true);
             children.Add(process);
             candidates.Add(process);
         }
         Until("Concurrent launches must settle on one manager", () => candidates.Count(c => !c.Exited(0)) == 1);
         var manager = candidates.Single(c => !c.Exited(0));
-        foreach (var secondary in candidates.Where(c => c != manager)) {
-            Require(secondary.ExitCode == 0, "Secondary launch exited " + secondary.ExitCode + ": " + secondary.Error);
-            Require(secondary.Output.Split('\n').Any(line => line.Trim() == "pid=" + manager.Pid),
-                "Secondary launch did not report elected owner: " + secondary.Output);
-        }
+        foreach (var secondary in candidates.Where(c => c != manager))
+            Require(secondary.ExitCode == 0, "Secondary launch exited " + secondary.ExitCode);
         var tray = TrayWindow(manager);
         Until("The primary should tile both fixtures", () => Tiled(area, windows));
-        var status = Cli(client, "status", desktop);
+        var status = Cli(rustile, "status", desktop);
         Require(status.Split('\n').Any(line => line.Trim() == "pid=" + manager.Pid), "CLI did not report the elected owner: " + status);
-        Require(Cli(client, "start", desktop) == status, "Starting again must return the incumbent's status");
-        Require(Cli(rustile, "status", desktop) == status, "The GUI executable must forward requests to the same instance");
-        Require(Cli(client, "mosaic status", desktop) == "on", "Expected mosaic to be enabled");
-        var list = Cli(client, "window list", desktop).Split('\n');
+        Require(Cli(rustile, "start", desktop) == status, "Starting again must return the incumbent's status");
+        Require(Cli(rustile, "", desktop) == status, "Bare launch with redirected output must return the incumbent's status");
+        Require(Cli(rustile, "mosaic status", desktop) == "on", "Expected mosaic to be enabled");
+        var list = Cli(rustile, "window list", desktop).Split('\n');
         foreach (var hwnd in windows) {
             int pid;
             GetWindowThreadProcessId(hwnd, out pid);
@@ -329,121 +327,143 @@ internal static class DesktopSmoke {
         }
         // Virtual desktops belong to the real interactive Shell; an isolated
         // Win32 desktop must return an error without switching the user's desktop.
-        var noDesktops = Cli(client, "desktop current", desktop, false);
+        var noDesktops = Cli(rustile, "desktop current", desktop, false);
         foreach (var command in new[] { "desktop", "desktop next", "desktop previous", "desktop 3",
             "transfer next", "transfer previous", "transfer 3" })
-            Require(Cli(client, command, desktop, false) == noDesktops, command + " must reach desktop management on the private desktop");
+            Require(Cli(rustile, command, desktop, false) == noDesktops, command + " must reach desktop management on the private desktop");
         var before = windows.Select(VisibleFrame).ToArray();
         var names = new[] { "left", "right", "up", "down" };
         var activeIndex = Array.IndexOf(windows, GetForegroundWindow());
         if (activeIndex >= 0) {
             var other = 1 - activeIndex;
-            Require(Cli(client, "focus", desktop) == ControlText(windows[activeIndex]),
+            Require(Cli(rustile, "focus", desktop) == ControlText(windows[activeIndex]),
                 "focus should report the active fixture's title");
             var towardOther = names[NeighborDirection(before[activeIndex], before[other])];
-            Cli(client, "focus " + towardOther, desktop);
+            Cli(rustile, "focus " + towardOther, desktop);
             Until("Directional CLI focus should select the neighboring window", () => GetForegroundWindow() == windows[other]);
-            Require(Cli(client, "window current", desktop) == ControlText(windows[other]), "window current should report the new focus");
+            Require(Cli(rustile, "window current", desktop) == ControlText(windows[other]), "window current should report the new focus");
             Console.WriteLine("PASS  CLI reads the focused title and changes focus to the adjacent tile");
         } else {
             // A private desktop usually has no active application.
-            var noFocus = Cli(client, "focus", desktop, false);
+            var noFocus = Cli(rustile, "focus", desktop, false);
             Require(noFocus.IndexOf("focus", StringComparison.OrdinalIgnoreCase) >= 0
-                && noFocus == Cli(client, "window current", desktop, false), "Both focus queries should report the same English error");
-            Cli(client, "focus right", desktop, false);
+                && noFocus == Cli(rustile, "window current", desktop, false), "Both focus queries should report the same English error");
+            Cli(rustile, "focus right", desktop, false);
             Console.WriteLine("PASS  CLI reports an empty focus in English and rejects a directional move without a starting window");
         }
         var edge = NeighborDirection(before[0], before[1]);
         var dir = names[edge];
         var opposite = names[edge ^ 1];
         var handle = " --hwnd 0x" + windows[0].ToInt64().ToString("X");
-        Cli(client, "resize " + opposite + " " + dir + handle, desktop, false);
-        Cli(client, "resize " + dir + " " + names[edge ^ 2] + handle, desktop, false);
+        Cli(rustile, "resize " + opposite + " " + dir + handle, desktop, false);
+        Cli(rustile, "resize " + dir + " " + names[edge ^ 2] + handle, desktop, false);
         Require(windows.Select(VisibleFrame).SequenceEqual(before), "Rejected edge resizes must leave both tiles in place");
-        Cli(client, "resize " + dir + " " + dir + handle, desktop);
+        Cli(rustile, "resize " + dir + " " + dir + handle, desktop);
         Until("An explicit resize must move only the shared divider toward the neighbor", () => {
             var current = windows.Select(VisibleFrame).ToArray();
             return current[0] != before[0] && current[0].Contains(before[0])
                 && current[1] != before[1] && before[1].Contains(current[1])
                 && Rectangle.Union(current[0], current[1]) == Rectangle.Union(before[0], before[1]);
         });
-        Cli(client, "resize " + dir + " " + opposite + handle, desktop);
+        Cli(rustile, "resize " + dir + " " + opposite + handle, desktop);
         Until("Reversing the same edge must restore both tiles", () => windows.Select(VisibleFrame).SequenceEqual(before));
         var neighbor = " --hwnd 0x" + windows[1].ToInt64().ToString("X");
-        Cli(client, "resize " + opposite + " " + opposite + neighbor, desktop);
+        Cli(rustile, "resize " + opposite + " " + opposite + neighbor, desktop);
         Until("Resizing the neighbor's edge must grow that window", () => {
             var current = VisibleFrame(windows[1]);
             return current != before[1] && current.Contains(before[1]);
         });
-        Cli(client, "resize " + opposite + " " + dir + neighbor, desktop);
+        Cli(rustile, "resize " + opposite + " " + dir + neighbor, desktop);
         Until("Reversing from the neighbor must restore the same divider", () => windows.Select(VisibleFrame).SequenceEqual(before));
-        Cli(client, "window resize " + dir + handle, desktop);
+        Cli(rustile, "window resize " + dir + handle, desktop);
         Until("The explicit CLI target must grow toward its neighbor", () => {
             var current = VisibleFrame(windows[0]);
             return (long)current.Width * current.Height > (long)before[0].Width * before[0].Height;
         });
-        Cli(client, "window resize " + dir + " --shrink" + handle, desktop);
+        Cli(rustile, "window resize " + dir + " --shrink" + handle, desktop);
         Until("The inverse CLI resize must restore both tiles", () => windows.Select(VisibleFrame).SequenceEqual(before));
-        Cli(client, "move " + dir + handle, desktop);
+        Cli(rustile, "move " + dir + handle, desktop);
         Until("CLI move must enter the adjacent tile", () => VisibleFrame(windows[0]).IntersectsWith(before[1]));
 
-        Require(Cli(client, "disable", desktop) == "off" && Cli(client, "mosaic off", desktop) == "off",
+        Require(Cli(rustile, "disable", desktop) == "off" && Cli(rustile, "mosaic off", desktop) == "off",
             "disable and repeated mosaic off must leave tiling off");
         var paused = windows.Select(VisibleFrame).ToArray();
-        Cli(client, "window move " + dir + handle, desktop, false);
-        Cli(client, "window resize " + dir + handle, desktop, false);
+        Cli(rustile, "window move " + dir + handle, desktop, false);
+        Cli(rustile, "window resize " + dir + handle, desktop, false);
         Require(windows.Select(VisibleFrame).SequenceEqual(paused), "CLI tile commands moved a paused layout");
         using (var app = new Child(Application.ExecutablePath, "fixture 7", desktop)) {
             var target = IntPtr.Zero;
             Until("CLI control fixture should be visible", () => (target = Find(app.Pid, false)) != IntPtr.Zero);
             var targetArg = " --hwnd 0x" + target.ToInt64().ToString("X");
-            Cli(client, "maximize" + targetArg, desktop);
+            Cli(rustile, "maximize" + targetArg, desktop);
             Until("maximize should expand the window while tiling is off", () => IsZoomed(target));
-            Cli(client, "maximize" + targetArg, desktop);
+            Cli(rustile, "maximize" + targetArg, desktop);
             Until("Repeating maximize should restore the window", () => !IsZoomed(target));
-            Cli(client, "close" + targetArg, desktop);
+            Cli(rustile, "close" + targetArg, desktop);
             Require(app.Exited(5000) && app.ExitCode == 0, "close must send a regular close request to the selected fixture");
         }
-        Require(Cli(client, "enable", desktop) == "on" && Cli(client, "enable", desktop) == "on",
+        Require(Cli(rustile, "enable", desktop) == "on" && Cli(rustile, "enable", desktop) == "on",
             "enable must resume tiling and keep it enabled when repeated");
-        Require(Cli(client, "toggle", desktop) == "off" && Cli(client, "toggle", desktop) == "on"
-            && Cli(client, "mosaic status", desktop) == "on", "toggle must change the incumbent's tiling state both ways");
+        Require(Cli(rustile, "toggle", desktop) == "off" && Cli(rustile, "toggle", desktop) == "on"
+            && Cli(rustile, "mosaic status", desktop) == "on", "toggle must change the incumbent's tiling state both ways");
         Require(TrayWindow(manager) == tray, "Running client commands changed the tray owner");
-        Cli(client, "quit", desktop);
+        Cli(rustile, "quit", desktop);
         Require(manager.Exited(5000) && manager.ExitCode == 0, "CLI quit must close the manager cleanly");
         Until("CLI quit must restore both original windows", () => windows.Select(Bounds).SequenceEqual(originals));
-        Cli(client, "status", desktop, false);
+        // Cold status and three simultaneous mutations must converge on
+        // one manager and each toggle must run exactly once.
+        var clients = new List<Child>();
         try {
-            var started = Cli(client, "start", desktop);
-            var pidLine = started.Split('\n').Single(line => line.StartsWith("pid="));
-            int restartPid = int.Parse(pidLine.Substring(4).Trim());
-            int trayPid;
-            GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out trayPid);
-            Require(trayPid == restartPid, "The detached manager must run on its CLI client's private desktop");
-            using (var restarted = Process.GetProcessById(restartPid)) {
-                IntPtr handleBeforeQuit = restarted.Handle;
-                Require(Cli(client, "status", desktop) == started, "The new owner must outlive its start command");
-                Require(Cli(client, "mosaic status", desktop) == "on", "A new owner should accept commands after restart");
-                Cli(client, "quit", desktop);
-                uint code;
-                Require(restarted.WaitForExit(5000) && GetExitCodeProcess(handleBeforeQuit, out code) && code == 0,
-                    "Restarted CLI owner failed to quit");
-            }
+            foreach (var args in new[] { "status", "toggle", "toggle", "toggle" })
+                clients.Add(new Child(rustile, args, desktop, true, true));
+            foreach (var command in clients)
+                Require(command.Exited(15000) && command.ExitCode == 0 && command.Error.Length == 0,
+                    "A concurrent cold command failed: " + command.Error);
+            var owner = clients[0].Output.Split('\n').Single(line => line.StartsWith("pid=")).Trim();
+            Require(Cli(rustile, "status", desktop).Split('\n').Any(line => line.Trim() == owner),
+                "Cold status must report the persistent owner");
+            var replies = clients.Skip(1).Select(command => command.Output).OrderBy(text => text).ToArray();
+            Require(replies.SequenceEqual(new[] { "off", "off", "on" }) && Cli(rustile, "mosaic status", desktop) == "off",
+                "Each simultaneous cold toggle must change the same manager once");
         } finally {
-            // Also reap the test owner if a broken client never returns its PID.
-            int survivor;
-            GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out survivor);
-            if (survivor != 0) {
-                using (var process = Process.GetProcessById(survivor)) {
-                    if (String.Equals(process.MainModule.FileName, rustile, StringComparison.OrdinalIgnoreCase)) {
-                        process.Kill();
-                        process.WaitForExit(5000);
-                    }
+            foreach (var command in clients) command.Dispose();
+        }
+        Cli(rustile, "enable", desktop);
+        Cli(rustile, "quit", desktop);
+        var redirected = Cli(rustile, "", desktop);
+        Require(redirected.StartsWith("pid=") && Cli(rustile, "status", desktop) == redirected,
+            "A bare cold launch with redirected output must exit and leave its manager running");
+        Cli(rustile, "quit", desktop);
+        var started = Cli(rustile, "start", desktop);
+        var pidLine = started.Split('\n').Single(line => line.StartsWith("pid="));
+        int restartPid = int.Parse(pidLine.Substring(4).Trim());
+        int trayPid;
+        GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out trayPid);
+        Require(trayPid == restartPid, "The detached manager must run on its CLI client's private desktop");
+        using (var restarted = Process.GetProcessById(restartPid)) {
+            IntPtr handleBeforeQuit = restarted.Handle;
+            Require(Cli(rustile, "status", desktop) == started, "The new owner must outlive its start command");
+            Require(Cli(rustile, "mosaic status", desktop) == "on", "A new owner should accept commands after restart");
+            Cli(rustile, "quit", desktop);
+            uint code;
+            Require(restarted.WaitForExit(5000) && GetExitCodeProcess(handleBeforeQuit, out code) && code == 0,
+                "Restarted CLI owner failed to quit");
+        }
+        Until("Restarted owner must also restore both windows", () => windows.Select(Bounds).SequenceEqual(originals));
+        Console.WriteLine("PASS  One executable starts the tray, forwards commands and handles concurrent cold requests exactly once");
+    }
+    static void ReapTestOwner(string rustile) {
+        // Also reap the test owner if a broken client never returns its PID.
+        int survivor;
+        GetWindowThreadProcessId(FindWindow("Rustile.Tray", "Rustile"), out survivor);
+        if (survivor != 0) {
+            using (var process = Process.GetProcessById(survivor)) {
+                if (String.Equals(process.MainModule.FileName, rustile, StringComparison.OrdinalIgnoreCase)) {
+                    process.Kill();
+                    process.WaitForExit(5000);
                 }
             }
         }
-        Until("Restarted owner must also restore both windows", () => windows.Select(Bounds).SequenceEqual(originals));
-        Console.WriteLine("PASS  Concurrent launches share one owner; console and GUI clients return results, change tiles and release the instance on quit");
     }
     static void Until(string description, Func<bool> condition) {
         var timer = Stopwatch.StartNew();
@@ -1979,7 +1999,9 @@ internal static class DesktopSmoke {
             };
             Action<int> launch = index => launchFixture(index, false);
             launch(0); launch(1);
-            VerifyCli(rustile, desktopName, children, windows.Take(2).ToArray(), originals.Take(2).ToArray(), Screen.PrimaryScreen.WorkingArea);
+            try {
+                VerifyCli(rustile, desktopName, children, windows.Take(2).ToArray(), originals.Take(2).ToArray(), Screen.PrimaryScreen.WorkingArea);
+            } finally { ReapTestOwner(rustile); }
             FullscreenRoundTrips(rustile, desktopName, children, windows[0], windows[1], originals);
             // Exercise the default Windows modifier even when another application
             // has already registered Win+Enter on this desktop.

@@ -6,9 +6,10 @@ fn main() {
             println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
         }
         println!("cargo:rerun-if-changed=assets/rustile.rc");
+        println!("cargo:rerun-if-changed=assets/rustile.manifest");
         println!("cargo:rerun-if-changed=assets/rustile.ico");
         embed_resource::compile_for_everything("assets/rustile.rc", embed_resource::NONE)
             .manifest_required()
-            .expect("Failed to embed the Rustile application icon");
+            .expect("Failed to embed Rustile's Windows resources");
     }
 }

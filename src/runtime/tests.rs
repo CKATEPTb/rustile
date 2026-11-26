@@ -380,7 +380,7 @@ fn isolated_startup_tray() {
         assert_eq!(RegOverridePredefKey(HKEY_CURRENT_USER, root), 0);
     }
     crate::startup::mock_task_for_smoke();
-    let result = std::panic::catch_unwind(|| run_with_args(&[]));
+    let result = std::panic::catch_unwind(|| run_with_args(&[], false));
     unsafe {
         assert_eq!(RegOverridePredefKey(HKEY_CURRENT_USER, null_mut()), 0);
         RegCloseKey(root);

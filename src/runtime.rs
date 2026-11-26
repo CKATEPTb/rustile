@@ -1053,40 +1053,48 @@ fn pump(
     }
 }
 
-pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
-    let from_console_client = args.first().is_some_and(|arg| arg == "--cli");
-    let args = if from_console_client {
-        &args[1..]
-    } else {
-        args
-    };
-    let logon = !from_console_client
-        && matches!(args, [flag] if matches!(flag.as_str(), startup::STARTUP_FLAG | startup::LEGACY_ELEVATED_FLAG));
-    let background = !from_console_client && matches!(args, [flag] if flag == "--background");
-    let invocation = if background {
-        cli::Invocation::Start(None)
-    } else if logon {
-        if !startup::run_at_logon()? {
-            return Ok(());
+pub(crate) fn run_with_args(args: &[String], from_terminal: bool) -> Result<(), String> {
+    let logon = matches!(args, [flag] if matches!(flag.as_str(), startup::STARTUP_FLAG | startup::LEGACY_ELEVATED_FLAG));
+    if logon && !startup::run_at_logon()? {
+        return Ok(());
+    }
+    if logon || matches!(args, [flag] if flag == "--background") {
+        if let Some(_owner) = instance::Instance::acquire()? {
+            run_primary(None)?;
         }
-        cli::Invocation::Start(None)
-    } else {
-        cli::parse(args)?
-    };
-    match invocation {
+        return Ok(());
+    }
+    match cli::parse(args)? {
         cli::Invocation::Print(text) => {
             println!("{text}");
             Ok(())
         }
-        cli::Invocation::Request(command) => client_command(command),
+        cli::Invocation::Request(command) => {
+            if command == cli::Command::Quit {
+                if !instance::Instance::running()? {
+                    println!("ok");
+                    return Ok(());
+                }
+            } else {
+                ensure_running()?;
+            }
+            client_command(command)
+        }
         cli::Invocation::Start(modifier)
-            if from_console_client || args.first().is_some_and(|a| a == "start") =>
+            if from_terminal || args.first().is_some_and(|a| a == "start") =>
         {
-            start_background(modifier)
+            ensure_running()?;
+            if let Some(modifier) = modifier {
+                ipc::send(
+                    &cli::Command::ResizeShortcut(modifier).to_wire(),
+                    false,
+                    false,
+                )?;
+            }
+            client_command(cli::Command::Status)
         }
         cli::Invocation::Start(modifier) => match instance::Instance::acquire()? {
             Some(_owner) => run_primary(modifier),
-            None if logon || background => Ok(()),
             None => {
                 client_command(modifier.map_or(cli::Command::Status, cli::Command::ResizeShortcut))
             }
@@ -1112,33 +1120,29 @@ fn client_command(command: cli::Command) -> Result<(), String> {
     Ok(())
 }
 
-fn start_background(modifier: Option<Modifier>) -> Result<(), String> {
+fn ensure_running() -> Result<(), String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    if !instance::Instance::running()? {
-        let child = instance::launch_background()?;
-        let start = Instant::now();
-        while !instance::Instance::running()? {
-            if start.elapsed() >= Duration::from_secs(5) {
-                return Err("Rustile did not confirm startup within 5 seconds.".into());
-            }
-            match unsafe { WaitForSingleObject(child.as_raw_handle(), 20) } {
-                WAIT_TIMEOUT => {}
-                WAIT_OBJECT_0 if instance::Instance::running()? => break,
-                WAIT_OBJECT_0 => return Err("Rustile exited during startup.".into()),
-                _ => return Err(crate::cli_error::io(io::Error::last_os_error())),
-            }
+    if instance::Instance::running()? {
+        return Ok(());
+    }
+    // Concurrent cold commands can each start a candidate. Only the elected
+    // owner stays running. Each caller submits its command once, over IPC.
+    let child = instance::launch_background()?;
+    let start = Instant::now();
+    while !instance::Instance::running()? {
+        if start.elapsed() >= Duration::from_secs(5) {
+            return Err("Rustile did not confirm startup within 5 seconds.".into());
+        }
+        match unsafe { WaitForSingleObject(child.as_raw_handle(), 20) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 if instance::Instance::running()? => break,
+            WAIT_OBJECT_0 => return Err("Rustile exited during startup.".into()),
+            _ => return Err(crate::cli_error::io(io::Error::last_os_error())),
         }
     }
-    if let Some(modifier) = modifier {
-        ipc::send(
-            &cli::Command::ResizeShortcut(modifier).to_wire(),
-            false,
-            false,
-        )?;
-    }
-    client_command(cli::Command::Status)
+    Ok(())
 }
 
 fn run_primary(resize_override: Option<Modifier>) -> Result<(), String> {

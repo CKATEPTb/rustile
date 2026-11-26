@@ -1,5 +1,3 @@
-#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
-
 #[cfg(windows)]
 mod cli;
 #[cfg(windows)]
@@ -27,6 +25,28 @@ mod tray;
 use manager::Manager;
 
 #[cfg(windows)]
+fn launched_from_terminal() -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut pid = 0;
+    let attached = unsafe { GetConsoleProcessList(&mut pid, 1) };
+    let redirected = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].iter().any(|&stream| {
+        matches!(
+            unsafe { GetFileType(GetStdHandle(stream)) },
+            FILE_TYPE_DISK | FILE_TYPE_PIPE
+        )
+    });
+    // Earlier Windows builds may allocate a private console for an Explorer
+    // launch. Release only that console; a shell or pipe belongs to the caller.
+    if attached == 1 && !redirected {
+        unsafe { FreeConsole() };
+    }
+    attached > 1 || redirected
+}
+
+#[cfg(windows)]
 fn main() -> std::process::ExitCode {
     // Both the consent helper and the scheduled GUI use only system DLLs.
     unsafe {
@@ -38,20 +58,12 @@ fn main() -> std::process::ExitCode {
         }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let from_terminal = launched_from_terminal();
     if let Some(exit) = startup::consent::handle_helper(&args) {
         return exit;
     }
-    // Explorer launches Rustile without a console. A command-line launch can
-    // still print help and accept Ctrl+C from the existing parent console.
-    if args
-        .first()
-        .is_none_or(|arg| !matches!(arg.as_str(), "--cli" | "--background"))
-    {
-        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
-    }
     native::init_dpi();
-    match runtime::run_with_args(&args) {
+    match runtime::run_with_args(&args, from_terminal) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("Rustile: {message}");
