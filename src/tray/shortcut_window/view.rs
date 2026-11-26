@@ -1,8 +1,9 @@
 use super::*;
 use Shortcut::*;
+use windows_sys::Win32::System::SystemServices::{SS_NOTIFY, SS_OWNERDRAW};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
-const GROUPS: [(&str, &[Shortcut]); 7] = [
+pub(super) const GROUPS: [(&str, &[Shortcut]); 8] = [
     ("Перемещение окон", &[MoveLeft, MoveRight, MoveUp, MoveDown]),
     (
         "Навигация по окнам",
@@ -51,7 +52,7 @@ const GROUPS: [(&str, &[Shortcut]); 7] = [
         ],
     ),
     (
-        "Рабочие столы",
+        "Переключение столов",
         &[
             PreviousDesktop,
             PreviousDesktopAlt,
@@ -59,19 +60,19 @@ const GROUPS: [(&str, &[Shortcut]); 7] = [
             NextDesktop,
             NextDesktopAlt,
             NextDesktopWheel,
-            Desktop1,
-            Desktop2,
-            Desktop3,
-            Desktop4,
-            Desktop5,
-            Desktop6,
-            Desktop7,
-            Desktop8,
-            Desktop9,
-            Desktop10,
+        ],
+    ),
+    (
+        "Стол по номеру",
+        &[
+            Desktop1, Desktop2, Desktop3, Desktop4, Desktop5, Desktop6, Desktop7, Desktop8,
+            Desktop9, Desktop10,
         ],
     ),
 ];
+
+// Keep keyboard traversal in reading order at every column count.
+const READING_ORDER: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
 
 impl ShortcutWindow {
     pub(super) fn create_controls(&self, hwnd: HWND) -> Result<(), String> {
@@ -112,6 +113,8 @@ impl ShortcutWindow {
         };
 
         create(hwnd, w!("STATIC"), "", STATUS, 0, 0)?;
+        let preview = create(hwnd, w!("STATIC"), "", PREVIEW, SS_OWNERDRAW | SS_NOTIFY, 0)?;
+        let reset_all = button(hwnd, "Сбросить всё", RESET_ALL)?;
         let view = create(
             hwnd,
             w!("STATIC"),
@@ -121,7 +124,6 @@ impl ShortcutWindow {
             WS_EX_CONTROLPARENT,
         )?;
         unsafe { SetWindowSubclass(view, Some(view_proc), 1, self as *const Self as usize) };
-        button(view, "Сбросить всё", RESET_ALL)?;
         let tooltip = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST,
@@ -138,8 +140,35 @@ impl ShortcutWindow {
                 null(),
             )
         };
-        for (i, &(label, actions)) in GROUPS.iter().enumerate() {
-            create(view, w!("STATIC"), label, SECTION + i as i32, 0, 0)?;
+        let hint = |parent, control: HWND, text: *const u16| {
+            if !tooltip.is_null() {
+                let tool = TTTOOLINFOW {
+                    cbSize: size_of::<TTTOOLINFOW>() as u32,
+                    uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                    hwnd: parent,
+                    uId: control as usize,
+                    lpszText: text.cast_mut(),
+                    ..Default::default()
+                };
+                unsafe { SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize) };
+            }
+        };
+        hint(
+            hwnd,
+            preview,
+            w!("Дважды щёлкните, чтобы изменить сочетание"),
+        );
+        hint(hwnd, reset_all, w!("Сбросить все сочетания"));
+        for i in READING_ORDER {
+            let (label, actions) = GROUPS[i];
+            create(
+                view,
+                w!("STATIC"),
+                label,
+                SECTION + i as i32,
+                SS_OWNERDRAW,
+                0,
+            )?;
             for &action in actions {
                 let row = button(view, action.label(), row_id(action))?;
                 let reset = button(
@@ -147,24 +176,8 @@ impl ShortcutWindow {
                     &format!("Сбросить сочетание для «{}»", action.label()),
                     RESET_ROW + action.index() as i32,
                 )?;
-                if !tooltip.is_null() {
-                    for (control, hint) in [
-                        (row, w!("Изменить сочетание: двойной щелчок или F2")),
-                        (reset, w!("Сбросить сочетание")),
-                    ] {
-                        let tool = TTTOOLINFOW {
-                            cbSize: size_of::<TTTOOLINFOW>() as u32,
-                            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
-                            hwnd: view,
-                            uId: control as usize,
-                            lpszText: hint.cast_mut(),
-                            ..Default::default()
-                        };
-                        unsafe {
-                            SendMessageW(tooltip, TTM_ADDTOOLW, 0, (&raw const tool) as isize)
-                        };
-                    }
-                }
+                hint(view, row, w!("Изменить сочетание двойным щелчком или F2"));
+                hint(view, reset, w!("Сбросить сочетание"));
             }
         }
         Ok(())
@@ -197,6 +210,17 @@ impl ShortcutWindow {
                 (&raw const dark).cast(),
                 size_of_val(&dark) as u32,
             );
+            let caption = if palette.high_contrast {
+                DWMWA_COLOR_DEFAULT
+            } else {
+                self.header_color()
+            };
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR as u32,
+                (&raw const caption).cast(),
+                size_of_val(&caption) as u32,
+            );
             let theme = if palette.dark {
                 w!("DarkMode_Explorer")
             } else {
@@ -213,7 +237,8 @@ impl ShortcutWindow {
     }
 
     fn margin(&self, width: i32) -> i32 {
-        self.p(14).max((width - self.p(1020)) / 2)
+        let edge = if width < self.p(620) { 14 } else { 24 };
+        self.p(edge).max((width - self.p(1460)) / 2)
     }
 
     pub(super) fn set_status(&self, message: &str) {
@@ -233,7 +258,29 @@ impl ShortcutWindow {
         let margin = self.margin(width);
         let status = child(hwnd, STATUS);
         let count = unsafe { GetWindowTextLengthW(status) };
-        let mut top = 0;
+        let p = |n| self.p(n);
+        let compact = width < p(620);
+        let content = width - 2 * margin;
+        let reset_width = p(if compact { 34 } else { 133 });
+        let header_height = p(if compact { 92 } else { 86 });
+        let button_height = p(32);
+        let reset_y = (header_height - button_height) / 2;
+        let preview_width = content - reset_width - p(if compact { 10 } else { 20 });
+        place(
+            child(hwnd, PREVIEW),
+            margin,
+            0,
+            preview_width,
+            header_height,
+        );
+        place(
+            child(hwnd, RESET_ALL),
+            width - margin - reset_width,
+            reset_y,
+            reset_width,
+            button_height,
+        );
+        let mut top = header_height;
         if count > 0 {
             let mut text = vec![0; count as usize + 1];
             let mut bounds = RECT {
@@ -255,8 +302,8 @@ impl ShortcutWindow {
                 ReleaseDC(hwnd, dc);
             }
             let height = bounds.bottom.max(self.p(18));
-            place(status, margin, self.p(7), width - 2 * margin, height);
-            top = height + self.p(10);
+            place(status, margin, top + p(4), content, height);
+            top += height + p(12);
         }
         unsafe {
             ShowWindow(
@@ -268,6 +315,7 @@ impl ShortcutWindow {
                 },
             );
         }
+        top += p(1);
         let height = (client.bottom - top).max(1);
         let view = child(hwnd, VIEW);
         place(view, 0, top, width, height);
@@ -277,35 +325,36 @@ impl ShortcutWindow {
 
     fn layout_rows(&self, view: HWND, width: i32, height: i32) {
         let p = |n| self.p(n);
-        let columns = width >= p(710);
-        let stacked = width < p(400);
-        let row_h = if stacked { p(43) } else { p(29) };
-        let header_h = p(29);
+        let columns = if width >= p(1140) {
+            3
+        } else if width >= p(780) {
+            2
+        } else {
+            1
+        };
+        let row_h = p(if width < p(430) { 50 } else { 32 });
+        let header_h = p(34);
         let row_gap = |action| {
-            if matches!(
-                action,
-                GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft | Desktop1
-            ) {
-                p(3)
+            if matches!(action, GrowLeft | ShrinkLeft | Confirm | QuickReverseLeft) {
+                p(5)
             } else {
                 0
             }
         };
         let mut starts = [(0, 0); GROUPS.len()];
-        let mut end = [p(7); 2];
-        for (i, &(_, actions)) in GROUPS.iter().enumerate() {
-            let column = usize::from(
-                columns
-                    && matches!(
-                        actions[0],
-                        FocusLeft | PreviousDesktop | MovePreviousDesktop
-                    ),
-            );
-            starts[i] = (column, end[column]);
-            end[column] +=
-                header_h + actions.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(10);
+        let mut ends = [p(12); 3];
+        for (order, &i) in READING_ORDER.iter().enumerate() {
+            let column = match columns {
+                3 if order >= 6 => 2,
+                3 if order >= 4 => 1,
+                2 if order >= 5 => 1,
+                _ => 0,
+            };
+            starts[i] = (column, ends[column]);
+            ends[column] +=
+                header_h + GROUPS[i].1.iter().map(|&a| row_h + row_gap(a)).sum::<i32>() + p(15);
         }
-        let total = end[0].max(end[1]);
+        let total = *ends.iter().max().unwrap();
         self.scroll
             .set(self.scroll.get().clamp(0, (total - height).max(0)));
         let scroll = SCROLLINFO {
@@ -323,35 +372,15 @@ impl ShortcutWindow {
             GetClientRect(view, &mut client)
         };
         let margin = self.margin(width);
-        let gap = p(18);
-        let col = (client.right - 2 * margin - if columns { gap } else { 0 })
-            / if columns { 2 } else { 1 };
-        let reset_w = p(104);
-        let reset_x = client.right - margin - reset_w;
-        place(
-            child(view, RESET_ALL),
-            reset_x,
-            p(7) - self.scroll.get(),
-            reset_w,
-            p(24),
-        );
+        let gap = p(24);
+        let col = (client.right - 2 * margin - (columns - 1) * gap) / columns;
+        let reset_w = p(25);
         for (i, &(_, actions)) in GROUPS.iter().enumerate() {
             let (column, start) = starts[i];
             let x = margin + column as i32 * (col + gap);
             let mut y = start - self.scroll.get();
-            place(
-                child(view, SECTION + i as i32),
-                x + p(2),
-                y + p(2),
-                if i == usize::from(columns) {
-                    reset_x - x - p(6)
-                } else {
-                    col - p(4)
-                },
-                p(21),
-            );
+            place(child(view, SECTION + i as i32), x, y, col, header_h);
             y += header_h;
-            let reset_w = p(26);
             for &action in actions {
                 y += row_gap(action);
                 place(self.row(action), x, y, col - reset_w, row_h);
@@ -405,156 +434,22 @@ impl ShortcutWindow {
     pub(super) fn background(&self, hwnd: HWND, dc: HDC) {
         let mut rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut rect) };
-        paint::background(dc, &rect, self.colors.get());
-    }
-
-    pub(super) fn draw(&self, item: &DRAWITEMSTRUCT) {
         let colors = self.colors.get();
-        let fonts = self.fonts.borrow();
-        let Some(fonts) = fonts.as_ref() else {
-            return;
-        };
-        let p = |n| self.p(n);
-        let id = item.CtlID as i32;
-        let r = item.rcItem;
-        let dc = item.hDC;
-        unsafe { SetBkMode(dc, TRANSPARENT as i32) };
-        paint::background(dc, &r, colors);
-        let disabled = item.itemState & ODS_DISABLED != 0;
-        let mut cursor = POINT::default();
-        let hovered =
-            unsafe { GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == item.hwndItem };
-        let hot = !disabled && (hovered || item.itemState & ODS_SELECTED != 0);
-        if id == RESET_ALL {
-            if hot {
-                paint::fill(dc, &r, colors.hover, p(4));
+        if hwnd == self.hwnd.get() {
+            paint::fill(dc, &rect, self.header_color(), 0);
+            let mut view = RECT::default();
+            if unsafe { GetWindowRect(child(hwnd, VIEW), &mut view) } != 0 {
+                unsafe { MapWindowPoints(null_mut(), hwnd, (&raw mut view).cast(), 2) };
+                rect.bottom = view.top;
+                rect.top = rect.bottom - self.p(1);
+                paint::fill(dc, &rect, colors.border, 0);
             }
-            let ink = if disabled {
-                colors.disabled
-            } else if hot {
-                colors.hover_text
-            } else {
-                colors.text
-            };
-            paint::text(dc, r, "Сбросить всё", fonts.regular, ink, DT_CENTER);
-        } else if let Some(action) = row_action(id) {
-            let selected = action == self.selected.get();
-            if selected || hot {
-                paint::fill(
-                    dc,
-                    &r,
-                    if hot { colors.hover } else { colors.control },
-                    p(4),
-                );
-            }
-            self.draw_binding(dc, r, action, fonts, hot);
-        } else if reset_action(id).is_some() && !disabled {
-            if hot {
-                paint::fill(dc, &r, colors.hover, p(4));
-            }
-            let ink = if hot {
-                colors.hover_text
-            } else {
-                colors.secondary
-            };
-            paint::text(dc, r, "\u{e777}", fonts.symbol, ink, DT_CENTER);
-        }
-        if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-            let outline = inset(r, p(2));
-            let color = if row_action(id).is_some_and(|action| self.recording(action)) {
-                colors.accent
-            } else {
-                colors.secondary
-            };
-            unsafe {
-                let region = CreateRoundRectRgn(
-                    outline.left,
-                    outline.top,
-                    outline.right + 1,
-                    outline.bottom + 1,
-                    p(8),
-                    p(8),
-                );
-                if !region.is_null() {
-                    SetDCBrushColor(dc, color);
-                    FrameRgn(dc, region, GetStockObject(DC_BRUSH), p(1), p(1));
-                    DeleteObject(region);
-                }
-            }
+        } else {
+            paint::background(dc, &rect, colors);
         }
     }
-
-    fn draw_binding(&self, dc: HDC, r: RECT, action: Shortcut, fonts: &Fonts, hot: bool) {
-        let p = |n| self.p(n);
-        let colors = self.colors.get();
-        let ink = if hot { colors.hover_text } else { colors.text };
-        let stacked = r.bottom - r.top > p(38);
-        let value = self.binding_text(action);
-        let left = r.left + p(7);
-        let right = r.right - p(6);
-        let key_width = measure(dc, fonts.regular, &value);
-        let value_x = if stacked {
-            left
-        } else {
-            (right - key_width - p(2)).max(left)
-        };
-        let label = RECT {
-            left,
-            right: if stacked { right } else { value_x - p(5) },
-            bottom: if stacked { r.top + p(22) } else { r.bottom },
-            ..r
-        };
-        paint::text(
-            dc,
-            label,
-            action.label(),
-            fonts.regular,
-            ink,
-            DT_LEFT | DT_END_ELLIPSIS,
-        );
-        let binding = RECT {
-            left: value_x,
-            right,
-            top: if stacked { label.bottom } else { r.top },
-            ..r
-        };
-        let value_ink = if hot {
-            colors.hover_text
-        } else if self.recording(action) {
-            colors.accent
-        } else {
-            colors.secondary
-        };
-        paint::text(
-            dc,
-            binding,
-            &value,
-            fonts.regular,
-            value_ink,
-            if stacked { DT_LEFT } else { DT_RIGHT },
-        );
-    }
 }
 
-fn measure(dc: HDC, font: HFONT, text: &str) -> i32 {
-    let utf16 = wide(text);
-    let mut size = SIZE::default();
-    unsafe {
-        let old = SelectObject(dc, font);
-        GetTextExtentPoint32W(dc, utf16.as_ptr(), (utf16.len() - 1) as i32, &mut size);
-        SelectObject(dc, old);
-    }
-    size.cx
-}
-
-fn inset(r: RECT, n: i32) -> RECT {
-    RECT {
-        left: r.left + n,
-        top: r.top + n,
-        right: r.right - n,
-        bottom: r.bottom - n,
-    }
-}
 fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe {
         SetWindowPos(

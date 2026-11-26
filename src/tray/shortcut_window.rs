@@ -1,5 +1,7 @@
+mod appearance;
 mod capture;
 mod conflict;
+mod header;
 mod view;
 
 use std::{
@@ -29,6 +31,7 @@ const STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
 const RESET_ALL: i32 = 505;
 const STATUS: i32 = 506;
 const VIEW: i32 = 510;
+const PREVIEW: i32 = 511;
 const SECTION: i32 = 520;
 const ROW: i32 = 1000;
 const RESET_ROW: i32 = 1100;
@@ -143,8 +146,8 @@ impl ShortcutWindow {
                 GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut y_dpi);
                 self.dpi.set(dpi.max(96));
                 let mut size = RECT {
-                    right: self.p(760),
-                    bottom: self.p(936),
+                    right: self.p(1232),
+                    bottom: self.p(852),
                     ..Default::default()
                 };
                 AdjustWindowRectExForDpi(&mut size, STYLE, 0, WS_EX_CONTROLPARENT, self.dpi.get());
@@ -297,11 +300,14 @@ impl ShortcutWindow {
 
     fn update_row(&self, action: Shortcut) {
         let row = self.row(action);
-        caption(
-            row,
-            &format!("{}, {}", action.label(), self.binding_text(action)),
-        );
+        let name = format!("{}, {}", action.label(), self.binding_text(action));
+        caption(row, &name);
         unsafe { InvalidateRect(row, null(), 0) };
+        if action == self.selected.get() {
+            let preview = child(self.hwnd.get(), PREVIEW);
+            caption(preview, &name);
+            unsafe { InvalidateRect(preview, null(), 0) };
+        }
     }
 
     fn update_rows(&self) {
@@ -326,7 +332,7 @@ impl ShortcutWindow {
             .is_ok_and(|s| s != settings);
         unsafe {
             EnableWindow(
-                child(view, RESET_ALL),
+                child(hwnd, RESET_ALL),
                 (can_reset && !self.saving.get()) as i32,
             )
         };
@@ -337,9 +343,9 @@ impl ShortcutWindow {
         if old != action {
             self.end_capture();
             self.selected.set(action);
+            self.update_row(action);
             unsafe {
                 InvalidateRect(self.row(old), null(), 0);
-                InvalidateRect(self.row(action), null(), 0);
             }
             self.set_status("");
         }
@@ -514,13 +520,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                         ui.end_capture();
                         ui.reveal_row(hwnd, lp as HWND);
                     }
+                } else if id == PREVIEW && event == STN_DBLCLK {
+                    ui.start_capture(ui.selected.get());
                 } else if id == RESET_ALL {
                     if event == BN_CLICKED {
                         SetFocus(ui.row(ui.selected.get()));
                         ui.submit(Command::ResetShortcuts);
                     } else if event == BN_SETFOCUS {
                         ui.end_capture();
-                        ui.reveal_row(hwnd, lp as HWND);
                     }
                 } else if id == IDCANCEL && lp == 0 {
                     if ui.capture.borrow().is_some() {
@@ -532,7 +539,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_DRAWITEM if lp != 0 => {
-                ui.draw(&*(lp as *const DRAWITEMSTRUCT));
+                let item = &*(lp as *const DRAWITEMSTRUCT);
+                match item.CtlID as i32 {
+                    PREVIEW => ui.draw_preview(item),
+                    RESET_ALL => ui.draw_reset_all(item),
+                    _ => ui.draw(item),
+                }
                 1
             }
             WM_ERASEBKGND => {
@@ -541,16 +553,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 let colors = ui.colors.get();
-                SetBkColor(wp as HDC, colors.background);
+                let status = GetDlgCtrlID(lp as HWND) == STATUS;
+                let surface = if status {
+                    ui.header_color()
+                } else {
+                    colors.background
+                };
+                SetBkColor(wp as HDC, surface);
                 SetTextColor(
                     wp as HDC,
-                    if GetDlgCtrlID(lp as HWND) == STATUS {
+                    if status {
                         colors.secondary
                     } else {
                         colors.text
                     },
                 );
-                SetDCBrushColor(wp as HDC, colors.background);
+                SetDCBrushColor(wp as HDC, surface);
                 GetStockObject(DC_BRUSH) as isize
             }
             WM_MOUSEWHEEL => {

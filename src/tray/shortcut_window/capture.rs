@@ -152,6 +152,13 @@ fn modifier(key: u16) -> u32 {
 }
 
 impl Keys {
+    pub(super) fn preview(&self) -> (u32, Option<u16>) {
+        self.chord.map_or_else(
+            || (self.modifiers(), None),
+            |chord| (chord.mods, Some(chord.key)),
+        )
+    }
+
     fn modifiers(&self) -> u32 {
         self.held.iter().fold(0, |mods, &key| mods | modifier(key))
     }

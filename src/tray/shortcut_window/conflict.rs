@@ -2,6 +2,7 @@ use super::*;
 
 const TEMPLATE: usize = 132;
 const BODY: i32 = 1010;
+const CHORD: i32 = 1011;
 
 impl ShortcutWindow {
     pub(super) fn ask_transfer(
@@ -31,20 +32,16 @@ impl ShortcutWindow {
         }
         self.transfer.set(Some(transfer));
         self.conflict.set(dialog);
-        let message = match previous {
-            BindingOwners::One(_) => format!(
-                "{} уже назначено действию {}. Перенести сочетание на «{}»? Прежнее действие останется без сочетания.",
-                chord.label(),
-                previous.labels(),
-                action.label()
-            ),
-            BindingOwners::Both(_, _) => format!(
-                "{} уже назначено действиям {}. Перенести сочетание на «{}»? Оба прежних действия останутся без сочетания.",
-                chord.label(),
-                previous.labels(),
-                action.label()
-            ),
+        caption(child(dialog, CHORD), &chord.label());
+        let verb = match previous {
+            BindingOwners::One(_) => "останется",
+            BindingOwners::Both(_, _) => "останутся",
         };
+        let message = format!(
+            "Назначить действию «{}»?\r\n{} {verb} без сочетания.",
+            action.label(),
+            previous.labels(),
+        );
         caption(child(dialog, BODY), &message);
         unsafe {
             let mut owner_rect = RECT::default();
@@ -175,37 +172,58 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let Some(fonts) = fonts.as_ref() else {
                     return 0;
                 };
+                let dc = item.hDC;
+                let r = item.rcItem;
+                paint::fill(dc, &r, colors.background, 0);
+                SetBkMode(dc, TRANSPARENT as i32);
+                if item.CtlID == CHORD as u32 {
+                    if let Some(Command::ReassignShortcut(_, chord, _)) = ui.transfer.get() {
+                        let label = chord.label();
+                        let font = if appearance::text_width(dc, fonts.display, &label)
+                            > r.right - r.left
+                        {
+                            fonts.heading
+                        } else {
+                            fonts.display
+                        };
+                        let ink = if colors.high_contrast {
+                            colors.text
+                        } else {
+                            colors.accent
+                        };
+                        paint::text(dc, r, &label, font, ink, DT_LEFT | DT_END_ELLIPSIS);
+                    }
+                    return 1;
+                }
                 let accept = item.CtlID == IDOK as u32;
                 let hot = item.itemState & (ODS_SELECTED | ODS_HOTLIGHT) != 0;
                 let focused =
                     item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0;
-                let dc = item.hDC;
-                let mut r = item.rcItem;
-                paint::fill(dc, &r, colors.background, 0);
-                let radius = ui.p(5);
-                let fill = if hot {
+                let fill = if accept && hot && !colors.high_contrast {
+                    appearance::blend(colors.accent, colors.on_accent, 8)
+                } else if hot {
                     colors.hover
                 } else if accept {
                     colors.accent
                 } else {
                     colors.control
                 };
-                let ink = if hot {
+                let ink = if hot && (!accept || colors.high_contrast) {
                     colors.hover_text
                 } else if accept {
                     colors.on_accent
                 } else {
                     colors.text
                 };
-                paint::fill(
+                let edge = if focused { colors.text } else { colors.border };
+                appearance::fill_outlined(
                     dc,
-                    &r,
-                    if focused { colors.text } else { colors.border },
-                    radius,
+                    appearance::inset(r, ui.p(1)),
+                    fill,
+                    edge,
+                    ui.p(6),
+                    ui.p(if focused { 2 } else { 1 }),
                 );
-                InflateRect(&mut r, -ui.p(1), -ui.p(1));
-                paint::fill(dc, &r, fill, radius - 1);
-                SetBkMode(dc, TRANSPARENT as i32);
                 paint::text(
                     dc,
                     r,

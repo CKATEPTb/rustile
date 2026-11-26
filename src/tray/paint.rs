@@ -132,6 +132,7 @@ pub(crate) struct Fonts {
     pub(crate) regular: HFONT,
     pub(crate) small: HFONT,
     pub(crate) heading: HFONT,
+    pub(super) display: HFONT,
     pub(super) symbol: HFONT,
 }
 
@@ -163,6 +164,7 @@ impl Fonts {
             regular: font(14, 400, w!("Segoe UI")),
             small: font(13, 400, w!("Segoe UI")),
             heading: font(16, 600, w!("Segoe UI")),
+            display: font(23, 600, w!("Segoe UI")),
             symbol: font(16, 400, w!("Segoe Fluent Icons")),
         }
     }
@@ -170,7 +172,13 @@ impl Fonts {
 
 impl Drop for Fonts {
     fn drop(&mut self) {
-        for font in [self.regular, self.small, self.heading, self.symbol] {
+        for font in [
+            self.regular,
+            self.small,
+            self.heading,
+            self.display,
+            self.symbol,
+        ] {
             if !font.is_null() {
                 unsafe { DeleteObject(font) };
             }
