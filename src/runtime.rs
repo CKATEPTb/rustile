@@ -9,6 +9,7 @@ mod instance;
 pub(crate) use instance::installation_lock;
 mod ipc;
 pub(crate) use ipc::{InstallOwner, owner_image, quit_owner};
+mod native_navigation;
 mod shortcuts;
 pub(crate) mod taskbar_attention;
 #[cfg(test)]
@@ -121,6 +122,57 @@ struct QueuedStep {
 struct CliArrival {
     client: ipc::Request,
     desktop: DesktopId,
+}
+
+struct NativeSwitch {
+    navigation: native_navigation::Navigation,
+    client: Option<ipc::Request>,
+    timer: MessageTimer,
+}
+
+impl NativeSwitch {
+    fn start(destination: DesktopDestination, client: Option<ipc::Request>) -> Option<Self> {
+        let mut timer = MessageTimer::default();
+        if let Some(navigation) = native_navigation::Navigation::begin(destination)
+            && timer.schedule(FOCUS_SETTLE_MS)
+        {
+            shortcuts::watch_desktop_focus();
+            return Some(Self {
+                navigation,
+                client,
+                timer,
+            });
+        }
+        if let Some(client) = client {
+            client.respond(Err("Windows could not start the desktop switch.".into()));
+        }
+        None
+    }
+
+    fn finished(&mut self, message: &MSG) -> bool {
+        if !self.timer.matches(message) {
+            return false;
+        }
+        if !shortcuts::desktop_focus_uninterrupted() {
+            if let Some(client) = self.client.take() {
+                client.respond(Err("Desktop navigation was interrupted.".into()));
+            }
+            self.navigation.stop_after_current_step();
+        } else if self.client.as_ref().is_some_and(ipc::Request::expired) {
+            self.navigation.stop_after_current_step();
+        }
+        let result = match self.navigation.poll() {
+            native_navigation::Progress::Pending => return false,
+            native_navigation::Progress::Arrived(index) => Ok(index.to_string()),
+            native_navigation::Progress::Failed => {
+                Err("Windows did not confirm the desktop switch.".into())
+            }
+        };
+        if let Some(client) = self.client.take() {
+            client.respond(result);
+        }
+        true
+    }
 }
 
 // A successful switch RPC can precede Explorer's active-desktop change.
@@ -654,15 +706,20 @@ fn pump(
     let mut opening_timer = MessageTimer::default();
     let mut inventory_timer = MessageTimer::default();
     let mut workspaces = dynamic_desktops::Workspaces::new();
+    shortcuts::set_desktops_available(workspaces.available());
     let mut focus_timer = MessageTimer::default();
     let mut attention = taskbar_attention::TaskbarAttention::default();
     let mut attention_timer = MessageTimer::default();
     let mut navigation: VecDeque<QueuedStep> = VecDeque::new();
+    let mut native_switch: Option<NativeSwitch> = None;
     let mut cli_arrival = None;
     let mut following: Option<Rc<TransferIdentity>> = None;
-    let mut desktop_watch = None;
+    let mut desktop_watch = if workspaces.supported || native_navigation::snapshot().is_some() {
+        desktop_watch::DesktopWatch::start()
+    } else {
+        None
+    };
     if workspaces.supported {
-        desktop_watch = desktop_watch::DesktopWatch::start();
         inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
     }
     let mut desktop_focus = DesktopFocus {
@@ -793,11 +850,12 @@ fn pump(
             // The source can already look empty before Explorer exposes the
             // moved view on the destination. Let the bounded handoff finish
             // before the spare-desktop policy can remove or reorder either.
-            if following.is_some() && desktop_focus.pending.is_some() {
+            if native_switch.is_some() || (following.is_some() && desktop_focus.pending.is_some()) {
                 inventory_timer.schedule(dynamic_desktops::EVENT_BATCH_MS);
             } else if let Some(delay) = workspaces.reconcile() {
                 inventory_timer.schedule(delay);
             }
+            shortcuts::set_desktops_available(workspaces.available());
             if workspaces.supported && desktop_watch.is_none() {
                 desktop_watch = desktop_watch::DesktopWatch::start();
             }
@@ -839,6 +897,8 @@ fn pump(
         {
             let actual = if workspaces.available() {
                 workspaces.current_desktop()
+            } else if watching_desktops || native_switch.is_some() {
+                native_navigation::snapshot().map(|(current, _)| current)
             } else {
                 manager.layout_desktop()
             };
@@ -851,8 +911,12 @@ fn pump(
             if external {
                 // Task View or another program selected a different desktop.
                 manager.begin_desktop_focus();
-                shortcuts::watch_desktop_focus();
-                navigation.clear();
+                // Native jumps produce an ordinary Shell switch at every
+                // intermediate desktop. Their registry checks own the sequence.
+                if native_switch.is_none() {
+                    shortcuts::watch_desktop_focus();
+                    navigation.clear();
+                }
                 if destination
                     .as_ref()
                     .is_some_and(|step| step.window.is_some())
@@ -966,6 +1030,11 @@ fn pump(
                 shortcut_command = Some((Command::Toggle, ticket));
             } else if let Some(destination) = destination {
                 if matches!(destination.destination, DesktopDestination::Number(_)) {
+                    if let Some(active) = &mut native_switch
+                        && active.client.is_none()
+                    {
+                        active.navigation.stop_after_current_step();
+                    }
                     // A direct jump supersedes queued navigation. Preserve any
                     // window moves and the steps on which their destinations depend.
                     while navigation
@@ -1028,7 +1097,14 @@ fn pump(
         }
         // Rapid arrows or wheel detents can precede Explorer's first arrival.
         // Resolve each relative step from the last confirmed desktop.
+        if native_switch
+            .as_mut()
+            .is_some_and(|active| active.finished(&message))
+        {
+            native_switch = None;
+        }
         while !desktop_focus.awaiting_switch()
+            && native_switch.is_none()
             && cli_arrival.is_none()
             && !following.as_ref().is_some_and(|window| {
                 navigation
@@ -1045,6 +1121,13 @@ fn pump(
                 explicit_window,
             }) = navigation.pop_front()
         {
+            if client.as_ref().is_some_and(ipc::Request::expired) {
+                continue;
+            }
+            if !workspaces.available() && window.is_none() {
+                native_switch = NativeSwitch::start(destination, client);
+                continue;
+            }
             let valid_target = |window: &TransferIdentity, from| {
                 window.matches()
                     && if explicit_window {
@@ -1054,9 +1137,6 @@ fn pump(
                     }
             };
             let client = if let Some(request) = client {
-                if request.expired() {
-                    continue;
-                }
                 if let Some(window) = &window
                     && !workspaces
                         .current_desktop()

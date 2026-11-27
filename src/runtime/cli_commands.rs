@@ -105,6 +105,9 @@ fn window_command(
     let id = hwnd.unwrap_or_else(native::foreground);
     let still_target = || hwnd.is_some() || native::foreground() == id;
     if let WindowAction::ToDesktop(destination) = action {
+        if !workspaces.available() && native_navigation::snapshot().is_some() {
+            return Err("Moving windows requires a compatible Explorer desktop interface.".into());
+        }
         let current = workspaces
             .current_desktop()
             .ok_or_else(|| desktop_error(workspaces))?;
@@ -216,7 +219,7 @@ pub(super) fn execute(
             desktop_table(current, &order)
         }
         CliCommand::DesktopGo(destination) => {
-            if !workspaces.available() {
+            if !workspaces.available() && native_navigation::snapshot().is_none() {
                 return Err(desktop_error(workspaces));
             }
             return Ok(Outcome::Navigate {

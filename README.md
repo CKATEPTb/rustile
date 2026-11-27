@@ -54,11 +54,13 @@ In the desktop shortcuts, `↑` also goes back and `↓` goes forward. If you pa
 
 ## Windows virtual desktops
 
-Switch desktops with `Win+Ctrl+←/→` or jump directly with `Win+1…0`. Both shortcuts switch without the Windows slide animation. Each desktop retains its window positions and tile sizes when you switch away. Transferring a window also switches to its destination desktop. Desktop numbers follow the order in Task View.
+Switch desktops with `Win+Ctrl+←/→` or jump directly with `Win+1…0`. Desktop numbers follow the order in Task View. Each desktop retains its window positions and tile sizes when you switch away.
 
 A lone window stays put when you try to move it left from the first desktop or right from the last occupied desktop. You can still send it to a specific desktop by number.
 
-Rustile keeps a spare empty desktop at the end of Task View. Open a window there and the next empty desktop appears. A desktop with minimized windows still counts as occupied. If automatic desktop management is unavailable on your system, you can switch desktops with `Win+Tab`.
+With a compatible Explorer interface, Rustile switches without the Windows slide animation, follows transferred windows and keeps a spare empty desktop at the end of Task View. Open a window there and the next empty desktop appears. A desktop with minimized windows still counts as occupied.
+
+If the private Explorer interface is unavailable, Windows handles its standard `Win+Ctrl+←/→` shortcuts. When Explorer reports the current desktop and Task View order, numbered shortcuts and `rustile desktop N` can still reach an existing desktop. Rustile waits for you to release the modifier keys, then switches one desktop at a time. In this mode, use Task View (`Win+Tab`) to create desktops or move windows between them.
 
 ## Control your windows from PowerShell
 

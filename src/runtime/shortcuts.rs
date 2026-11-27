@@ -34,6 +34,7 @@ use crate::settings::{Chord, Settings, Shortcut};
 static TRANSFER_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
 static DESKTOP_FOCUS_WATCH: AtomicBool = AtomicBool::new(false);
 static DESKTOP_GESTURE: AtomicUsize = AtomicUsize::new(0);
+pub(super) const NATIVE_DESKTOP_INPUT_TAG: usize = u32::from_be_bytes(*b"RsVD") as usize;
 
 pub(super) fn desktop_gesture_generation() -> usize {
     DESKTOP_GESTURE.load(Ordering::Acquire)
@@ -135,6 +136,33 @@ impl KeyRoutes {
             mods,
             predict_resize: known_tile,
         })
+    }
+
+    fn keyboard_binding(
+        self,
+        key: u16,
+        state: Snapshot,
+        pending: Pending,
+        mods: u32,
+        foreground: impl FnOnce() -> isize,
+    ) -> Option<BoundCommand> {
+        let binding = self.binding(state, pending, mods, foreground)?;
+        // Explorer can perform this exact action itself when its private
+        // interface is unavailable. A remapped chord must keep its meaning.
+        (state.desktops_available
+            || native_desktop_command(Chord { key, mods }) != Some(binding.id))
+        .then_some(binding)
+    }
+}
+
+fn native_desktop_command(chord: Chord) -> Option<i32> {
+    if chord.mods != MOD_CONTROL | MOD_WIN {
+        return None;
+    }
+    match chord.key {
+        VK_LEFT => Some(DESKTOP_PREVIOUS),
+        VK_RIGHT => Some(DESKTOP_NEXT),
+        _ => None,
     }
 }
 
@@ -329,6 +357,7 @@ struct Snapshot {
     mode: Mode,
     focus_epoch: usize,
     handled: usize,
+    desktops_available: bool,
 }
 
 struct Routing {
@@ -345,6 +374,7 @@ static ROUTING: LazyLock<Mutex<Routing>> = LazyLock::new(|| {
             mode: Mode::Normal,
             focus_epoch: 0,
             handled: 0,
+            desktops_available: false,
         },
         // Global shortcuts can fire before the manager has sampled a window.
         // Arm them only when the user's actual settings have been loaded.
@@ -365,6 +395,11 @@ pub(super) fn update(target: Option<ShortcutTarget>, mode: Mode, handled: usize)
     if handled != 0 {
         state.handled = handled;
     }
+}
+
+pub(super) fn set_desktops_available(available: bool) {
+    let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+    routing.focus.desktops_available = available;
 }
 
 // A following key can arrive before the manager has even opened its HUD.
@@ -518,9 +553,10 @@ fn route_snapshot(slot: usize) -> (Snapshot, Option<KeyRoutes>, usize) {
     (routing.focus, routing.keys.get(slot), routing.revision)
 }
 
-fn bound_command(slot: usize, pending: Pending) -> Option<BoundCommand> {
-    let (state, key, _) = route_snapshot(slot);
-    key?.binding(
+fn bound_command(key: u16, pending: Pending) -> Option<BoundCommand> {
+    let (state, row, _) = route_snapshot(usize::from(key));
+    row?.keyboard_binding(
+        key,
         state,
         pending,
         modifiers().0,
@@ -532,6 +568,11 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
     if code == HC_ACTION as i32 {
         // Read only the virtual key. No translations, strings or input logs.
         let event = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
+        // Send our native desktop steps straight to Windows, including their
+        // modifier events. Physical presses can be held across the whole step.
+        if event.dwExtraInfo == NATIVE_DESKTOP_INPUT_TAG && event.flags & LLKHF_INJECTED != 0 {
+            return unsafe { CallNextHookEx(null_mut(), code, message, data) };
+        }
         let vk = event.vkCode;
         let down = matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let modifier = matches!(
@@ -570,7 +611,7 @@ unsafe extern "system" fn on_key(code: i32, message: usize, data: isize) -> isiz
             }
             let pending = PENDING.get();
             let binding = if down && previous != Press::Passed && Chord::supports_key(vk.into()) {
-                bound_command(slot, pending)
+                bound_command(vk.into(), pending)
             } else {
                 None
             };
@@ -772,6 +813,7 @@ impl Drop for Hook {
         let mut routing = ROUTING.lock().unwrap_or_else(|e| e.into_inner());
         routing.registered.configure(&Routes::EMPTY);
         routing.keys = Routes::EMPTY;
+        routing.focus.desktops_available = false;
     }
 }
 
@@ -801,6 +843,7 @@ mod tests {
                     mode: Mode::Normal,
                     focus_epoch: 1,
                     handled: 0,
+                    desktops_available: true,
                 },
                 pending: Pending::NEW,
             }
@@ -836,9 +879,9 @@ mod tests {
         ) -> Action {
             let slot = usize::from(key);
             let routes = Routes::new(&self.settings);
-            let binding = routes
-                .get(slot)
-                .and_then(|route| route.binding(self.state, self.pending, mods, || active));
+            let binding = routes.get(slot).and_then(|route| {
+                route.keyboard_binding(key, self.state, self.pending, mods, || active)
+            });
             let action = self.held[slot].route(down, binding);
             if let Action::Command(_) = action
                 && let Some(next) = binding.and_then(|b| b.transition(self.pending))
@@ -847,6 +890,68 @@ mod tests {
             }
             action
         }
+    }
+
+    #[test]
+    fn generated_desktop_steps_leave_held_physical_arrows_alone() {
+        let slot = usize::from(VK_LEFT);
+        HELD.with(|held| held[slot].set(Press::Consumed));
+        let mut event = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_LEFT),
+            flags: LLKHF_INJECTED | LLKHF_UP,
+            dwExtraInfo: NATIVE_DESKTOP_INPUT_TAG,
+            ..Default::default()
+        };
+        let release = |event: &KBDLLHOOKSTRUCT| unsafe {
+            on_key(
+                HC_ACTION as i32,
+                WM_KEYUP as usize,
+                std::ptr::from_ref(event) as isize,
+            )
+        };
+        release(&event);
+        assert!(HELD.with(|held| held[slot].get() == Press::Consumed));
+        event.flags = LLKHF_UP;
+        assert_eq!(release(&event), 1);
+        assert!(HELD.with(|held| held[slot].get() == Press::Up));
+    }
+
+    #[test]
+    fn native_arrows_follow_shell_availability_without_changing_held_or_remapped_keys() {
+        let mods = MOD_CONTROL | MOD_WIN;
+        for mode in [Mode::Normal, Mode::Resize] {
+            let mut keyboard = Keyboard::new();
+            keyboard.state.mode = mode;
+            for (key, command) in [(VK_LEFT, DESKTOP_PREVIOUS), (VK_RIGHT, DESKTOP_NEXT)] {
+                keyboard.state.desktops_available = false;
+                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
+                keyboard.state.desktops_available = true;
+                assert_eq!(keyboard.key(key, true, mods), Action::Pass);
+                assert_eq!(keyboard.key(key, false, mods), Action::Pass);
+                assert_eq!(keyboard.key(key, true, mods), Action::Command(command));
+                keyboard.state.desktops_available = false;
+                assert_eq!(keyboard.key(key, true, mods), Action::Consume);
+                assert_eq!(keyboard.key(key, false, mods), Action::Consume);
+            }
+        }
+
+        let mut keyboard = Keyboard::new();
+        keyboard.state.desktops_available = false;
+        keyboard.assign(Shortcut::PreviousDesktop, MOD_ALT, VK_F8);
+        keyboard.assign(Shortcut::NextDesktop, mods, VK_LEFT);
+        keyboard.assign(Shortcut::FocusRight, mods, VK_RIGHT);
+        assert_eq!(
+            keyboard.key(VK_LEFT, true, mods),
+            Action::Command(DESKTOP_NEXT)
+        );
+        assert_eq!(
+            keyboard.key(VK_RIGHT, true, mods),
+            Action::Command(FOCUS + 1)
+        );
+        assert_eq!(
+            keyboard.key(VK_1, true, MOD_WIN),
+            Action::Command(DESKTOP_FIRST)
+        );
     }
 
     #[test]

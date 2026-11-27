@@ -1,14 +1,12 @@
 //! Deliver Rustile desktop commands via WM_HOTKEY when the chord is available.
-//! The Windows desktop arrows are captured directly by our keyboard hook.
+//! The keyboard hook handles Windows' native desktop arrows.
 
 use super::*;
 use std::collections::VecDeque;
 
 fn can_register(chord: Chord, command: i32) -> bool {
     // Letting these physical keys through can start Explorer's slide animation.
-    let desktop_arrow =
-        chord.mods == MOD_CONTROL | MOD_WIN && matches!(chord.key, VK_LEFT | VK_RIGHT);
-    !desktop_arrow
+    native_desktop_command(chord).is_none()
         && chord.key != VK_F12
         && (DesktopDestination::from_command(command).is_some() || is_desktop_move(command))
 }
@@ -221,6 +219,7 @@ mod tests {
             target: None,
             focus_epoch: 0,
             handled: 0,
+            desktops_available: true,
         };
         for (key, action, id) in [
             (VK_LEFT, Shortcut::PreviousDesktop, DESKTOP_PREVIOUS),

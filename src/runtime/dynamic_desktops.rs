@@ -342,7 +342,9 @@ impl Workspaces {
     }
 
     pub(super) fn snapshot(&self) -> Option<(DesktopId, Vec<DesktopId>)> {
-        let shell = self.shell.as_ref()?;
+        let Some(shell) = self.shell.as_ref() else {
+            return super::native_navigation::snapshot();
+        };
         let current = shell.current()?;
         let order = shell.list()?;
         (order.contains(&current) && shell.current()? == current).then_some((current, order))
