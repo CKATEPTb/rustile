@@ -6,11 +6,12 @@ use std::cell::OnceCell;
 use std::collections::HashSet;
 
 use windows::core::{IUnknown, Interface};
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, TYPE_E_ELEMENTNOTFOUND};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH, TYPE_E_ELEMENTNOTFOUND};
 use windows_sys::Win32::Graphics::Dwm::DWM_CLOAKED_SHELL;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
+use windows_sys::Win32::UI::Shell::{CSIDL_SYSTEM, SHGetFolderPathW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW, GetWindowLongW,
     IsIconic, IsWindow, IsWindowVisible, WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED,
@@ -198,15 +199,20 @@ fn window_desktop(
             ) {
                 return Ok(None);
             }
-            // Explorer can retain its own cloaked frame after unregistering
-            // its application view. Check both Shell APIs for explicit absence.
+            // Explorer islands and retired application frames can outlive
+            // their Shell views. Require explicit absence from both APIs.
             if view_desktop == Err(TYPE_E_ELEMENTNOTFOUND)
-                && orphan_frame_candidate(
+                && unassigned_shell_window(
                     class_name(hwnd).as_deref(),
                     pid(hwnd as Id),
                     pid(service.shell as Id),
                     minimized,
                     cloak_flags(hwnd as Id),
+                    |owner| {
+                        process_image_path(owner)
+                            .as_deref()
+                            .is_some_and(system_frame_host)
+                    },
                 )
                 && views
                     .get_or_init(ApplicationViews::connect)
@@ -239,18 +245,47 @@ fn unassigned_overlay(desktop: Result<DesktopId, HRESULT>, extended: u32, minimi
         && extended & (OVERLAY | WS_EX_APPWINDOW) == OVERLAY
 }
 
-fn orphan_frame_candidate(
+fn unassigned_shell_window(
     class: Option<&str>,
     process: u32,
     shell_process: u32,
     minimized: bool,
     cloak: Option<u32>,
+    frame_host: impl FnOnce(u32) -> bool,
 ) -> bool {
-    class == Some("ApplicationFrameWindow")
-        && process != 0
-        && process == shell_process
-        && !minimized
-        && cloak == Some(DWM_CLOAKED_SHELL)
+    if process == 0 || minimized {
+        return false;
+    }
+    match class {
+        Some("XamlExplorerHostIslandWindow_WASDK") => process == shell_process,
+        Some("ApplicationFrameWindow") => {
+            cloak == Some(DWM_CLOAKED_SHELL) && (process == shell_process || frame_host(process))
+        }
+        _ => false,
+    }
+}
+
+fn system_frame_host(path: &str) -> bool {
+    let Some((directory, image)) = path.rsplit_once('\\') else {
+        return false;
+    };
+    if !image.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+        return false;
+    }
+    let mut system = [0u16; MAX_PATH as usize];
+    let hr = unsafe {
+        SHGetFolderPathW(
+            std::ptr::null_mut(),
+            CSIDL_SYSTEM as i32,
+            std::ptr::null_mut(),
+            0,
+            system.as_mut_ptr(),
+        )
+    };
+    hr == 0
+        && system.iter().position(|&c| c == 0).is_some_and(|end| {
+            directory.eq_ignore_ascii_case(&String::from_utf16_lossy(&system[..end]))
+        })
 }
 
 fn class_name(hwnd: HWND) -> Option<String> {
@@ -346,19 +381,22 @@ fn task_style(style: u32, extended: u32, class: &str) -> bool {
     )
 }
 
-fn core_window_shell_host(process_id: u32) -> bool {
+fn process_image_path(process_id: u32) -> Option<String> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process.is_null() {
-        return false;
+        return None;
     }
     let mut path = [0u16; 1024];
     let mut len = path.len() as u32;
     let success = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len) };
     unsafe { CloseHandle(process) };
-    if success == 0 {
+    (success != 0).then(|| String::from_utf16_lossy(&path[..len as usize]))
+}
+
+fn core_window_shell_host(process_id: u32) -> bool {
+    let Some(path) = process_image_path(process_id) else {
         return false;
-    }
-    let path = String::from_utf16_lossy(&path[..len as usize]);
+    };
     let image = path.rsplit('\\').next().unwrap_or_default();
     [
         "TextInputHost.exe",
@@ -397,22 +435,26 @@ mod tests {
     }
 
     #[test]
-    fn only_shell_owned_cloaked_unminimized_frames_can_be_orphaned() {
+    fn only_identified_shell_windows_can_lack_a_view() {
+        let candidate = |class, process, minimized, cloak| {
+            unassigned_shell_window(class, process, 9, minimized, cloak, |pid| pid == 10)
+        };
         let frame = Some("ApplicationFrameWindow");
         let hidden = Some(DWM_CLOAKED_SHELL);
-        assert!(orphan_frame_candidate(frame, 9, 9, false, hidden));
-        assert!(!orphan_frame_candidate(frame, 8, 9, false, hidden));
-        assert!(!orphan_frame_candidate(frame, 0, 0, false, hidden));
-        assert!(!orphan_frame_candidate(frame, 9, 9, true, hidden));
-        assert!(!orphan_frame_candidate(frame, 9, 9, false, Some(0)));
-        assert!(!orphan_frame_candidate(frame, 9, 9, false, None));
-        assert!(!orphan_frame_candidate(
-            Some("CabinetWClass"),
-            9,
-            9,
-            false,
-            hidden
-        ));
+        for owner in [9, 10] {
+            assert!(candidate(frame, owner, false, hidden));
+            assert!(!candidate(frame, owner, true, hidden));
+            assert!(!candidate(frame, owner, false, Some(0)));
+            assert!(!candidate(frame, owner, false, None));
+        }
+        assert!(!candidate(frame, 8, false, hidden));
+        assert!(!candidate(frame, 0, false, hidden));
+        assert!(!candidate(Some("CabinetWClass"), 9, false, hidden));
+        let island = Some("XamlExplorerHostIslandWindow_WASDK");
+        assert!(candidate(island, 9, false, Some(0)));
+        assert!(!candidate(island, 10, false, Some(0)));
+        assert!(!candidate(island, 9, true, Some(0)));
+        assert!(!system_frame_host(r"C:\Apps\ApplicationFrameHost.exe"));
     }
 
     #[test]
