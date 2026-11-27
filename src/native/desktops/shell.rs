@@ -1,11 +1,13 @@
 //! Private Explorer COM interfaces for creating, ordering and switching desktops.
-//! Register a build in `supported_abi` only after checking the interface IDs
-//! and vtable slots. A failed mutation may already have reached Explorer; the
-//! caller must observe the new state before deciding whether to retry.
+//! Match the Shell DLL's layout and query its interface IDs before calling private
+//! methods. A failed mutation can reach Explorer, so observe the result before retrying.
+
+mod image_version;
+use image_version::installed_layout;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::ptr::{null, null_mut};
+use std::ptr::null;
 
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, CoAllowSetForegroundWindow, CoCreateInstance, IServiceProvider,
@@ -13,14 +15,12 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::Common::IObjectArray;
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
 use windows_sys::Win32::Foundation::{
-    E_UNEXPECTED, ERROR_SUCCESS, HWND, RPC_E_CHANGED_MODE, TYPE_E_ELEMENTNOTFOUND,
+    E_NOINTERFACE, E_UNEXPECTED, HWND, RPC_E_CHANGED_MODE, TYPE_E_ELEMENTNOTFOUND,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
-};
 use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(test)]
 use windows_sys::core::w;
 
 use super::{DesktopId, Service, object_name, shell_window};
@@ -33,16 +33,23 @@ fn shell_provider() -> Option<IServiceProvider> {
     unsafe { CoCreateInstance(&IMMERSIVE_SHELL, None, CLSCTX_LOCAL_SERVER).ok() }
 }
 
-// Explorer's private ABI for 26100.2605+ and 26200, as defined by
-// VirtualDesktopAccessor (winvd 0.0.49, src/interfaces.rs). Leave unused
-// vtable slots in order. Never dispatch this layout on an unverified build.
+// Leave unused entries in order to preserve Explorer's private vtable slots.
 #[repr(transparent)]
 #[derive(Clone)]
 struct ShellDesktop(IUnknown);
 
-unsafe impl Interface for ShellDesktop {
+// The manager returns its native desktop interface. Both published 23H2
+// desktop IIDs and the 24H2 interface have the same prefix through GetId.
+const DESKTOP_IID: u128 = 0x3f07f4be_b107_441a_af0f_39d82529072c;
+const DESKTOP_23H2_IID: u128 = 0xa871910e_6cc0_4e65_8b9b_458ce9115e30;
+
+#[repr(transparent)]
+#[derive(Clone)]
+struct IndexedDesktop<const ID: u128>(ShellDesktop);
+
+unsafe impl<const ID: u128> Interface for IndexedDesktop<ID> {
     type Vtable = DesktopVtable;
-    const IID: GUID = GUID::from_u128(0x3f07f4be_b107_441a_af0f_39d82529072c);
+    const IID: GUID = GUID::from_u128(ID);
 }
 
 type Out<T> = unsafe extern "system" fn(*mut c_void, *mut Option<T>) -> HRESULT;
@@ -99,10 +106,13 @@ impl ApplicationView {
 
 impl ApplicationViews {
     pub(super) fn connect() -> Option<Self> {
-        if !DesktopShell::supported() {
-            return None;
+        let layout = interactive_layout()?;
+        let provider = shell_provider()?;
+        if layout == ManagerLayout::Legacy {
+            // Earlier updates in the same binary family used other interfaces.
+            ShellManager::connect(&provider, layout)?;
         }
-        unsafe { shell_provider()?.QueryService(&Self::IID).ok() }
+        unsafe { provider.QueryService(&Self::IID).ok() }
     }
 
     pub(super) fn for_window(&self, hwnd: HWND) -> Result<ApplicationView, HRESULT> {
@@ -148,7 +158,9 @@ struct DesktopVtable {
 impl ShellDesktop {
     fn id(&self) -> Option<DesktopId> {
         let mut id = GUID::zeroed();
-        unsafe { (self.vtable().get_id)(self.as_raw(), &mut id) }
+        // Both accepted desktop interfaces return the ID in slot 4.
+        let table = unsafe { self.0.assume_vtable::<IndexedDesktop<DESKTOP_IID>>() };
+        unsafe { (table.get_id)(self.0.as_raw(), &mut id) }
             .ok()
             .ok()?;
         (id.to_u128() != 0).then_some(DesktopId(id.to_u128()))
@@ -156,21 +168,50 @@ impl ShellDesktop {
 }
 
 fn desktop_id_at(order: &IObjectArray, index: u32) -> Option<DesktopId> {
-    unsafe { order.GetAt::<ShellDesktop>(index) }.ok()?.id()
+    let desktop = match unsafe { order.GetAt::<IndexedDesktop<DESKTOP_IID>>(index) } {
+        Ok(desktop) => desktop.0,
+        Err(error) if error.code().0 == E_NOINTERFACE => {
+            unsafe { order.GetAt::<IndexedDesktop<DESKTOP_23H2_IID>>(index) }
+                .ok()?
+                .0
+        }
+        Err(_) => return None,
+    };
+    desktop.id()
+}
+
+// 22H2/23H2 used both manager IIDs with the same slots. 24H2 kept the
+// second IID but inserted SwitchDesktopAndMoveForegroundView after SwitchDesktop.
+// Compare VirtualDesktopAccessor's 2023-11-10, 2024-01-25 and 2024-12-16 tags.
+const EARLY_MANAGER_IID: u128 = 0xa3175f2d_239c_4bd2_8aa0_eeba8b0b138e;
+const MANAGER_IID: u128 = 0x53f5ca0b_158f_4124_900c_057158060b27;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagerLayout {
+    Legacy,
+    Modern,
 }
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct ShellManager(IUnknown);
+struct ManagerInterface<const ID: u128, const EXTRA: usize>(IUnknown);
 
-unsafe impl Interface for ShellManager {
-    type Vtable = ManagerVtable;
-    const IID: GUID = GUID::from_u128(0x53f5ca0b_158f_4124_900c_057158060b27);
+unsafe impl<const ID: u128, const EXTRA: usize> Interface for ManagerInterface<ID, EXTRA> {
+    type Vtable = ManagerVtable<EXTRA>;
+    const IID: GUID = GUID::from_u128(ID);
 }
 
 #[repr(C)]
-struct ManagerVtable {
+struct ManagerVtable<const EXTRA: usize> {
     base: IUnknown_Vtbl,
+    navigation: ManagerNavigation,
+    switch_and_move_foreground: [usize; EXTRA],
+    desktops: ManagerDesktops,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ManagerNavigation {
     get_count: usize,
     move_view: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
     can_move_view: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
@@ -178,37 +219,97 @@ struct ManagerVtable {
     list: Out<IObjectArray>,
     adjacent: usize,
     switch: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
-    switch_and_move_foreground: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ManagerDesktops {
     create: Out<ShellDesktop>,
     move_desktop: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> HRESULT,
     remove: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
     find: unsafe extern "system" fn(*mut c_void, *const GUID, *mut Option<ShellDesktop>) -> HRESULT,
 }
 
+struct ShellManager {
+    interface: IUnknown,
+    navigation: ManagerNavigation,
+    desktops: ManagerDesktops,
+}
+
 impl ShellManager {
+    fn connect(provider: &IServiceProvider, layout: ManagerLayout) -> Option<Self> {
+        fn query<const ID: u128, const EXTRA: usize>(
+            provider: &IServiceProvider,
+        ) -> windows::core::Result<ShellManager> {
+            let interface: ManagerInterface<ID, EXTRA> =
+                unsafe { provider.QueryService(&DESKTOP_SERVICE)? };
+            Ok(ShellManager {
+                navigation: interface.vtable().navigation,
+                desktops: interface.vtable().desktops,
+                interface: interface.0,
+            })
+        }
+
+        match layout {
+            ManagerLayout::Modern => query::<MANAGER_IID, 1>(provider),
+            ManagerLayout::Legacy => query::<MANAGER_IID, 0>(provider).or_else(|error| {
+                if error.code().0 == E_NOINTERFACE {
+                    query::<EARLY_MANAGER_IID, 0>(provider)
+                } else {
+                    Err(error)
+                }
+            }),
+        }
+        .ok()
+    }
+
     fn object<T>(&self, method: Out<T>) -> Option<T> {
         let mut result = None;
-        unsafe { method(self.as_raw(), &mut result) }.ok().ok()?;
+        unsafe { method(self.interface.as_raw(), &mut result) }
+            .ok()
+            .ok()?;
         result
     }
 
     fn find(&self, id: DesktopId) -> Option<ShellDesktop> {
         let mut desktop = None;
-        unsafe { (self.vtable().find)(self.as_raw(), &GUID::from_u128(id.0), &mut desktop) }
-            .ok()
-            .ok()?;
+        unsafe {
+            (self.desktops.find)(
+                self.interface.as_raw(),
+                &GUID::from_u128(id.0),
+                &mut desktop,
+            )
+        }
+        .ok()
+        .ok()?;
         desktop
     }
 
     fn current(&self) -> Option<DesktopId> {
-        self.object(self.vtable().current)?.id()
+        self.object(self.navigation.current)?.id()
+    }
+
+    fn list(&self) -> Option<Vec<DesktopId>> {
+        let array = self.object(self.navigation.list)?;
+        let count = unsafe { array.GetCount() }.ok()?;
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let id = desktop_id_at(&array, index)?;
+            if ids.contains(&id) {
+                return None;
+            }
+            ids.push(id);
+        }
+        (!ids.is_empty()).then_some(ids)
     }
 
     fn can_move_view(&self, hwnd: HWND, view: &ApplicationView, from: DesktopId) -> Option<bool> {
         let mut movable = 0;
-        unsafe { (self.vtable().can_move_view)(self.as_raw(), view.as_raw(), &mut movable) }
-            .ok()
-            .ok()?;
+        unsafe {
+            (self.navigation.can_move_view)(self.interface.as_raw(), view.as_raw(), &mut movable)
+        }
+        .ok()
+        .ok()?;
         // Pinned windows and apps have special GUIDs and never match the source.
         Some(
             movable != 0
@@ -218,7 +319,7 @@ impl ShellManager {
     }
 
     fn move_desktop(&self, desktop: &ShellDesktop, index: u32) -> Option<()> {
-        unsafe { (self.vtable().move_desktop)(self.as_raw(), desktop.as_raw(), index) }
+        unsafe { (self.desktops.move_desktop)(self.interface.as_raw(), desktop.0.as_raw(), index) }
             .ok()
             .ok()
     }
@@ -241,45 +342,13 @@ impl Drop for Apartment {
     }
 }
 
-fn supported_abi(build: u32, revision: u32) -> bool {
-    (build == 26100 && revision >= 2605) || build == 26200
-}
-
-fn supports_installed_shell() -> bool {
-    let version = w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
-    let mut build = [0u16; 16];
-    let mut bytes = size_of_val(&build) as u32;
-    let mut revision = 0u32;
-    let mut revision_bytes = size_of_val(&revision) as u32;
-    unsafe {
-        if RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            version,
-            w!("CurrentBuildNumber"),
-            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
-            null_mut(),
-            build.as_mut_ptr().cast(),
-            &mut bytes,
-        ) != ERROR_SUCCESS
-            || RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                version,
-                w!("UBR"),
-                RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
-                null_mut(),
-                (&raw mut revision).cast(),
-                &mut revision_bytes,
-            ) != ERROR_SUCCESS
-        {
-            return false;
-        }
+fn interactive_layout() -> Option<ManagerLayout> {
+    let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+    if object_name(desktop).ok()?.eq_ignore_ascii_case("Default") {
+        installed_layout()
+    } else {
+        None
     }
-    let build = &build[..bytes as usize / 2];
-    build
-        .strip_suffix(&[0])
-        .and_then(|text| String::from_utf16(text).ok())
-        .and_then(|build| build.parse().ok())
-        .is_some_and(|build| supported_abi(build, revision))
 }
 
 struct ShellConnection {
@@ -302,9 +371,7 @@ pub(crate) struct DesktopShell {
 
 impl DesktopShell {
     pub(crate) fn supported() -> bool {
-        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
-        object_name(desktop).is_ok_and(|name| name.eq_ignore_ascii_case("Default"))
-            && supports_installed_shell()
+        interactive_layout().is_some()
     }
 
     pub(crate) fn connect() -> Option<Self> {
@@ -315,7 +382,7 @@ impl DesktopShell {
             service: RefCell::default(),
             _apartment: Apartment::enter()?,
         };
-        shell.current()?;
+        shell.with_connection(|_| Some(()))?;
         Some(shell)
     }
 
@@ -333,7 +400,13 @@ impl DesktopShell {
         if service.as_ref().is_none_or(|shell| shell.tray != tray) {
             service.take();
             let provider = shell_provider()?;
-            let manager = unsafe { provider.QueryService(&DESKTOP_SERVICE) }.ok()?;
+            let manager = ShellManager::connect(&provider, installed_layout()?)?;
+            // Confirm that Explorer exposes typed desktop objects in Task View
+            // order before enabling operations on this connection.
+            let current = manager.current()?;
+            if !manager.list()?.contains(&current) {
+                return None;
+            }
             *service = Some(ShellConnection {
                 tray,
                 provider,
@@ -350,19 +423,7 @@ impl DesktopShell {
     }
 
     pub(crate) fn list(&self) -> Option<Vec<DesktopId>> {
-        self.with_manager(|manager| {
-            let array = manager.object(manager.vtable().list)?;
-            let count = unsafe { array.GetCount() }.ok()?;
-            let mut ids = Vec::new();
-            for index in 0..count {
-                let id = desktop_id_at(&array, index)?;
-                if ids.contains(&id) {
-                    return None;
-                }
-                ids.push(id);
-            }
-            (!ids.is_empty()).then_some(ids)
-        })
+        self.with_manager(ShellManager::list)
     }
 
     pub(crate) fn current(&self) -> Option<DesktopId> {
@@ -375,7 +436,7 @@ impl DesktopShell {
     }
 
     pub(crate) fn create(&self) -> Option<DesktopId> {
-        self.with_manager(|manager| manager.object(manager.vtable().create)?.id())
+        self.with_manager(|manager| manager.object(manager.desktops.create)?.id())
     }
 
     pub(crate) fn move_before_first(&self, id: DesktopId, first: DesktopId) -> bool {
@@ -384,7 +445,7 @@ impl DesktopShell {
         }
         self.with_manager(|manager| {
             let desktop = manager.find(id)?;
-            let order = manager.object(manager.vtable().list)?;
+            let order = manager.object(manager.navigation.list)?;
             let head = desktop_id_at(&order, 0)?;
             if head == id {
                 return Some(desktop_id_at(&order, 1)? == first && manager.current()? == first);
@@ -401,7 +462,7 @@ impl DesktopShell {
     pub(crate) fn move_to_end(&self, id: DesktopId) -> bool {
         self.with_manager(|manager| {
             let desktop = manager.find(id)?;
-            let order = manager.object(manager.vtable().list)?;
+            let order = manager.object(manager.navigation.list)?;
             let last = unsafe { order.GetCount() }.ok()?.checked_sub(1)?;
             if desktop_id_at(&order, last)? == id {
                 return Some(true);
@@ -431,7 +492,7 @@ impl DesktopShell {
                 return Some(false);
             }
             // Both relative and numbered shortcuts use the direct Shell switch.
-            unsafe { (manager.vtable().switch)(manager.as_raw(), desktop.as_raw()) }
+            unsafe { (manager.navigation.switch)(manager.interface.as_raw(), desktop.0.as_raw()) }
                 .ok()
                 .ok()?;
             Some(true)
@@ -465,14 +526,18 @@ impl DesktopShell {
             // Keep the exact view and destination alive throughout the RPCs.
             let view = ApplicationView::lookup(hwnd)?;
             let destination = manager.find(to)?;
-            let table = manager.vtable();
             // The caller validates the exact identity here, including foreground
             // ownership for hotkeys and implicit CLI targets.
             if !manager.can_move_view(hwnd, &view, from)? || !validate() {
                 return Some(false);
             }
-            let moved =
-                unsafe { (table.move_view)(manager.as_raw(), view.as_raw(), destination.as_raw()) };
+            let moved = unsafe {
+                (manager.navigation.move_view)(
+                    manager.interface.as_raw(),
+                    view.as_raw(),
+                    destination.0.as_raw(),
+                )
+            };
             Some(moved.0 == 0)
         })
         .unwrap_or(false)
@@ -489,7 +554,11 @@ impl DesktopShell {
                 return None;
             }
             unsafe {
-                (manager.vtable().remove)(manager.as_raw(), desktop.as_raw(), fallback.as_raw())
+                (manager.desktops.remove)(
+                    manager.interface.as_raw(),
+                    desktop.0.as_raw(),
+                    fallback.0.as_raw(),
+                )
             }
             .ok()
             .ok()
@@ -518,26 +587,38 @@ mod tests {
 
     #[test]
     fn move_and_switch_slots_match_the_supported_shell_manager() {
+        use std::mem::offset_of;
+
         let slot = size_of::<usize>();
-        assert_eq!(std::mem::offset_of!(ManagerVtable, move_view), 4 * slot);
-        assert_eq!(std::mem::offset_of!(ManagerVtable, can_move_view), 5 * slot);
-        assert_eq!(std::mem::offset_of!(ManagerVtable, current), 6 * slot);
-        assert_eq!(std::mem::offset_of!(ManagerVtable, switch), 9 * slot);
+        for prefix in [
+            offset_of!(ManagerVtable<0>, navigation),
+            offset_of!(ManagerVtable<1>, navigation),
+        ] {
+            assert_eq!(prefix + offset_of!(ManagerNavigation, move_view), 4 * slot);
+            assert_eq!(
+                prefix + offset_of!(ManagerNavigation, can_move_view),
+                5 * slot
+            );
+            assert_eq!(prefix + offset_of!(ManagerNavigation, current), 6 * slot);
+            assert_eq!(prefix + offset_of!(ManagerNavigation, list), 7 * slot);
+            assert_eq!(prefix + offset_of!(ManagerNavigation, switch), 9 * slot);
+        }
+
+        let legacy = offset_of!(ManagerVtable<0>, desktops);
+        let modern = offset_of!(ManagerVtable<1>, desktops);
+        assert_eq!(legacy, 10 * slot);
+        assert_eq!(modern, 11 * slot);
+        assert_eq!(offset_of!(ManagerDesktops, create), 0);
+        assert_eq!(offset_of!(ManagerDesktops, move_desktop), slot);
+        assert_eq!(offset_of!(ManagerDesktops, remove), 2 * slot);
+        assert_eq!(offset_of!(ManagerDesktops, find), 3 * slot);
+        assert_eq!(offset_of!(DesktopVtable, get_id), 4 * slot);
     }
 
     fn move_for_test(shell: &DesktopShell, id: DesktopId, index: u32) -> bool {
         shell
             .with_manager(|manager| manager.move_desktop(&manager.find(id)?, index))
             .is_some()
-    }
-
-    #[test]
-    fn private_abi_is_limited_to_known_builds() {
-        assert!(!supported_abi(26099, 9000));
-        assert!(!supported_abi(26100, 2604));
-        assert!(supported_abi(26100, 2605));
-        assert!(supported_abi(26200, 9974));
-        assert!(!supported_abi(26201, 9000));
     }
 
     #[test]
